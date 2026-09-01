@@ -1234,6 +1234,13 @@ impl ElfReader {
         // and the application resolves the other, with every value plausible. Refuse instead: the
         // ceiling is a property of the addressing mode, not of this binary, and a user who hits it
         // needs to hear the number.
+        //
+        // The application-side numbering (mc-instrument's register_measurements) degrades instead:
+        // the objects under the ceiling still measure and the ones past it are named on stderr and
+        // dropped. Deliberate, on both sides. A running application has somewhere to put that
+        // message and a reason to keep going; an A2L that silently omits signals is worse than no
+        // A2L, because nothing downstream can tell the difference. If either side is revisited
+        // they both move: the identifier rule is the contract between them.
         if names.len() > XCP_ID_MAX as usize {
             return Err(format!(
                 "{} distinct measurement names, but identifier addressing can only address {} \
