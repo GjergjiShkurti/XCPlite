@@ -1753,7 +1753,12 @@ impl ElfReader {
                 info!("  Metadata applied to instance '{}'", flat);
             }
         } else {
-            debug!("Calibration metadata '{}': no typedef field and no instance of that name", flat);
+            // warn!, not debug!. A record names a field the segment does not have, which is
+            // always a defect whatever caused it -- a truncated name in the record, a field
+            // renamed on one side of the seam, a stale object file. At debug! the default
+            // verbosity said nothing at all, so the unit, comment and limits simply went
+            // missing from the A2L with no line anywhere to explain it.
+            warn!("Calibration metadata '{}': no typedef field and no instance of that name, so its unit, comment and limits are not in the A2L", flat);
         }
     }
 
