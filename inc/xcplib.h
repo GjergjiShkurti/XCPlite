@@ -435,15 +435,32 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 typedef struct {
     /// Resolved live location, or NULL if not currently available.
     ///
-    /// Written by the application per trigger and read by the DAQ sampling loop, both as plain
-    /// accesses. That is safe only under the rule below, which the library cannot enforce:
+    /// Written by the application per trigger, as a plain access, and read by two consumers that
+    /// do not run in the writing thread:
+    ///
+    ///   * the DAQ sampling loop, and
+    ///   * ApplXcpReadMemory -- the application read callback registered through
+    ///     ApplXcpRegisterReadCallback -- which serves SHORT_UPLOAD / UPLOAD / CALC_CHECKSUM of
+    ///     an identifier-addressed object and runs on the XCP command/RX thread.
+    ///
+    /// All three accesses are plain. That is safe only under the rule below, which the library
+    /// cannot enforce:
     ///
     /// **One identifier must be updated from one thread.** A single measurement name deliberately
     /// shares one identifier across every event that measures it, so if two of those events fire
     /// on different threads, this field has two writers and the sample may be taken through
-    /// either. The value is never torn on any supported target (an aligned pointer), so the
-    /// consequence is a sample from the wrong event's address rather than a corrupt pointer -- but
-    /// it is a data race, and a sanitizer will say so.
+    /// either.
+    ///
+    /// The guarantee the rule actually gives, in either direction: the value is never torn on any
+    /// supported target (an aligned pointer), so the worst case is an access through a *previous*
+    /// trigger's address -- the wrong event's, or a moment out of date -- and never a corrupt
+    /// pointer. That is the same failure for the command path as for the DAQ loop, which is why
+    /// adding the second reader does not weaken the rule. It is still a data race by the standard,
+    /// and a sanitizer will say so.
+    ///
+    /// Deliberately not an atomic: this struct is shared between C11 and C++17 translation units,
+    /// so the field would have to be spelled differently on each side of the seam for no change in
+    /// the observable outcome. The *table* is published atomically; see XcpSetResolveTable.
     void *ptr;
     uint32_t size;  ///< Byte size at ptr, used for DAQ bounds checking at arm time
     uint16_t seg;   ///< Calibration segment index, or XCP_RESOLVE_SEG_NONE for a measurement
