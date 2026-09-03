@@ -502,6 +502,7 @@ void A2lSetRelAddrMode(tXcpEventId event_id, const uint8_t *base_ptr) {
     gA2lFixedEvent = event_id;
     gA2lDefaultEvent = XCP_UNDEFINED_EVENT_ID;
     gA2lAddrExt = XCP_ADDR_EXT_REL;
+    gA2lIdMode = false;
 }
 #endif
 
@@ -514,6 +515,7 @@ void A2lSetDynAddrMode(tXcpEventId event_id, uint8_t i, const uint8_t *base_ptr)
     gA2lFixedEvent = event_id;
     gA2lDefaultEvent = XCP_UNDEFINED_EVENT_ID;
     gA2lAddrExt = XCP_ADDR_EXT_DYN + i;
+    gA2lIdMode = false;
     assert(gA2lAddrExt <= XCP_ADDR_EXT_DYN_MAX);
 }
 
@@ -526,6 +528,7 @@ void A2lSetAutoAddrMode(tXcpEventId event_id, const uint8_t *frame_ptr, const ui
     gA2lFixedEvent = event_id;
     gA2lDefaultEvent = XCP_UNDEFINED_EVENT_ID;
     gA2lAddrExt = XCP_UNDEFINED_ADDR_EXT; // Auto
+    gA2lIdMode = false;
 }
 
 static void A2lRstAddrMode(void) {

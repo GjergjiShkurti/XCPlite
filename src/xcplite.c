@@ -867,11 +867,16 @@ tXcpEventId XcpFindEvent(const char *name) { return XcpFindEventInstances(name, 
 // Returns the new XCP event id or XCP_UNDEFINED_EVENT_ID when out of memory
 tXcpEventId XcpCreateIndexedEvent(const char *name, uint16_t index, uint32_t cycle_time_ns, uint8_t priority) {
 
+    assert(name != NULL);
+
+    // Every failure path below names itself. The caller only sees XCP_UNDEFINED_EVENT_ID, which
+    // it cannot tell apart from the event limit, so a caller that guesses a cause sends the
+    // developer after the wrong one -- raising OPTION_DAQ_EVENT_COUNT for an event that was
+    // rejected for its name, or for one created before XcpInit.
     if (!isActivated()) {
+        DBG_PRINTF_ERROR("event '%s' cannot be created: the XCP server is not activated yet, call XcpInit first\n", name);
         return XCP_UNDEFINED_EVENT_ID; // Uninitialized
     }
-
-    assert(name != NULL);
 
     // Check name length
     size_t nameLen = STRNLEN(name, XCP_MAX_EVENT_NAME + 1);
@@ -883,7 +888,7 @@ tXcpEventId XcpCreateIndexedEvent(const char *name, uint16_t index, uint32_t cyc
     // Check event count
     uint16_t e = acquireEventCount();
     if (e >= XCP_MAX_EVENT_COUNT) {
-        DBG_PRINT_ERROR("too many events\n");
+        DBG_PRINTF_ERROR("event '%s' cannot be created: the limit of %u events is reached. Raise OPTION_DAQ_EVENT_COUNT.\n", name, (unsigned)XCP_MAX_EVENT_COUNT);
         return XCP_UNDEFINED_EVENT_ID; // Out of memory
     }
 
@@ -936,6 +941,7 @@ tXcpEventId XcpCreateEventInstance(const char *name, uint32_t cycle_time_ns, uin
 tXcpEventId XcpCreateEvent(const char *name, uint32_t cycle_time_ns, uint8_t priority) {
 
     if (!isActivated()) {
+        DBG_PRINTF_ERROR("event '%s' cannot be created: the XCP server is not activated yet, call XcpInit first\n", name);
         return XCP_UNDEFINED_EVENT_ID; // Uninitialized
     }
 
@@ -973,9 +979,11 @@ static uint16_t XcpRegisterSectionEvents(void) {
                 // it said nothing at all and left the event undefined, which is the worse half:
                 // the signals bound to it are simply absent from a server that started normally.
                 if (id == XCP_UNDEFINED_EVENT_ID) {
-                    DBG_PRINTF_ERROR("event '%s' could not be created: the limit of %u events is reached, so this event and every "
-                                     "measurement bound to it will be missing. Raise OPTION_DAQ_EVENT_COUNT.\n",
-                                     e->name, (unsigned)XCP_MAX_EVENT_COUNT);
+                    // The cause is printed by XcpCreateEvent itself -- name too long, server not
+                    // activated, or the event limit. Naming one of them here was wrong whenever
+                    // it was not the limit, and sent the developer to raise a setting that was
+                    // never the problem.
+                    DBG_PRINTF_ERROR("event '%s' could not be created (cause above), so this event and every measurement bound to it will be missing\n", e->name);
                     continue;
                 }
                 count++;
@@ -1252,16 +1260,34 @@ void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count) {
     atomic_store_explicit(&gXcpResolveCount, (table != NULL) ? count : 0, memory_order_release);
 }
 
+// A consistent (table, count) pair. Taken once per use site and passed down, so the two
+// atomics cannot be re-read between a bounds check and the access it guards.
+typedef struct {
+    const tXcpResolveEntry *table;
+    uint32_t count;
+} tXcpResolveView;
+
+// Load the table *before* the count. Both are acquire loads paired with the release stores in
+// XcpSetResolveTable, whose order is count=0 (relaxed), table (release), count=N (release).
+// Reading the table first means the acquire that observes a given table pointer synchronizes
+// with a store sequenced after count=0, so the count read afterwards is that publication's own
+// count or 0 -- never a larger count left over from a previous, longer table. Reading the count
+// first permits exactly that pairing (old count, new shorter table) and indexes past the end.
+static tXcpResolveView XcpLoadResolveView(void) {
+    tXcpResolveView view;
+    view.table = (const tXcpResolveEntry *)atomic_load_explicit(&gXcpResolveTable, memory_order_acquire);
+    view.count = atomic_load_explicit(&gXcpResolveCount, memory_order_acquire);
+    return view;
+}
+
 // Resolve a 32 bit identifier to a live pointer, or NULL if it is out of range,
 // unregistered or not currently available. Identifier 0 is reserved as invalid;
 // valid identifiers are 1..count-1 and index the table directly.
-static const uint8_t *XcpResolveId(uint32_t packed, uint32_t n) {
+static const uint8_t *XcpResolveId(const tXcpResolveView *view, uint32_t packed, uint32_t n) {
     const uint32_t id = XcpAddrDecodeId(packed);
     const uint32_t offset = XcpAddrDecodeIdOffset(packed);
-    // Acquire, paired with the release stores in XcpSetResolveTable: reading the count first
-    // and the pointer after means the entries this count covers are already visible.
-    const uint32_t count = atomic_load_explicit(&gXcpResolveCount, memory_order_acquire);
-    const tXcpResolveEntry *table = (const tXcpResolveEntry *)atomic_load_explicit(&gXcpResolveTable, memory_order_acquire);
+    const tXcpResolveEntry *const table = view->table;
+    const uint32_t count = view->count;
     if (table == NULL || id == 0 || id >= count) {
         return NULL;
     }
@@ -1363,9 +1389,9 @@ static uint8_t XcpAddOdtEntry(uint32_t addr, uint8_t ext, uint8_t size) {
                 // constructor, so this can only mean a client connected before the
                 // application finished starting, or an application that never publishes one.
                 {
-                    const uint32_t resolve_count = atomic_load_explicit(&gXcpResolveCount, memory_order_acquire);
-                    const tXcpResolveEntry *resolve_table =
-                        (const tXcpResolveEntry *)atomic_load_explicit(&gXcpResolveTable, memory_order_acquire);
+                    const tXcpResolveView resolve_view = XcpLoadResolveView();
+                    const tXcpResolveEntry *resolve_table = resolve_view.table;
+                    const uint32_t resolve_count = resolve_view.count;
                     if (resolve_table == NULL) {
                         DBG_PRINT_ERROR("WRITE_DAQ: identifier addressing requested but no resolve table is published\n");
                         return CRC_ACCESS_DENIED;
@@ -1642,6 +1668,14 @@ static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, const ui
     uint8_t *d0;
     uint16_t odt, hs;
 
+#ifdef XCP_ENABLE_ID_ADDRESSING
+    // Taken once for the whole DAQ list, not once per ODT entry. The pair cannot usefully
+    // change inside one trigger -- a re-publication that lands mid-list would only mean some
+    // entries sample the old table and some the new -- and re-loading it per entry cost two
+    // acquire loads and their barriers on the library's hottest loop.
+    const tXcpResolveView resolve_view = XcpLoadResolveView();
+#endif
+
     // Outer loop
     // Loop over all ODTs of the current DAQ list
     for (hs = ODT_HEADER_SIZE + ODT_TIMESTAMP_SIZE, odt = DaqListFirstOdt(daq); odt <= DaqListLastOdt(daq); hs = ODT_HEADER_SIZE, odt++) {
@@ -1715,7 +1749,7 @@ static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, const ui
                 // and is sampled as a defined zero, so an armed but not yet live
                 // signal is harmless instead of dereferencing a stale pointer.
                 if (XcpAddrIsId(ext)) {
-                    const uint8_t *src = XcpResolveId(offset, n);
+                    const uint8_t *src = XcpResolveId(&resolve_view, offset, n);
                     if (src != NULL) {
                         memcpy(dst, src, n);
                     } else {
