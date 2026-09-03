@@ -782,8 +782,17 @@ static uint32_t A2lGetAddr_(const void *p) {
                 uint64_t addr_high2 = (addr_diff2 >> XCP_DYN_ADDR_OFFSET_BITS);
                 DBG_PRINTF6("A2L auto dyn address mode: addr=%p, base1=%p, diff1=%llX, base2=%p, diff2=%llX\n", p, (void *)gA2lBasePtr, (unsigned long long)addr_diff1,
                             (void *)gA2lFramePtr, (unsigned long long)addr_diff2);
+                // addr_high is ZERO when the offset fits the 22 bit DYN field, so "valid" is
+                // `== 0` in all three tests below. The first and the third used to read
+                // `addr_high2` and `addr_high1 == 0` respectively, which made the first mean
+                // "base fits and stack does NOT" and the third a repeat of the second -- so the
+                // stack-only case matched nothing and fell into the overflow arm, which asserts
+                // in a debug build and returns address 0 in a release one. An ordinary stack
+                // local in a program whose base pointer is more than 4 MiB away is exactly that
+                // case.
+                //
                 // Both valid ? Prefer the smaller one
-                if (addr_high1 == 0 && addr_high2) {
+                if (addr_high1 == 0 && addr_high2 == 0) {
                     if (addr_diff1 < addr_diff2) {
                         base_ptr = gA2lBasePtr;
                         gA2lAutoAddrExt = XCP_ADDR_EXT_DYN + 1; // Use base pointer addressing mode with index 1
@@ -795,10 +804,10 @@ static uint32_t A2lGetAddr_(const void *p) {
                 // Base valid
                 else if (addr_high1 == 0) {
                     base_ptr = gA2lBasePtr;
-                    gA2lAutoAddrExt = XCP_ADDR_EXT_DYN + 1; // Use frame pointer addressing mode
+                    gA2lAutoAddrExt = XCP_ADDR_EXT_DYN + 1; // Use base pointer addressing mode with index 1
                 }
                 // Stack valid
-                else if (addr_high1 == 0) {
+                else if (addr_high2 == 0) {
                     base_ptr = gA2lFramePtr;
                     gA2lAutoAddrExt = XCP_ADDR_EXT_DYN; // Use frame pointer addressing mode
                 }

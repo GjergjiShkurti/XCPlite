@@ -1381,7 +1381,7 @@ impl ElfReader {
                 // arithmetic works: a master selecting one array element sends ECU_ADDRESS +
                 // i*elemsize, and an object wider than one ODT entry is armed as chunks at
                 // ECU_ADDRESS + k*248. With the whole word spent on the identifier those landed
-                // on unrelated objects. Mirrors XcpAddrEncodeId in xcp_cfg.h.
+                // on unrelated objects. Mirrors XcpAddrEncodeId in xcplite's inc/xcp_id_addr.h.
                 None => McAddress::new_a2l_with_event(event_id, id << XCP_ID_OFFSET_BITS, XCP_ADDR_EXT_APP),
             };
             match reg.instance_list.add_instance(r.name.clone(), dim_type, sd, addr) {
@@ -1419,7 +1419,8 @@ impl ElfReader {
 /// mc-instrument runtime side.
 /// Correct for the default XCPLITE__CASDD scheme, which is what mc-instrument builds. Under
 /// XCPLITE__AXSDD (no calibration segments) and XCPLITE__CXSDD (SHM) the application extension
-/// is 0x01 instead (xcp_cfg.h:135,145) -- and nothing in the ELF says which scheme was used, so
+/// is 0x01 instead (xcp_cfg.h, the AXSDD and CXSDD blocks) -- and nothing in the ELF says which
+/// scheme was used, so
 /// this cannot be derived here. An A2L generated from a binary built in one of those schemes
 /// would carry ECU_ADDRESS_EXTENSION 128 while the application only accepts 1, and every
 /// WRITE_DAQ would be rejected. Loud, at least. Carrying the extension in the mci_layout record
@@ -1427,10 +1428,12 @@ impl ElfReader {
 const XCP_ADDR_EXT_APP: u8 = 0x80;
 
 /// How many low bits of the address field are a byte offset into the object the identifier names.
-/// Must equal XCP_ID_OFFSET_BITS in xcplite's xcp_cfg.h -- the server decodes what this encodes.
+/// Must equal XCP_ID_OFFSET_BITS in xcplite's inc/xcp_id_addr.h -- the server decodes what this
+/// encodes. That header is the single definition (xcp_cfg.h and xcplib.h both include it); this
+/// Rust mirror is the one copy that still has to be kept by hand, which is why it names the file.
 const XCP_ID_OFFSET_BITS: u32 = 16;
 
-/// The largest identifier the field can hold, = XCP_ID_MAX in xcp_cfg.h / xcplib.h.
+/// The largest identifier the field can hold, = XCP_ID_MAX in xcplite's inc/xcp_id_addr.h.
 const XCP_ID_MAX: u32 = u32::MAX >> XCP_ID_OFFSET_BITS;
 
 /// Map an A2L type id (tA2lTypeId in a2l.h: magnitude = byte size, sign = signedness) to the
