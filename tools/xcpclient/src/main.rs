@@ -767,15 +767,21 @@ async fn xcp_client(
                     // Apply mc-instrument's calibration field metadata from the mci_meta ELF section
                     elf_reader.register_cal_metadata(&mut reg, verbose)?;
                     // Register identifier-addressed measurements from the mci_meas descriptor section
-                    elf_reader.register_mci_measurements(&mut reg, verbose)?;
-                    // The application's own name, when it carries one, becomes the A2L's PROJECT
-                    // and MODULE. An explicit --ecu-name still wins; the placeholder no longer
-                    // has to, which is what made two offline A2Ls indistinguishable.
-                    if ecu_name.is_empty()
-                        && let Some(name) = elf_reader.app_name()
-                    {
-                        ecu_name = name.to_string();
-                    }
+                    elf_reader.register_mci_measurements(&mut reg, segment_relative, verbose)?;
+                }
+
+                // The application's own name, when it carries one, becomes the A2L's PROJECT and
+                // MODULE. An explicit --ecu-name still wins; the placeholder no longer has to,
+                // which is what made two offline A2Ls indistinguishable.
+                //
+                // Outside the --create-a2l-template guard on purpose: mci_app is plain section
+                // data and needs no DWARF variable sweep, so a template A2L can carry the real
+                // name too. Inside the guard, the template kept falling through to
+                // "project_name" -- the placeholder this exists to remove.
+                if ecu_name.is_empty()
+                    && let Some(name) = elf_reader.app_name()
+                {
+                    ecu_name = name.to_string();
                 }
             }
 

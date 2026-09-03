@@ -293,7 +293,9 @@ impl ElfReader {
                     seg_descr_addr = 0;
                 } else if seg_descr_addr == 0 {
                     log::warn!(
-                        "Calibration segment marker '{var_name}' has no address in the debug info. Segment numbering is taken from marker                          addresses, so this segment may be numbered wrongly. Declare the marker with external linkage so the compiler emits                          a location for it."
+                        "Calibration segment marker '{var_name}' has no address in the debug info. Segment numbering is taken \
+                         from marker addresses, so this segment may be numbered wrongly. Declare the marker with external \
+                         linkage so the compiler emits a location for it."
                     );
                 }
                 seg_definitions.push((seg_name.to_string(), var_infos, seg_descr_addr, seg_number));
@@ -1022,7 +1024,7 @@ impl ElfReader {
     /// name in the byte-wise sorted, de-duplicated set of names -- exactly how register_measurements()
     /// assigns them at runtime (identifier-addressing spec §3). Reproducing that sort here is what
     /// makes the offline A2L agree with a runtime A2L on every id.
-    pub fn register_mci_measurements(&self, reg: &mut Registry, verbose: usize) -> Result<(), Box<dyn Error>> {
+    pub fn register_mci_measurements(&self, reg: &mut Registry, segment_relative: bool, verbose: usize) -> Result<(), Box<dyn Error>> {
         let Some((_base, data)) = self.debug_data.mci_meas_data.as_ref() else {
             return Ok(());
         };
@@ -1106,16 +1108,23 @@ impl ElfReader {
         // layout claiming, say, 16-byte records with min at offset 32 passes the chunk-length
         // check and then panics in rd_f64 with a backtrace instead of a diagnostic.
         let fits = |offset: usize, width: usize| offset + width <= lay.rec;
+        // o_event and o_addr are Options because v1 records do not have them, but when they are
+        // present they are sliced exactly like the v1 fields (rd_ptr below), so they are checked
+        // exactly like them. Leaving them out let a v2 layout over v1-sized records -- a stale
+        // object file relinked against a newer mci_layout -- reach rd_ptr and panic.
         let bad = [
-            ("name", lay.o_name, lay.ptr),
-            ("type", lay.o_type, 1),
-            ("x_dim", lay.o_x_dim, 2),
-            ("comment", lay.o_comment, lay.ptr),
-            ("unit", lay.o_unit, lay.ptr),
-            ("min", lay.o_min, 8),
-            ("max", lay.o_max, 8),
+            ("name", Some(lay.o_name), lay.ptr),
+            ("type", Some(lay.o_type), 1),
+            ("x_dim", Some(lay.o_x_dim), 2),
+            ("comment", Some(lay.o_comment), lay.ptr),
+            ("unit", Some(lay.o_unit), lay.ptr),
+            ("min", Some(lay.o_min), 8),
+            ("max", Some(lay.o_max), 8),
+            ("event", lay.o_event, lay.ptr),
+            ("addr", lay.o_addr, lay.ptr),
         ]
         .into_iter()
+        .filter_map(|(name, offset, width)| offset.map(|o| (name, o, width)))
         .find(|(_, offset, width)| !fits(*offset, *width));
         if let Some((field, offset, width)) = bad {
             warn!(
@@ -1359,8 +1368,14 @@ impl ElfReader {
                     0
                 }
             };
+            // Absolute addresses carry the target's absolute extension, which is not always 0:
+            // under a segment-relative target (XCPLITE__CASDD) extension 0 *is* the calibration
+            // segment and absolute is 1. register_variables makes the same choice at line ~867;
+            // hardcoding 0 here emitted MEASUREMENTs pointing into the calibration page while
+            // every other object in the same A2L used 1.
+            let abs_addr_ext = if segment_relative { 1 } else { 0 };
             let addr = match r.addr {
-                Some(a) => McAddress::new_a2l_with_event(event_id, a, 0),
+                Some(a) => McAddress::new_a2l_with_event(event_id, a, abs_addr_ext),
                 // The identifier occupies the high 16 bits and the low 16 are a byte offset into
                 // the object (0 for the whole object). The field is split so that address
                 // arithmetic works: a master selecting one array element sends ECU_ADDRESS +
@@ -1478,10 +1493,24 @@ fn a2l_type_max(t: i8) -> f64 {
 
 // Read a null-terminated UTF-8 string from a byte slice at a given offset
 fn read_cstr_at(data: &[u8], offset: usize) -> Option<String> {
+    read_cstr_bounded(data, offset, usize::MAX)
+}
+
+/// Read a null-terminated UTF-8 string from a *fixed-width* field: the scan for the terminator
+/// stops at the end of the field, not at the next NUL anywhere in the section.
+///
+/// Every string in an `mci_meta` record is a fixed-width buffer laid end to end with the next one.
+/// Scanning past the width made an unterminated field swallow the fields that follow it -- a full
+/// 64-byte owner came back as owner+field+unit+comment, and a full 128-byte comment ran into the
+/// raw f64 min/max bytes, failed UTF-8 and dropped the whole record. mc.hpp's `chars<N>` always
+/// terminates today, so this was latent; the reader is the side that must not trust the section.
+fn read_cstr_bounded(data: &[u8], offset: usize, len: usize) -> Option<String> {
     if offset >= data.len() {
         return None;
     }
-    let end = data[offset..].iter().position(|&b| b == 0).map(|p| offset + p).unwrap_or(data.len());
+    let limit = data.len().min(offset.saturating_add(len));
+    let field = &data[offset..limit];
+    let end = offset + field.iter().position(|&b| b == 0).unwrap_or(field.len());
     String::from_utf8(data[offset..end].to_vec()).ok()
 }
 
@@ -1625,7 +1654,7 @@ fn parse_cal_meta_record(bytes: &[u8], is_le: bool) -> Option<CalMetaRecord> {
     }
     let mut at = 0;
     let mut take = |len: usize| -> Option<String> {
-        let s = read_cstr_at(bytes, at)?;
+        let s = read_cstr_bounded(bytes, at, len)?;
         at += len;
         Some(s)
     };
