@@ -66,7 +66,7 @@ static uint8_t gA2lAutoAddrExt = XCP_UNDEFINED_ADDR_EXT; // Address extension ca
 static const uint8_t *gA2lFramePtr = NULL;               // Frame address for rel and dyn mode
 static const uint8_t *gA2lBasePtr = NULL;                // Base address for rel and dyn mode
 static tXcpCalSegIndex gA2lAddrIndex = 0;                // Segment index for seg mode
-static bool gA2lIdMode = false;                          // Identifier (resolve-table) addressing: address field carries a 32-bit identifier, not a memory address
+static bool gA2lIdMode = false;                          // Identifier (resolve-table) addressing: address field is an identifier and a byte offset, not a memory address
 
 // Input quantities
 static const char *gA2lInputQuantity_x = NULL;
@@ -730,10 +730,11 @@ void A2lSetApplicationAddrMode(void) {
 #ifdef XCP_ENABLE_ID_ADDRESSING
 // Identifier (resolve-table) addressing mode.
 //
-// The A2L address field carries a deterministic 32-bit identifier, not a memory address; the
-// address extension is XCP_ADDR_EXT_ID (== XCP_ADDR_EXT_APP) and serves only as a mode tag.
-// A2lCreateMeasurement_ is called with the identifier cast to a pointer, and A2lGetAddr_ then
-// passes that value through unchanged (see below). default_event_id, when set, is emitted as a
+// The A2L address field carries a deterministic identifier and a byte offset into the object
+// (XcpAddrEncodeId, xcp_id_addr.h), not a memory address; the address extension is
+// XCP_ADDR_EXT_ID (== XCP_ADDR_EXT_APP) and serves only as a mode tag. A2lCreateMeasurement_ is
+// called with that encoded address cast to a pointer, and A2lGetAddr_ then passes it through
+// unchanged (see below). default_event_id, when set, is emitted as a
 // DEFAULT_EVENT_LIST so a tool knows which event can sample the object; XCP_UNDEFINED_EVENT_ID
 // emits no event association at all.
 void A2lSetIdAddrMode(tXcpEventId default_event_id) {
@@ -853,9 +854,9 @@ static uint32_t A2lGetAddr_(const void *p) {
 
         } // gA2lAddrExt == XCP_UNDEFINED_ADDR_EXT
 
-        // Identifier: p is not a pointer, it carries the 32-bit identifier itself. Passed
-        // through unchanged so the A2L address field becomes the id. Checked before the
-        // application branch, which shares the same address extension.
+        // Identifier: p is not a pointer, it carries the encoded identifier address itself
+        // (XcpAddrEncodeId). Passed through unchanged so the A2L address field becomes it.
+        // Checked before the application branch, which shares the same address extension.
 #ifdef XCP_ENABLE_ID_ADDRESSING
         else if (gA2lIdMode) {
             return (uint32_t)(uintptr_t)p;

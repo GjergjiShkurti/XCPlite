@@ -419,10 +419,12 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 // Identifier (resolve-table) addressing (optional, requires the library to be
 // built with OPTION_ID_ADDRESSING)
 //
-// A DAQ measurement (ODT entry) may carry a 32 bit identifier instead of a
-// base+offset address. The identifier indexes a table published by
-// XcpSetResolveTable(); the DAQ sampling loop reads table[id].ptr directly, and
-// an entry whose ptr is NULL is sampled as zero ("not currently available").
+// A DAQ measurement (ODT entry) may carry an identifier and a byte offset into
+// the object it names (layout in xcp_id_addr.h) instead of a base+offset
+// address. The identifier indexes a table published by XcpSetResolveTable();
+// the DAQ sampling loop reads table[id].ptr plus the offset, bounded by
+// table[id].size, and an entry whose ptr is NULL is sampled as zero ("not
+// currently available").
 // This lets a single addressing mode cover globals, stack locals and
 // heap/pointer-reachable data, and removes the dynamic-base slot limit for
 // pointer-reachable objects. Identifier 0 is reserved; valid identifiers are
@@ -435,13 +437,15 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 typedef struct {
     /// Resolved live location, or NULL if not currently available.
     ///
-    /// Written by the application per trigger, as a plain access, and read by two consumers that
-    /// do not run in the writing thread:
+    /// Written by the application per trigger, as a plain access, and read by two consumers:
     ///
-    ///   * the DAQ sampling loop, and
+    ///   * the DAQ sampling loop, which runs in whichever thread triggers the event -- the
+    ///     writer's own, unless the identifier is also measured by an event triggered on another
+    ///     thread (the rule below) -- and
     ///   * ApplXcpReadMemory -- the application read callback registered through
     ///     ApplXcpRegisterReadCallback -- which serves SHORT_UPLOAD / UPLOAD / CALC_CHECKSUM of
-    ///     an identifier-addressed object and runs on the XCP command/RX thread.
+    ///     an identifier-addressed object and runs on the XCP command/RX thread, never the
+    ///     writer's.
     ///
     /// All three accesses are plain. That is safe only under the rule below, which the library
     /// cannot enforce:
@@ -462,7 +466,7 @@ typedef struct {
     /// so the field would have to be spelled differently on each side of the seam for no change in
     /// the observable outcome. The *table* is published atomically; see XcpSetResolveTable.
     void *ptr;
-    uint32_t size;  ///< Byte size at ptr, used for DAQ bounds checking at arm time
+    uint32_t size;  ///< Byte size at ptr, used for DAQ bounds checking at arm time and per sample
     uint16_t seg;   ///< Calibration segment index, or XCP_RESOLVE_SEG_NONE for a measurement
     uint16_t flags; ///< Application defined
 } tXcpResolveEntry;

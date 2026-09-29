@@ -188,11 +188,12 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 
 // Identifier (resolve-table) addressing
 //
-// A DAQ ODT entry may carry a 32 bit identifier instead of a base+offset. The
-// identifier indexes the table published here, and the DAQ sampling loop reads
-// table[id].ptr directly. An entry whose ptr is NULL is sampled as zero (a
-// defined "not currently available"), so an armed but not yet live signal
-// produces no fault. Identifiers travel on the application address extension
+// A DAQ ODT entry may carry an identifier and a byte offset into the object it
+// names (xcp_id_addr.h) instead of a base+offset. The identifier indexes the
+// table published here, and the DAQ sampling loop reads table[id].ptr plus the
+// offset, bounded by table[id].size. An entry whose ptr is NULL is sampled as
+// zero (a defined "not currently available"), so an armed but not yet live
+// signal produces no fault. Identifiers travel on the application address extension
 // (XCP_ADDR_EXT_APP). The command path resolves them only if the application
 // registers a resolver: ApplXcpReadMemory / ApplXcpWriteMemory reach
 // ApplXcpRegisterReadCallback / ApplXcpRegisterWriteCallback, and xcpappl.c's
@@ -208,7 +209,7 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 #define XCP_RESOLVE_SEG_NONE 0xFFFF
 typedef struct {
     void *ptr;      // Resolved live location, or NULL if not currently available
-    uint32_t size;  // Byte size at ptr, used for DAQ bounds checking at arm time
+    uint32_t size;  // Byte size at ptr, used for DAQ bounds checking at arm time and per sample
     uint16_t seg;   // Calibration segment index, or XCP_RESOLVE_SEG_NONE for a measurement
     uint16_t flags; // Application defined
 } tXcpResolveEntry;

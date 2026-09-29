@@ -1006,19 +1006,23 @@ impl ElfReader {
         Ok(())
     }
 
-    /// True when the ELF carries mc-instrument measurement descriptors (the mci_meas section),
-    /// i.e. the target uses identifier addressing for measurements. In that case the DWARF
-    /// measurement sweep in register_variables is suppressed and the measurements are produced by
-    /// register_mci_measurements instead.
+    /// True when the ELF carries mc-instrument measurement descriptors (the mci_meas section):
+    /// identifier-addressed on xcplite, or with absolute addresses from a backend that supplies
+    /// them (VX1000). In that case the DWARF measurement sweep in register_variables is suppressed
+    /// and the measurements are produced by register_mci_measurements instead.
     pub fn has_id_addressing(&self) -> bool {
         self.debug_data.mci_meas_data.is_some()
     }
 
-    /// Register identifier-addressed measurements from the mci_meas ELF section.
+    /// Register the measurements the mci_meas ELF section describes: identifier-addressed, or at
+    /// an absolute address where the backend supplied one (layout version 2).
     ///
-    /// Each MeasMeta record (mc.hpp) is 56 bytes, laid out as: name ptr @0, tA2lTypeId @8,
-    /// x_dim @10, flags @12, comment ptr @16, unit ptr @24, min @32, max @40, id-slot ptr @48.
-    /// The three string pointers are absolute virtual addresses into .rodata (our binaries are
+    /// Each MeasMeta record (mc-instrument's mc_meas_abi.hpp) is parsed with the layout the
+    /// binary's mci_layout record gives, because it moves with the target ABI (below). Without
+    /// that record the historical LP64 layout is assumed: 56 bytes, name ptr @0, tA2lTypeId @8,
+    /// x_dim @10, flags @12, comment ptr @16, unit ptr @24, min @32, max @40, id-slot ptr @48;
+    /// version 2 appends the owning event's name ptr and the absolute address.
+    /// The string pointers are absolute virtual addresses into .rodata (our binaries are
     /// linked at base 0, so the stored value is the string's vaddr and no relocation needs to be
     /// applied). Identifiers are NOT read from the binary: they are the 1-based position of each
     /// name in the byte-wise sorted, de-duplicated set of names -- exactly how register_measurements()
@@ -1175,8 +1179,10 @@ impl ElfReader {
             /// needs, because the device samples ECU memory from outside the CPU and cannot ask
             /// the application to resolve an identifier at trigger time.
             addr: Option<u32>,
-            /// Owning event's name. Only meaningful together with `addr`: identifier-addressed
-            /// objects carry their event as metadata instead (spec §7).
+            /// Owning event's name, on both addressing modes: it is the object's event binding in
+            /// the A2L whether or not `addr` is set. Under identifier addressing that binding is
+            /// metadata rather than something the address implies (spec §7), but it still decides
+            /// which event the object is armed on -- see the event_id lookup below.
             event: String,
         }
 
@@ -1317,11 +1323,11 @@ impl ElfReader {
             let r = widest;
             let value_type = a2l_type_to_value_type(r.ty);
             let dim_type = McDimType::new(value_type, r.x_dim.max(1), 1);
-            // Match sig_min/sig_max in mc.hpp: the descriptor stores (0.0, 0.0) when neither bound
-            // was given, and that resolves to the type's own range. The range must be xcplite's
-            // (A2lGetTypeMin/Max, mirrored by type_min/type_max in mc.hpp: +-1e12 for float/double/
-            // int64), NOT the registry's own get_min/get_max (+-1e32), so the offline limits equal
-            // the runtime ones.
+            // Match sig_min/sig_max in mc_meas_abi.hpp: the descriptor stores (0.0, 0.0) when
+            // neither bound was given, and that resolves to the type's own range. The range must be
+            // xcplite's (A2lGetTypeMin/Max, mirrored by type_min/type_max in mc_meas_abi.hpp: +-1e12
+            // for float/double/int64), NOT the registry's own get_min/get_max (+-1e32), so the
+            // offline limits equal the runtime ones.
             let (min, max) = if r.min == 0.0 && r.max == 0.0 {
                 (Some(a2l_type_min(r.ty)), Some(a2l_type_max(r.ty)))
             } else {
@@ -1337,7 +1343,8 @@ impl ElfReader {
             // Two addressing modes, chosen per record by whether the backend supplied an address.
             //
             // Absolute (VX1000): the descriptor carries the object's real address, so it goes into
-            // ECU_ADDRESS with extension 0 and the object is bound to its owning event by name.
+            // ECU_ADDRESS with the target's absolute extension (abs_addr_ext below) and the object
+            // is bound to its owning event by name.
             // The VX samples ECU memory from outside the CPU, so there is nobody to resolve an
             // identifier at trigger time and the address has to be in the A2L.
             //
@@ -1419,12 +1426,13 @@ impl ElfReader {
 /// mc-instrument runtime side.
 /// Correct for the default XCPLITE__CASDD scheme, which is what mc-instrument builds. Under
 /// XCPLITE__AXSDD (no calibration segments) and XCPLITE__CXSDD (SHM) the application extension
-/// is 0x01 instead (xcp_cfg.h, the AXSDD and CXSDD blocks) -- and nothing in the ELF says which
-/// scheme was used, so
-/// this cannot be derived here. An A2L generated from a binary built in one of those schemes
-/// would carry ECU_ADDRESS_EXTENSION 128 while the application only accepts 1, and every
-/// WRITE_DAQ would be rejected. Loud, at least. Carrying the extension in the mci_layout record
-/// is the real fix and needs a layout version bump on both sides.
+/// is 0x01 instead (xcp_cfg.h, the AXSDD and CXSDD blocks). The ELF does name its scheme -- the
+/// XCPLITE__<scheme> marker that get_target_signature reads -- but main.rs uses it only to choose
+/// segment-relative addressing, and this constant does not follow it. An A2L generated from a
+/// binary built in one of those schemes would carry ECU_ADDRESS_EXTENSION 128 while the
+/// application only accepts 1, and every WRITE_DAQ would be rejected. Loud, at least. Deriving
+/// the extension from that marker, or carrying it in the mci_layout record (a layout version
+/// bump on both sides), would close this.
 const XCP_ADDR_EXT_APP: u8 = 0x80;
 
 /// How many low bits of the address field are a byte offset into the object the identifier names.
@@ -1436,8 +1444,6 @@ const XCP_ID_OFFSET_BITS: u32 = 16;
 /// The largest identifier the field can hold, = XCP_ID_MAX in xcplite's inc/xcp_id_addr.h.
 const XCP_ID_MAX: u32 = u32::MAX >> XCP_ID_OFFSET_BITS;
 
-/// Map an A2L type id (tA2lTypeId in a2l.h: magnitude = byte size, sign = signedness) to the
-/// registry value type. mc-instrument measures `bool` as UINT8, so it arrives here as +1.
 /// Byte size of an A2L type id. The magnitude *is* the size for the integers (see
 /// mc_meas_abi.hpp); the two float ids sit past them and carry their own.
 fn a2l_type_size(t: i8) -> u32 {
@@ -1448,6 +1454,9 @@ fn a2l_type_size(t: i8) -> u32 {
     }
 }
 
+/// Map an A2L type id (tA2lTypeId in a2l.h: for the integers magnitude = byte size and sign =
+/// signedness; -9 and -10 are float and double) to the registry value type. mc-instrument
+/// measures `bool` as UINT8, so it arrives here as +1.
 fn a2l_type_to_value_type(t: i8) -> McValueType {
     match t {
         1 => McValueType::Ubyte,
@@ -1468,7 +1477,7 @@ fn a2l_type_to_value_type(t: i8) -> McValueType {
 }
 
 /// Type lower bound for an unset measurement limit, mirroring xcplite's A2lGetTypeMin (and its C++
-/// copy type_min() in mc.hpp): signed integers use their own minimum, int64/float/double clamp to
+/// copy type_min() in mc_meas_abi.hpp): signed integers use their own minimum, int64/float/double clamp to
 /// -1e12, unsigned integers start at 0. Kept equal to the runtime so the offline A2L agrees.
 fn a2l_type_min(t: i8) -> f64 {
     match t {
@@ -1481,7 +1490,7 @@ fn a2l_type_min(t: i8) -> f64 {
 }
 
 /// Type upper bound for an unset measurement limit, mirroring xcplite's A2lGetTypeMax / type_max()
-/// in mc.hpp: exact maxima for 8/16/32-bit integers, and 1e12 for int64/uint64/float/double.
+/// in mc_meas_abi.hpp: exact maxima for 8/16/32-bit integers, and 1e12 for int64/uint64/float/double.
 fn a2l_type_max(t: i8) -> f64 {
     match t {
         -1 => 127.0,
@@ -1505,7 +1514,7 @@ fn read_cstr_at(data: &[u8], offset: usize) -> Option<String> {
 /// Every string in an `mci_meta` record is a fixed-width buffer laid end to end with the next one.
 /// Scanning past the width made an unterminated field swallow the fields that follow it -- a full
 /// 64-byte owner came back as owner+field+unit+comment, and a full 128-byte comment ran into the
-/// raw f64 min/max bytes, failed UTF-8 and dropped the whole record. mc.hpp's `chars<N>` always
+/// raw f64 min/max bytes, failed UTF-8 and dropped the whole record. mc_meas_abi.hpp's `chars<N>` always
 /// terminates today, so this was latent; the reader is the side that must not trust the section.
 fn read_cstr_bounded(data: &[u8], offset: usize, len: usize) -> Option<String> {
     if offset >= data.len() {

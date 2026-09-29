@@ -146,14 +146,16 @@
 // #define OPTION_DAQ_ASYNC_EVENT
 
 // Enable identifier (resolve-table) addressing for DAQ
-// A measurement (ODT entry) may carry a 32 bit identifier that is resolved to a
-// live pointer at sample time through a table published by XcpSetResolveTable(),
-// instead of the usual base+offset. One addressing mode then covers globals,
-// stack locals and heap/pointer-reachable data without a per-kind address
-// extension, and there is no dynamic-base slot limit for pointer-reachable
-// objects. The identifier travels on the application address extension, so the
-// command path resolves it through ApplXcpReadMemory/ApplXcpWriteMemory and only
-// the DAQ path is affected. See xcp_cfg.h and XcpSetResolveTable() in xcplib.h.
+// A measurement (ODT entry) may carry an identifier (plus a byte offset into the
+// object) that is resolved to a live pointer at sample time through a table
+// published by XcpSetResolveTable(), instead of the usual base+offset. One
+// addressing mode then covers globals, stack locals and heap/pointer-reachable
+// data without a per-kind address extension, and there is no dynamic-base slot
+// limit for pointer-reachable objects. The identifier travels on the application
+// address extension, so the command path hands it to ApplXcpReadMemory /
+// ApplXcpWriteMemory, which resolve it only if the application registers a
+// callback; the library itself changes only the DAQ path. See xcp_cfg.h and
+// XcpSetResolveTable() in xcplib.h.
 // NOT defined here on purpose. Identifier addressing is our fork's addition, and defining it
 // in the shared default configuration turned it on for every XCPLITE_CONFIGURATION=default
 // build -- upstream's own examples and tests included -- so any ODT entry tagged with the

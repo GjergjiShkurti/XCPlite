@@ -1242,15 +1242,15 @@ static uint8_t XcpSetDaqPtr(uint16_t daq, uint8_t odt, uint8_t idx) {
 // pointers passed to XcpEventExt - the application is the single writer of each
 // entry, and a NULL ptr is a defined "not available".
 // Atomic because two threads read them: the XCP command thread when it validates an ODT entry,
-// and the application thread on every DAQ sample. Relaxed/acquire loads are enough -- the table's
-// contents are published before the count is raised (see XcpSetResolveTable).
+// and the application thread on every DAQ sample. Both read them as acquire loads, table before
+// count -- XcpLoadResolveView says why that is the order XcpSetResolveTable's stores support.
 static _Atomic uintptr_t gXcpResolveTable = (uintptr_t)NULL;
 static _Atomic uint32_t gXcpResolveCount = 0;
 
 void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count) {
     // Ordered so a concurrent reader never sees a new pointer with an old count. The XCP
-    // command thread reads both in XcpAddOdtEntry and the application thread reads both per
-    // ODT entry per sample, so a re-publication with a smaller table could otherwise be
+    // command thread reads both in XcpAddOdtEntry and the application thread reads both once
+    // per DAQ list per trigger, so a re-publication with a smaller table could otherwise be
     // observed mid-update and index past the new table's end.
     //
     // Close the window first (count 0 rejects every id), then publish the pointer, then open
@@ -1280,9 +1280,11 @@ static tXcpResolveView XcpLoadResolveView(void) {
     return view;
 }
 
-// Resolve a 32 bit identifier to a live pointer, or NULL if it is out of range,
-// unregistered or not currently available. Identifier 0 is reserved as invalid;
-// valid identifiers are 1..count-1 and index the table directly.
+// Resolve a packed identifier address (identifier and byte offset, xcp_id_addr.h)
+// to a live pointer, or NULL if the identifier is out of range, unregistered or
+// not currently available, or the n bytes at that offset do not fit the object.
+// Identifier 0 is reserved as invalid; valid identifiers are 1..count-1 and index
+// the table directly.
 static const uint8_t *XcpResolveId(const tXcpResolveView *view, uint32_t packed, uint32_t n) {
     const uint32_t id = XcpAddrDecodeId(packed);
     const uint32_t offset = XcpAddrDecodeIdOffset(packed);
@@ -1378,10 +1380,9 @@ static uint8_t XcpAddOdtEntry(uint32_t addr, uint8_t ext, uint8_t size) {
                 base_offset = XcpAddrDecodeAppOffset(addr);
 #ifdef XCP_ENABLE_ID_ADDRESSING
                 // Identifier addressing travels on the application address
-                // extension. If a resolution table is registered, validate the
-                // identifier and the requested size now, so a bad WRITE_DAQ fails
-                // at arm time instead of sampling garbage. Without a table the
-                // application handles the extension itself (external memory).
+                // extension. Validate the identifier, its offset and the requested
+                // size now, so a bad WRITE_DAQ fails at arm time instead of
+                // sampling garbage.
                 // No table means nothing can resolve. Accepting the entry armed a DAQ list
                 // that samples defined zeros for every identifier -- a successful
                 // START_STOP_DAQ_LIST and a screen full of 0.0, with nothing in the log.
@@ -1742,12 +1743,14 @@ static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, const ui
                 uint8_t ext = *addr_ext_ptr++;
                 uint32_t offset = *addr_ptr++;
 #ifdef XCP_ENABLE_ID_ADDRESSING
-                // Identifier addressing: the ODT entry carries a 32 bit
-                // identifier on the application address extension. Resolve it to a
-                // live pointer through the table published by XcpSetResolveTable().
-                // An identifier that is not currently available resolves to NULL
-                // and is sampled as a defined zero, so an armed but not yet live
-                // signal is harmless instead of dereferencing a stale pointer.
+                // Identifier addressing: the ODT entry carries an identifier and a
+                // byte offset (xcp_id_addr.h) on the application address extension.
+                // Resolve it to a live pointer through the table published by
+                // XcpSetResolveTable(). An identifier that is not currently
+                // available, or whose object does not hold n bytes at that offset,
+                // resolves to NULL and is sampled as a defined zero, so an armed but
+                // not yet live signal is harmless instead of dereferencing a stale
+                // pointer.
                 if (XcpAddrIsId(ext)) {
                     const uint8_t *src = XcpResolveId(&resolve_view, offset, n);
                     if (src != NULL) {

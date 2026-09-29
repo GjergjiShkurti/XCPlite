@@ -361,12 +361,12 @@ XCPlite multi application absolute addressing: XCP_ADDRESS_MODE_XCPLITE__CXSDD (
 #define XCP_ENABLE_DAQ_ADDREXT
 
 // --- Identifier (resolve-table) addressing mode for DAQ
-// Optional. A DAQ ODT entry stores a deterministic 32 bit identifier in its
-// address field and is tagged with the application address extension
-// (XCP_ADDR_EXT_APP) purely to select this mode -- the extension carries no data,
-// the whole identifier lives in the 32 bit address. The DAQ sampling loop uses
-// that identifier as a key into a table published by XcpSetResolveTable() to get
-// the live pointer, instead of the usual base+offset.
+// Optional. A DAQ ODT entry stores a deterministic identifier and a byte offset
+// into the object it names in its 32 bit address field (split below), and is
+// tagged with the application address extension (XCP_ADDR_EXT_APP) purely to
+// select this mode -- the extension carries no data. The DAQ sampling loop uses
+// the identifier as a key into a table published by XcpSetResolveTable() to get
+// the live pointer, and adds the offset, instead of the usual base+offset.
 // One addressing mode then covers globals, stack locals and heap/pointer
 // reachable data without a per-kind address extension, and there is no dynamic
 // base slot limit for pointer reachable objects. Only the DAQ path is affected
@@ -395,8 +395,8 @@ XCPlite multi application absolute addressing: XCP_ADDRESS_MODE_XCPLITE__CXSDD (
 #define XCP_ADDR_EXT_ID XCP_ADDR_EXT_APP
 #define XcpAddrIsId(addr_ext) ((addr_ext) == XCP_ADDR_EXT_ID)
 
-// The 32 bit address field is SPLIT, exactly as segment relative addressing splits it a few lines
-// above (XcpAddrEncodeSegIndex): the identifier names the object, the low bits are a byte offset
+// The 32 bit address field is SPLIT, exactly as segment relative addressing splits it further up
+// in this file (XcpAddrEncodeSegIndex): the identifier names the object, the low bits are a byte offset
 // into it. The layout, and why it has to be split, live in one dependency-free header -- an
 // application sees only inc/xcplib.h and the server compiles against this file, so the definition
 // cannot sit in either.

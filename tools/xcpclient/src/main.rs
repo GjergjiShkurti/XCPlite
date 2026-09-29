@@ -766,7 +766,8 @@ async fn xcp_client(
                     elf_reader.register_metadata(&mut reg, verbose)?;
                     // Apply mc-instrument's calibration field metadata from the mci_meta ELF section
                     elf_reader.register_cal_metadata(&mut reg, verbose)?;
-                    // Register identifier-addressed measurements from the mci_meas descriptor section
+                    // Register the measurements the mci_meas descriptor section describes, by identifier
+                    // or, where the backend supplied one (VX1000), by absolute address
                     elf_reader.register_mci_measurements(&mut reg, segment_relative, verbose)?;
                 }
 
