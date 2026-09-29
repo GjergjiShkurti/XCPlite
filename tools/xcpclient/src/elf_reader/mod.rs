@@ -707,15 +707,23 @@ impl ElfReader {
             }
         };
 
-        // The reference pages of the declared calibration segments. The compilation unit filter
-        // narrows the sweep of *incidental* variables -- without it the A2L also describes the
-        // XCP server's own internals -- but a calibration segment is not incidental: it was
-        // declared, register_segments has already created it, and its objects are what the A2L
-        // is being generated for. Filtering its page out left the segment in the registry with
-        // no INSTANCE and no TYPEDEF_STRUCTURE behind it, so the A2L came out with every
+        // The reference pages of the declared calibration segments and blocks. The compilation
+        // unit filter narrows the sweep of *incidental* variables -- without it the A2L also
+        // describes the XCP server's own internals -- but a declared segment is not incidental:
+        // register_segments has already created it, and its objects are what the A2L is being
+        // generated for. Filtering its page out left the segment in the registry with no
+        // INSTANCE and no TYPEDEF_STRUCTURE behind it, so the A2L came out with every
         // measurement, no calibration at all, and a dangling SUB_GROUP -- reported as a warning
-        // on a run that still exited successfully.
-        let calseg_pages: std::collections::HashSet<String> = self.calseg_roots().into_iter().map(|(name, _)| name).collect();
+        // on a run that still exited successfully. A calibration block (calblk__<name>) is the
+        // same declaration through the block API, and its page is found by the same name.
+        let calseg_pages: std::collections::HashSet<String> = self
+            .debug_data
+            .variables
+            .keys()
+            .filter_map(|marker| marker.strip_prefix("calseg__").or_else(|| marker.strip_prefix("calblk__")))
+            .filter(|name| *name != "epk")
+            .map(str::to_string)
+            .collect();
 
         // Compile compilation unit filter regex if specified
         let unit_regex: Option<Regex> = if unit_filter.is_empty() {
@@ -795,7 +803,7 @@ impl ElfReader {
                     continue;
                 }
 
-                // Apply compilation unit filter, except to a calibration segment's reference page
+                // Apply compilation unit filter, except to a calibration segment's or block's page
                 if let Some(ref re) = unit_regex
                     && !calseg_pages.contains(var_name)
                 {
