@@ -623,10 +623,10 @@ void A2lSetApplicationAddrMode(void);
 // Identifier (resolve-table) addressing. A2lCreateMeasurement_ is called with the encoded
 // identifier address (XcpAddrEncodeId(id, 0)) cast to a pointer; the address field of the
 // emitted object becomes that value and the extension is XCP_ADDR_EXT_ID (0x80 in the default
-// XCPLITE__CASDD scheme). default_event_id is emitted as a DEFAULT_EVENT_LIST, or
-// XCP_UNDEFINED_EVENT_ID for no event association. Declared unconditionally (like
-// A2lSetApplicationAddrMode); the definition is guarded by XCP_ENABLE_ID_ADDRESSING.
-void A2lSetIdAddrMode(tXcpEventId default_event_id);
+// XCPLITE__CASDD scheme). event_id, the one event that samples the object, is emitted as a
+// FIXED_EVENT_LIST, or XCP_UNDEFINED_EVENT_ID for no event association. Declared unconditionally
+// (like A2lSetApplicationAddrMode); the definition is guarded by XCP_ENABLE_ID_ADDRESSING.
+void A2lSetIdAddrMode(tXcpEventId event_id);
 
 // Once pattern helper
 bool A2lOnce_(uint64_t *once);

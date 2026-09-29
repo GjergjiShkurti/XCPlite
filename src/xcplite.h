@@ -190,10 +190,12 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 //
 // A DAQ ODT entry may carry an identifier and a byte offset into the object it
 // names (xcp_id_addr.h) instead of a base+offset. The identifier indexes the
-// table published here, and the DAQ sampling loop reads table[id].ptr plus the
-// offset, bounded by table[id].size. An entry whose ptr is NULL is sampled as
+// table published here, which bounds every access by table[id].size. A trigger
+// through XcpEventIdsAt_ is sampled through the addresses it passes, any other
+// trigger through table[id].ptr, and an identifier with no address is sampled as
 // zero (a defined "not currently available"), so an armed but not yet live
-// signal produces no fault. Identifiers travel on the application address extension
+// signal produces no fault. An identifier whose entry names an owning event
+// (XCP_RESOLVE_FLAG_EVENT) cannot be started on any other event. Identifiers travel on the application address extension
 // (XCP_ADDR_EXT_APP). The command path resolves them only if the application
 // registers a resolver: ApplXcpReadMemory / ApplXcpWriteMemory reach
 // ApplXcpRegisterReadCallback / ApplXcpRegisterWriteCallback, and xcpappl.c's
@@ -203,21 +205,17 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 // because a measurement has no reference page and no consistent-write discipline
 // (calibration goes through the segment mechanism, which has both).
 // Identifier 0 is reserved as invalid; valid identifiers are 1..count-1 and index
-// the table directly.
-#ifndef XCP_RESOLVE_ENTRY_DEFINED
-#define XCP_RESOLVE_ENTRY_DEFINED
-#define XCP_RESOLVE_SEG_NONE 0xFFFF
-typedef struct {
-    void *ptr;      // Resolved live location, or NULL if not currently available
-    uint32_t size;  // Byte size at ptr, used for DAQ bounds checking at arm time and per sample
-    uint16_t seg;   // Calibration segment index, or XCP_RESOLVE_SEG_NONE for a measurement
-    uint16_t flags; // Application defined
-} tXcpResolveEntry;
-#endif // XCP_RESOLVE_ENTRY_DEFINED
+// the table directly. tXcpResolveEntry and tXcpIdBases are defined in
+// xcp_id_addr.h, which xcp_cfg.h includes.
 
 // Publish (table != NULL) or clear (table == NULL) the identifier resolution
 // table. The table is indexed directly by identifier; index 0 is reserved.
 void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count);
+
+// Trigger an event and sample its identifier-addressed ODT entries through the
+// addresses this call passes (ids->ptrs[i] is identifier ids->first + i), not
+// through the table's shared ptr fields. Otherwise XcpEventExtAt_.
+void XcpEventIdsAt_(tXcpEventId event, int count, const uint8_t **bases, const tXcpIdBases *ids, uint64_t clock);
 
 #endif // XCP_ENABLE_ID_ADDRESSING
 

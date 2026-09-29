@@ -1216,6 +1216,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await;
         if let Err(e) = res {
             error!("XCP client error: {}", e);
+            // A failure has to be visible to whatever ran this. With exit status 0, a build step
+            // generating an A2L carried on with none, or with the one the previous run left.
+            std::process::exit(1);
         }
     }
 

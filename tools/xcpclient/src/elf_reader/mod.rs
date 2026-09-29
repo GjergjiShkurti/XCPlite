@@ -515,6 +515,48 @@ impl ElfReader {
         // Get the address of the XCP event descriptor memory section
         let xcp_event_section_addr = self.debug_data.get_event_section_addr();
 
+        // An event name belongs to one MEASURE. Each site defines its own evt__<name> record in
+        // xcp_evts, so a name defined at two addresses there is two sites -- one event with one DAQ
+        // list, triggered from two places, which the running application also refuses. Counted by
+        // address, not by DWARF definition: an inline function's MEASURE is one site however many
+        // units include it (the linker keeps one COMDAT copy, and the other units' definitions point
+        // at it or, for a discarded copy, at no address in the section).
+        let evt_section = self.debug_data.sections.get("xcp_evts").copied();
+        let mut duplicate_events: Vec<String> = Vec::new();
+        for (var_name, var_infos) in &self.debug_data.variables {
+            let Some(evt_name) = var_name.strip_prefix("evt__") else {
+                continue;
+            };
+            let Some((start, end)) = evt_section else {
+                break;
+            };
+            // One place per distinct record address: the first definition found at it.
+            let mut sites: std::collections::BTreeMap<u64, &VarInfo> = std::collections::BTreeMap::new();
+            for v in var_infos.iter().filter(|v| v.address.1 >= start && v.address.1 < end) {
+                sites.entry(v.address.1).or_insert(v);
+            }
+            if sites.len() > 1 {
+                let places: Vec<String> = sites
+                    .values()
+                    .map(|v| {
+                        let unit = self.debug_data.make_simple_unit_name(v.unit_idx).unwrap_or_else(|| format!("{}", v.unit_idx));
+                        format!("{}:{}", unit, v.function.as_deref().unwrap_or("?"))
+                    })
+                    .collect();
+                duplicate_events.push(format!("'{}' ({} sites: {})", evt_name, sites.len(), places.join(", ")));
+            }
+        }
+        if !duplicate_events.is_empty() {
+            duplicate_events.sort();
+            return Err(format!(
+                "event name used by more than one MEASURE: {}. An event belongs to one call site -- two would share one \
+                 DAQ list and trigger it from two places. Give each MEASURE an event name of its own. A MEASURE in a \
+                 `static` function in a header is one site per file that includes it: move that function into one .cpp file.",
+                duplicate_events.join("; ")
+            )
+            .into());
+        }
+
         // Iterate over variables
         for (var_name, var_infos) in &self.debug_data.variables {
             // Skip standard library variables and system/compiler internals (__<name>)s
@@ -578,8 +620,10 @@ impl ElfReader {
             // trg__<event_name> (thread local static, name is event name)
             // Event definitions (thread local static variables)
             if var_name.starts_with("trg__") {
-                assert!(var_infos.len() == 1); // Only one definition allowed
-                let var_info = &var_infos[0];
+                // More than one definition is one MEASURE in an inline function, described once per
+                // unit that includes it: two sites with one event name were refused by
+                // register_events. The copy the linker kept is the one with an address.
+                let var_info = var_infos.iter().find(|v| v.address.1 != 0).unwrap_or(&var_infos[0]);
 
                 // Get the event name from format  "trg__<tag>__<eventname>" prefix
                 let s = var_name.strip_prefix("trg__").unwrap_or("unnamed");
@@ -587,7 +631,7 @@ impl ElfReader {
                 let evt_mode = parts.next().unwrap_or("");
                 let evt_name = parts.next().unwrap_or("");
 
-                let evt_unit_idx = var_infos[0].unit_idx;
+                let evt_unit_idx = var_info.unit_idx;
                 let evt_unit_name = if let Some(name) = self.debug_data.make_simple_unit_name(evt_unit_idx) {
                     name
                 } else {
@@ -1025,9 +1069,10 @@ impl ElfReader {
     /// The string pointers are absolute virtual addresses into .rodata (our binaries are
     /// linked at base 0, so the stored value is the string's vaddr and no relocation needs to be
     /// applied). Identifiers are NOT read from the binary: they are the 1-based position of each
-    /// name in the byte-wise sorted, de-duplicated set of names -- exactly how register_measurements()
-    /// assigns them at runtime (identifier-addressing spec §3). Reproducing that sort here is what
-    /// makes the offline A2L agree with a runtime A2L on every id.
+    /// A2L name, `<event>.<name>`, in the byte-wise sorted set of names -- exactly how
+    /// register_measurements() assigns them at runtime (identifier-addressing spec §3). Reproducing
+    /// that sort here is what makes the offline A2L agree with a runtime A2L on every id. A name
+    /// that occurs twice is refused, as the application refuses it.
     pub fn register_mci_measurements(&self, reg: &mut Registry, segment_relative: bool, verbose: usize) -> Result<(), Box<dyn Error>> {
         let Some((_base, data)) = self.debug_data.mci_meas_data.as_ref() else {
             return Ok(());
@@ -1234,12 +1279,48 @@ impl ElfReader {
             recs.push(MeasRec { name, ty, x_dim, comment, unit, min, max, addr, event });
         }
 
-        // Deterministic identifiers: 1-based position in the byte-wise sorted, de-duplicated name
-        // list (spec §3). strcmp on the C strings is a byte comparison, which is exactly the Ord
-        // that sort/dedup on Rust String gives for these ASCII identifiers.
-        let mut names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
-        names.sort_unstable();
-        names.dedup();
+        // Each record's A2L name: `<event>.<name>`, or the bare name for a record built outside any
+        // MEASURE -- the rule mc-instrument's a2l_name() applies at runtime. A name alone does not say
+        // which object it is: two functions each measuring a local `speed`, or one global measured by
+        // two events, used to become one A2L object, so one of the objects went unmeasured. With the
+        // event in the name every entry is its own signal on its own event.
+        let qualified: Vec<String> = recs
+            .iter()
+            .map(|r| if r.event.is_empty() { r.name.clone() } else { format!("{}.{}", r.event, r.name) })
+            .collect();
+
+        // Deterministic identifiers: 1-based position in the byte-wise sorted name list (spec §3).
+        // strcmp on the C strings is a byte comparison, which is exactly the Ord that sorting Rust
+        // Strings gives for these ASCII identifiers.
+        let mut order: Vec<usize> = (0..recs.len()).collect();
+        order.sort_unstable_by(|&x, &y| qualified[x].cmp(&qualified[y]));
+
+        // A name sorted next to itself is two entries of one MEASURE: one A2L object for two
+        // objects, which the running application refuses to start with. An A2L for it would describe
+        // one of them under both names, so it is refused here too, naming every repeat.
+        let mut repeats: Vec<String> = Vec::new();
+        for w in order.windows(2) {
+            if qualified[w[0]] == qualified[w[1]] {
+                let r = &recs[w[1]];
+                let what = if r.event.is_empty() {
+                    format!("'{}' is named twice outside any MEASURE", r.name)
+                } else {
+                    format!("MEASURE({}, ...) lists '{}' twice", r.event, r.name)
+                };
+                if repeats.last() != Some(&what) {
+                    repeats.push(what);
+                }
+            }
+        }
+        if !repeats.is_empty() {
+            return Err(format!(
+                "measurement entries that share a name: {}. One signal cannot stand for two objects: measure each \
+                 object once, or give one a .name of its own.",
+                repeats.join("; ")
+            )
+            .into());
+        }
+        let names: Vec<&str> = order.iter().map(|&i| qualified[i].as_str()).collect();
         // identifier 0 is reserved (invalid), so ids are 1-based.
         let id_of = |name: &str| -> u32 { (names.binary_search(&name).unwrap() as u32) + 1 };
 
@@ -1269,58 +1350,9 @@ impl ElfReader {
             .into());
         }
 
-        // When one name appears in several records, the runtime keeps the WIDEST of them
-        // (`register_measurements` takes the max of type_size * x_dim), so the A2L has to
-        // describe the same one or the master arms a width the application did not reserve.
-        // Taking the first record instead let link order decide what the signal's type was.
-        //
-        // Built once into a map rather than re-scanned per id: this used to filter every record
-        // and binary-search each one's name, once per distinct id, which is O(n^2 log n) in the
-        // measurement count.
-        //
-        // The tie-break is explicit. `max_by_key` returns the LAST maximum, so two records of
-        // equal width used to be separated by their order in the ELF section -- and that order is
-        // compiler-dependent (gcc emits these descriptors in reverse, clang forward). The record
-        // chosen decides the signal's DEFAULT_EVENT_LIST, so the same source built by the other
-        // compiler could bind a two-event signal to the other event. Widest first, then the lowest
-        // event id, which is a property of the program rather than of the toolchain.
-        let mut widest: std::collections::HashMap<u32, &MeasRec> = std::collections::HashMap::new();
-        for r in &recs {
-            let key = |x: &MeasRec| {
-                (
-                    (a2l_type_size(x.ty) as u32) * u32::from(x.x_dim.max(1)),
-                    std::cmp::Reverse(reg.event_list.find_event(&x.event, 0).map_or(u16::MAX, |e| e.id)),
-                )
-            };
-            widest
-                .entry(id_of(&r.name))
-                .and_modify(|best| {
-                    if key(r) > key(best) {
-                        *best = r;
-                    }
-                })
-                .or_insert(r);
-        }
-        let widest_for_id = |id: u32| -> &MeasRec { widest.get(&id).copied().expect("id came from recs") };
-
-        let mut emitted: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut count = 0usize;
-        for r in &recs {
-            let id = id_of(&r.name);
-            // A name measured under several events appears in several records but is one A2L object.
-            if !emitted.insert(id) {
-                continue;
-            }
-            let widest = widest_for_id(id);
-            if widest.ty != r.ty || widest.x_dim.max(1) != r.x_dim.max(1) {
-                warn!(
-                    "measurement '{}' is described by records that disagree on shape (type {} dim {} \
-                     vs type {} dim {}); using the wider one, which is what the application's \
-                     resolve table reserves. Give one of them a .name of its own.",
-                    r.name, r.ty, r.x_dim.max(1), widest.ty, widest.x_dim.max(1)
-                );
-            }
-            let r = widest;
+        for (r, name) in recs.iter().zip(qualified.iter()) {
+            let id = id_of(name);
             let value_type = a2l_type_to_value_type(r.ty);
             let dim_type = McDimType::new(value_type, r.x_dim.max(1), 1);
             // Match sig_min/sig_max in mc_meas_abi.hpp: the descriptor stores (0.0, 0.0) when
@@ -1391,14 +1423,14 @@ impl ElfReader {
                 // on unrelated objects. Mirrors XcpAddrEncodeId in xcplite's inc/xcp_id_addr.h.
                 None => McAddress::new_a2l_with_event(event_id, id << XCP_ID_OFFSET_BITS, XCP_ADDR_EXT_APP),
             };
-            match reg.instance_list.add_instance(r.name.clone(), dim_type, sd, addr) {
+            match reg.instance_list.add_instance(name.clone(), dim_type, sd, addr) {
                 Ok(_) => {
                     count += 1;
                     if verbose >= 1 {
-                        info!("  measurement '{}' id={} type={:?} dim={}", r.name, id, value_type, r.x_dim.max(1));
+                        info!("  measurement '{}' id={} type={:?} dim={}", name, id, value_type, r.x_dim.max(1));
                     }
                 }
-                Err(e) => error!("Failed to register measurement '{}': {}", r.name, e),
+                Err(e) => error!("Failed to register measurement '{}': {}", name, e),
             }
         }
         info!("Registered {} identifier-addressed measurement(s) from mci_meas", count);

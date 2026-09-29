@@ -421,61 +421,29 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 //
 // A DAQ measurement (ODT entry) may carry an identifier and a byte offset into
 // the object it names (layout in xcp_id_addr.h) instead of a base+offset
-// address. The identifier indexes a table published by XcpSetResolveTable();
-// the DAQ sampling loop reads table[id].ptr plus the offset, bounded by
-// table[id].size, and an entry whose ptr is NULL is sampled as zero ("not
+// address. The identifier indexes a table published by XcpSetResolveTable(),
+// which bounds every access by table[id].size. A trigger through
+// XcpEventIdsAt_ passes the live addresses of its own identifiers, and the DAQ
+// sampling loop reads those; any other trigger is sampled through
+// table[id].ptr. An identifier with no address is sampled as zero ("not
 // currently available").
 // This lets a single addressing mode cover globals, stack locals and
 // heap/pointer-reachable data, and removes the dynamic-base slot limit for
 // pointer-reachable objects. Identifier 0 is reserved; valid identifiers are
-// 1..count-1 and index the table directly.
+// 1..count-1 and index the table directly. The table entry and the per-trigger
+// addresses (tXcpResolveEntry, tXcpIdBases) are defined in xcp_id_addr.h.
 #include "xcp_id_addr.h"
-
-#ifndef XCP_RESOLVE_ENTRY_DEFINED
-#define XCP_RESOLVE_ENTRY_DEFINED
-#define XCP_RESOLVE_SEG_NONE 0xFFFF
-typedef struct {
-    /// Resolved live location, or NULL if not currently available.
-    ///
-    /// Written by the application per trigger, as a plain access, and read by two consumers:
-    ///
-    ///   * the DAQ sampling loop, which runs in whichever thread triggers the event -- the
-    ///     writer's own, unless the identifier is also measured by an event triggered on another
-    ///     thread (the rule below) -- and
-    ///   * ApplXcpReadMemory -- the application read callback registered through
-    ///     ApplXcpRegisterReadCallback -- which serves SHORT_UPLOAD / UPLOAD / CALC_CHECKSUM of
-    ///     an identifier-addressed object and runs on the XCP command/RX thread, never the
-    ///     writer's.
-    ///
-    /// All three accesses are plain. That is safe only under the rule below, which the library
-    /// cannot enforce:
-    ///
-    /// **One identifier must be updated from one thread.** A single measurement name deliberately
-    /// shares one identifier across every event that measures it, so if two of those events fire
-    /// on different threads, this field has two writers and the sample may be taken through
-    /// either.
-    ///
-    /// The guarantee the rule actually gives, in either direction: the value is never torn on any
-    /// supported target (an aligned pointer), so the worst case is an access through a *previous*
-    /// trigger's address -- the wrong event's, or a moment out of date -- and never a corrupt
-    /// pointer. That is the same failure for the command path as for the DAQ loop, which is why
-    /// adding the second reader does not weaken the rule. It is still a data race by the standard,
-    /// and a sanitizer will say so.
-    ///
-    /// Deliberately not an atomic: this struct is shared between C11 and C++17 translation units,
-    /// so the field would have to be spelled differently on each side of the seam for no change in
-    /// the observable outcome. The *table* is published atomically; see XcpSetResolveTable.
-    void *ptr;
-    uint32_t size;  ///< Byte size at ptr, used for DAQ bounds checking at arm time and per sample
-    uint16_t seg;   ///< Calibration segment index, or XCP_RESOLVE_SEG_NONE for a measurement
-    uint16_t flags; ///< Application defined
-} tXcpResolveEntry;
-#endif // XCP_RESOLVE_ENTRY_DEFINED
 
 /// Publish or clear the identifier resolution table.
 /// @param table Table indexed directly by identifier (index 0 reserved), or NULL to clear.
 /// @param count Number of entries in the table.
 void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count);
+
+/// Trigger an event, sampling identifier-addressed ODT entries through the addresses this call
+/// passes rather than through the resolution table's shared `ptr` fields. Otherwise the same as
+/// XcpEventExtAt_.
+/// @param ids This trigger's addresses: ids->ptrs[i] belongs to identifier ids->first + i.
+void XcpEventIdsAt_(tXcpEventId event, int count, const uint8_t **bases, const tXcpIdBases *ids, uint64_t clock);
 
 // Enable or disable a XCP DAQ event
 void XcpEventEnable(tXcpEventId event, bool enable);

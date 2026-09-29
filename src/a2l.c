@@ -408,13 +408,12 @@ static void A2lCreateMeasurement_IF_DATA(void) {
 #endif
 #ifdef XCP_ENABLE_ID_ADDRESSING
         // Identifier addressing shares the application address extension, so it is not caught
-        // by the addr_ext tests above; the id-mode flag is what distinguishes it. The object
-        // is measurable on the default event, but is not bound to it (a signal may appear on
-        // several events, spec §7), so a VARIABLE / DEFAULT_EVENT_LIST is emitted, not FIXED.
+        // by the addr_ext tests above; the id-mode flag is what distinguishes it. An identifier
+        // belongs to exactly one event, and the server refuses to start it on any other
+        // (XcpCheckIdEvents), so the association is FIXED: a tool must not offer another event.
         else if (gA2lIdMode) {
-            if (gA2lDefaultEvent != XCP_UNDEFINED_EVENT_ID) {
-                fprintf(gA2lFile, " /begin IF_DATA XCP /begin DAQ_EVENT VARIABLE /begin DEFAULT_EVENT_LIST EVENT 0x%X /end DEFAULT_EVENT_LIST /end DAQ_EVENT /end IF_DATA",
-                        gA2lDefaultEvent);
+            if (gA2lFixedEvent != XCP_UNDEFINED_EVENT_ID) {
+                fprintf(gA2lFile, " /begin IF_DATA XCP /begin DAQ_EVENT FIXED_EVENT_LIST EVENT 0x%X /end DAQ_EVENT /end IF_DATA", gA2lFixedEvent);
             }
         }
 #endif
@@ -734,19 +733,18 @@ void A2lSetApplicationAddrMode(void) {
 // (XcpAddrEncodeId, xcp_id_addr.h), not a memory address; the address extension is
 // XCP_ADDR_EXT_ID (== XCP_ADDR_EXT_APP) and serves only as a mode tag. A2lCreateMeasurement_ is
 // called with that encoded address cast to a pointer, and A2lGetAddr_ then passes it through
-// unchanged (see below). default_event_id, when set, is emitted as a
-// DEFAULT_EVENT_LIST so a tool knows which event can sample the object; XCP_UNDEFINED_EVENT_ID
-// emits no event association at all.
-void A2lSetIdAddrMode(tXcpEventId default_event_id) {
+// unchanged (see below). event_id, when set, is emitted as a FIXED_EVENT_LIST: it is the one
+// event that samples the object. XCP_UNDEFINED_EVENT_ID emits no event association at all.
+void A2lSetIdAddrMode(tXcpEventId event_id) {
     if (gA2lFile != NULL) {
-        gA2lFixedEvent = XCP_UNDEFINED_EVENT_ID;
-        gA2lDefaultEvent = default_event_id;
+        gA2lFixedEvent = event_id;
+        gA2lDefaultEvent = XCP_UNDEFINED_EVENT_ID;
         gA2lFramePtr = NULL;
         gA2lBasePtr = NULL;
         gA2lAddrExt = XCP_ADDR_EXT_ID;
         gA2lIdMode = true;
-        if (default_event_id != XCP_UNDEFINED_EVENT_ID) {
-            beginEventGroup(default_event_id);
+        if (event_id != XCP_UNDEFINED_EVENT_ID) {
+            beginEventGroup(event_id);
         }
     }
 }

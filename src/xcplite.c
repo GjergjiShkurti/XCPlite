@@ -1285,7 +1285,11 @@ static tXcpResolveView XcpLoadResolveView(void) {
 // not currently available, or the n bytes at that offset do not fit the object.
 // Identifier 0 is reserved as invalid; valid identifiers are 1..count-1 and index
 // the table directly.
-static const uint8_t *XcpResolveId(const tXcpResolveView *view, uint32_t packed, uint32_t n) {
+//
+// With `ids`, the trigger's own addresses answer, and an identifier they do not cover is not this
+// trigger's to sample. The table's ptr answers only for a trigger that passed none: it holds
+// whichever address the last trigger stored, which may be another thread's or another event's.
+static const uint8_t *XcpResolveId(const tXcpResolveView *view, const tXcpIdBases *ids, uint32_t packed, uint32_t n) {
     const uint32_t id = XcpAddrDecodeId(packed);
     const uint32_t offset = XcpAddrDecodeIdOffset(packed);
     const tXcpResolveEntry *const table = view->table;
@@ -1293,21 +1297,67 @@ static const uint8_t *XcpResolveId(const tXcpResolveView *view, uint32_t packed,
     if (table == NULL || id == 0 || id >= count) {
         return NULL;
     }
-    // Bounded by the object as the slot describes it *now*, offset included. Two things make the
-    // arm-time check insufficient on its own: one identifier is shared by every descriptor with
-    // the same name and the size recorded is the widest of them, so two same-named objects of
-    // different width pass on the wider one; and the slot's pointer is republished per trigger,
-    // so what it points at can change between arming and sampling. Written so neither term can
-    // overflow -- both come off the wire.
+    // Bounded by the object as the table describes it *now*, offset included: the arm-time check
+    // alone would miss a table republished between arming and sampling. Written so neither term
+    // can overflow -- both come off the wire.
     const uint32_t size = table[id].size;
     if (offset > size || n > size - offset) {
         return NULL;
     }
-    const uint8_t *base = (const uint8_t *)table[id].ptr;
+    const uint8_t *base;
+    if (ids != NULL) {
+        if (id < ids->first || id - ids->first >= ids->count) {
+            return NULL; // another trigger's identifier
+        }
+        base = (const uint8_t *)ids->ptrs[id - ids->first];
+    } else {
+        base = (const uint8_t *)table[id].ptr;
+    }
     if (base == NULL) {
         return NULL; // not currently available; adding an offset to NULL would be undefined
     }
     return base + offset;
+}
+
+// Whether every identifier-addressed ODT entry of a DAQ list may be sampled on the list's event.
+// An identifier whose entry names an owning event (XCP_RESOLVE_FLAG_EVENT) may not: its object
+// lives where that event's trigger says, and on another event the only address available is
+// whatever the owner stored last -- for a stack local, a frame that has returned. Checked when the
+// list starts, because only then is its event certain: WRITE_DAQ usually precedes
+// SET_DAQ_LIST_MODE.
+static bool XcpCheckIdEvents(uint16_t daq) {
+    const tXcpResolveView view = XcpLoadResolveView();
+    if (view.table == NULL) {
+        return true;
+    }
+    const tXcpEventId event = DaqListEventChannel(daq);
+    for (uint16_t odt = DaqListFirstOdt(daq); odt <= DaqListLastOdt(daq); odt++) {
+        for (uint32_t e = DaqListOdtTable[odt].first_odt_entry; e <= DaqListOdtTable[odt].last_odt_entry; e++) {
+            if (!XcpAddrIsId(DaqListOdtEntryAddrExtTable[e])) {
+                continue;
+            }
+            const uint32_t id = XcpAddrDecodeId(DaqListOdtEntryAddrTable[e]);
+            if (id == 0 || id >= view.count) {
+                continue; // refused by WRITE_DAQ already
+            }
+            const tXcpResolveEntry *const r = &view.table[id];
+            if ((r->flags & XCP_RESOLVE_FLAG_EVENT) != 0 && r->event != event) {
+                DBG_PRINTF_ERROR("DAQ list %u: identifier %u belongs to event %u and cannot be sampled on event %u\n", daq, id, r->event, event);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// XcpCheckIdEvents for every selected DAQ list, which START_STOP_SYNCH is about to start.
+static bool XcpCheckSelectedIdEvents(void) {
+    for (uint16_t daq = 0; daq < shared.daq_lists.daq_count; daq++) {
+        if ((DaqListState(daq) & DAQ_STATE_SELECTED) != 0 && !XcpCheckIdEvents(daq)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 #endif // XCP_ENABLE_ID_ADDRESSING
@@ -1661,15 +1711,22 @@ static void XcpStopSelectedDaqLists(void) {
 /****************************************************************************/
 
 // Trigger DAQ list
+// `ids` is the trigger's own identifier addresses (XcpEventIdsAt_), or NULL for a trigger that passed none.
+// Declared at file scope so the trigger functions share one type in a build without identifier
+// addressing too, where xcp_id_addr.h is not included and the parameter would otherwise declare a
+// new struct in each prototype.
+struct tXcpIdBases;
 #ifdef XCP_ENABLE_DAQ_ADDREXT
-static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, int count, const uint8_t **bases, uint64_t clock) {
+static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, int count, const uint8_t **bases, const struct tXcpIdBases *ids, uint64_t clock) {
 #else
-static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, const uint8_t *base, uint64_t clock) {
+static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, const uint8_t *base, const struct tXcpIdBases *ids, uint64_t clock) {
 #endif
     uint8_t *d0;
     uint16_t odt, hs;
 
-#ifdef XCP_ENABLE_ID_ADDRESSING
+#ifndef XCP_ENABLE_ID_ADDRESSING
+    (void)ids;
+#else
     // Taken once for the whole DAQ list, not once per ODT entry. The pair cannot usefully
     // change inside one trigger -- a re-publication that lands mid-list would only mean some
     // entries sample the old table and some the new -- and re-loading it per entry cost two
@@ -1745,14 +1802,14 @@ static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, const ui
 #ifdef XCP_ENABLE_ID_ADDRESSING
                 // Identifier addressing: the ODT entry carries an identifier and a
                 // byte offset (xcp_id_addr.h) on the application address extension.
-                // Resolve it to a live pointer through the table published by
-                // XcpSetResolveTable(). An identifier that is not currently
-                // available, or whose object does not hold n bytes at that offset,
-                // resolves to NULL and is sampled as a defined zero, so an armed but
-                // not yet live signal is harmless instead of dereferencing a stale
-                // pointer.
+                // Resolve it to a live pointer through the trigger's own addresses,
+                // or the table published by XcpSetResolveTable() for a trigger that
+                // passed none. An identifier that is not currently available, or
+                // whose object does not hold n bytes at that offset, resolves to NULL
+                // and is sampled as a defined zero, so an armed but not yet live
+                // signal is harmless instead of dereferencing a stale pointer.
                 if (XcpAddrIsId(ext)) {
-                    const uint8_t *src = XcpResolveId(&resolve_view, offset, n);
+                    const uint8_t *src = XcpResolveId(&resolve_view, ids, offset, n);
                     if (src != NULL) {
                         memcpy(dst, src, n);
                     } else {
@@ -1785,7 +1842,7 @@ static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, const ui
 
 // Trigger DAQ event
 // DAQ lists must be valid and DAQ must be running
-static void XcpTriggerDaqEvent_(tQueueHandle queue_handle, tXcpEventId event_id, int count, const uint8_t **bases, uint64_t clock) {
+static void XcpTriggerDaqEvent_(tQueueHandle queue_handle, tXcpEventId event_id, int count, const uint8_t **bases, const struct tXcpIdBases *ids, uint64_t clock) {
 
 #ifdef TEST_ENABLE_DBG_METRICS
     atomic_fetch_add_explicit(&gXcpDaqEventCount, 1, memory_order_relaxed);
@@ -1808,9 +1865,9 @@ static void XcpTriggerDaqEvent_(tQueueHandle queue_handle, tXcpEventId event_id,
 #ifndef XCP_ENABLE_DAQ_ADDREXT
         // Address extension unique per DAQ list, use base pointer for this DAQ list
         uint8_t ext = DaqListAddrExt(daq);
-        XcpTriggerDaqList_(queue_handle, daq, bases[ext], clock); // Trigger DAQ list
+        XcpTriggerDaqList_(queue_handle, daq, bases[ext], ids, clock); // Trigger DAQ list
 #else
-        XcpTriggerDaqList_(queue_handle, daq, count, bases, clock); // Trigger DAQ list
+        XcpTriggerDaqList_(queue_handle, daq, count, bases, ids, clock); // Trigger DAQ list
 #endif
 
     } /* daq */
@@ -1856,9 +1913,9 @@ static void XcpTriggerDaqEvent_(tQueueHandle queue_handle, tXcpEventId event_id,
 #ifndef XCP_ENABLE_DAQ_ADDREXT
             // Address extension unique per DAQ list, use base pointer for this DAQ list
             uint8_t ext = DaqListAddrExt(daq);
-            XcpTriggerDaqList_(queue_handle, daq, bases[ext], clock); // Trigger DAQ list
+            XcpTriggerDaqList_(queue_handle, daq, bases[ext], ids, clock); // Trigger DAQ list
 #else
-            XcpTriggerDaqList_(queue_handle, daq, count, bases, clock); // Trigger DAQ list
+            XcpTriggerDaqList_(queue_handle, daq, count, bases, ids, clock); // Trigger DAQ list
 #endif
         }
     }
@@ -1884,7 +1941,8 @@ static void XcpProcessPendingCommand(tXcpEventId event, int count, const uint8_t
 }
 #endif // XCP_ENABLE_DYN_ADDRESSING
 
-void XcpEventExtAt_(tXcpEventId event, int count, const uint8_t **bases, uint64_t clock) {
+// XcpEventExtAt_, and XcpEventIdsAt_ with the trigger's own identifier addresses.
+static void XcpEventExtIdsAt_(tXcpEventId event, int count, const uint8_t **bases, const struct tXcpIdBases *ids, uint64_t clock) {
 
     if (!isStarted())
         return;
@@ -1905,8 +1963,14 @@ void XcpEventExtAt_(tXcpEventId event, int count, const uint8_t **bases, uint64_
     // Daq
     if (!isDaqRunning())
         return; // DAQ not running
-    XcpTriggerDaqEvent_(local.queue, event, count, bases, clock);
+    XcpTriggerDaqEvent_(local.queue, event, count, bases, ids, clock);
 }
+
+void XcpEventExtAt_(tXcpEventId event, int count, const uint8_t **bases, uint64_t clock) { XcpEventExtIdsAt_(event, count, bases, NULL, clock); }
+
+#ifdef XCP_ENABLE_ID_ADDRESSING
+void XcpEventIdsAt_(tXcpEventId event, int count, const uint8_t **bases, const tXcpIdBases *ids, uint64_t clock) { XcpEventExtIdsAt_(event, count, bases, ids, clock); }
+#endif
 
 void XcpEventExt_(tXcpEventId event, int count, const uint8_t **bases) {
 
@@ -1928,7 +1992,7 @@ void XcpEventExt_(tXcpEventId event, int count, const uint8_t **bases) {
 
     if (!isDaqRunning())
         return; // DAQ not running
-    XcpTriggerDaqEvent_(local.queue, event, count, bases, ApplXcpGetClock64());
+    XcpTriggerDaqEvent_(local.queue, event, count, bases, NULL, ApplXcpGetClock64());
 }
 
 //----------------------------------------------------------------------------
@@ -1974,7 +2038,7 @@ void XcpEvent(tXcpEventId event) {
 #else
     const uint8_t *bases[2] = {NULL, xcp_get_base_addr()};
 #endif
-    XcpTriggerDaqEvent_(local.queue, event, 2, bases, ApplXcpGetClock64());
+    XcpTriggerDaqEvent_(local.queue, event, 2, bases, NULL, ApplXcpGetClock64());
 }
 void XcpEventAt(tXcpEventId event, uint64_t clock) {
     if (!isDaqRunning())
@@ -1993,7 +2057,7 @@ void XcpEventAt(tXcpEventId event, uint64_t clock) {
 #else
     const uint8_t *bases[2] = {NULL, xcp_get_base_addr()};
 #endif
-    XcpTriggerDaqEvent_(local.queue, event, 2, bases, clock);
+    XcpTriggerDaqEvent_(local.queue, event, 2, bases, NULL, clock);
 }
 
 #if defined(XCP_ENABLE_DYN_ADDRESSING)
@@ -2027,7 +2091,7 @@ void XcpEventExt_Var(tXcpEventId event, int args_count, ...) {
 
     if (!isDaqRunning())
         return; // DAQ not running
-    XcpTriggerDaqEvent_(local.queue, event, XCP_ADDR_EXT_DYN + args_count, bases, ApplXcpGetClock64());
+    XcpTriggerDaqEvent_(local.queue, event, XCP_ADDR_EXT_DYN + args_count, bases, NULL, ApplXcpGetClock64());
 }
 
 void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int args_count, ...) {
@@ -2057,7 +2121,7 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int args_count, ...) {
 
     if (!isDaqRunning())
         return; // DAQ not running
-    XcpTriggerDaqEvent_(local.queue, event, XCP_ADDR_EXT_DYN + args_count, bases, clock);
+    XcpTriggerDaqEvent_(local.queue, event, XCP_ADDR_EXT_DYN + args_count, bases, NULL, clock);
 }
 
 #endif // XCP_ENABLE_DYN_ADDRESSING
@@ -2825,6 +2889,10 @@ static uint8_t XcpAsyncCommand(bool async, const uint32_t *cmdBuf, uint8_t cmdLe
                 DBG_PRINT_ERROR("START_STOP_DAQ_LIST to start individual DAQ list is not supported, START_STOP_SYNCH start selected is mandatory!\n");
                 error(CRC_MODE_NOT_VALID);
 #endif
+#ifdef XCP_ENABLE_ID_ADDRESSING
+                if (!XcpCheckIdEvents(daq))
+                    error(CRC_DAQ_CONFIG); // an identifier armed on an event it does not belong to
+#endif
                 XcpStartDaqList(daq); // start DAQ list
                 XcpStartDaq();        // start event processing, if not already running
             } else if (mode == 0) {   // stop
@@ -2860,6 +2928,10 @@ static uint8_t XcpAsyncCommand(bool async, const uint32_t *cmdBuf, uint8_t cmdLe
                     DBG_PRINT_ERROR("DAQ is already running, start of additional DAQ list sets is not supported!\n");
                     error(CRC_DAQ_ACTIVE);
                 }
+#endif
+#ifdef XCP_ENABLE_ID_ADDRESSING
+                if (!XcpCheckSelectedIdEvents())
+                    error(CRC_DAQ_CONFIG); // an identifier armed on an event it does not belong to
 #endif
                 XcpSendResponse(async, &CRM, CRM_LEN); // Transmit response first and then start DAQ
                 XcpStartSelectedDaqLists();
