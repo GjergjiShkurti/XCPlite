@@ -1748,6 +1748,11 @@ impl ElfReader {
             return Ok(());
         }
 
+        // Where inside a segment a struct of a given type sits depends on the segment and the type
+        // alone, and every field of that type asks the same question: each segment's tree is
+        // walked once per declaring type, not once per record.
+        let mut prefixes_of: std::collections::HashMap<(usize, String), Vec<String>> = std::collections::HashMap::new();
+
         let is_le = self.debug_data.is_little_endian;
         for chunk in meta_data.chunks(MCI_META_RECORD_LEN) {
             let Some(record) = parse_cal_meta_record(chunk, is_le) else {
@@ -1787,11 +1792,12 @@ impl ElfReader {
                 continue;
             }
             let mut applied = 0;
-            for (segment, root) in &segments {
+            for (index, (segment, root)) in segments.iter().enumerate() {
                 // Where inside this segment a struct of the declaring type sits. Usually nowhere
                 // or at the root; a nested MC_STRUCT puts it one or more members down, and the
                 // field's A2L path then carries that prefix.
-                for prefix in self.paths_to_type(root, &record.owner) {
+                let prefixes = prefixes_of.entry((index, record.owner.clone())).or_insert_with(|| self.paths_to_type(root, &record.owner));
+                for prefix in prefixes.iter() {
                     self.apply_cal_metadata(reg, segment, &format!("{}{}", prefix, record.field), &record, verbose);
                     applied += 1;
                 }
