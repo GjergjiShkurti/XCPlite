@@ -376,6 +376,11 @@ impl DebugDataReader<'_> {
             // Where each variable DIE of this unit ended up, so that a later definition DIE can
             // find the declaration it completes. Unit-relative offsets, so it is per unit.
             let mut declared: HashMap<gimli::UnitOffset, (String, usize)> = HashMap::new();
+            // Definitions whose declaration had not been read when they were (issue 42): the
+            // declaration's offset, the name and where the definition was put. gcc writes the
+            // declaration first, which the merge below relies on, but DWARF does not require that
+            // order; these are merged once the whole unit is read.
+            let mut forward: Vec<(gimli::UnitOffset, String, usize)> = Vec::new();
             while let Ok(Some((depth_delta, entry))) = entries_cursor.next_dfs() {
                 depth += depth_delta;
                 debug_assert!(depth >= 1);
@@ -425,6 +430,9 @@ impl DebugDataReader<'_> {
                             if !merged {
                                 let (function, namespaces) = get_varinfo_from_context(&context);
                                 let infos = variables.entry(name.clone()).or_default();
+                                if let Some(offset) = specification {
+                                    forward.push((offset, name.clone(), infos.len()));
+                                }
                                 declared.insert(entry_offset, (name, infos.len()));
                                 infos.push(VarInfo {
                                     address, // may be 0 for local variables
@@ -441,6 +449,35 @@ impl DebugDataReader<'_> {
                                 log::warn!("Error loading variable @{offset:x}: {errmsg}");
                             }
                         }
+                    }
+                }
+            }
+
+            // The second pass: each forward definition gives its address to the declaration it
+            // completes, which keeps the namespaces only it knows, and is then removed -- after all
+            // of them are merged, so that the positions `declared` recorded stay valid until then.
+            let mut absorbed: HashMap<String, Vec<usize>> = HashMap::new();
+            for (offset, name, index) in forward {
+                let Some((declared_name, declared_index)) = declared.get(&offset) else {
+                    continue;
+                };
+                if *declared_name != name || *declared_index == index {
+                    continue;
+                }
+                let Some(infos) = variables.get_mut(name.as_str()) else {
+                    continue;
+                };
+                let address = infos[index].address;
+                if infos[*declared_index].address.1 == 0 {
+                    infos[*declared_index].address = address;
+                }
+                absorbed.entry(name).or_default().push(index);
+            }
+            for (name, mut indices) in absorbed {
+                indices.sort_unstable();
+                if let Some(infos) = variables.get_mut(name.as_str()) {
+                    for index in indices.into_iter().rev() {
+                        infos.remove(index);
                     }
                 }
             }
