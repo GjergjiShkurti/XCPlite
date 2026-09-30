@@ -104,7 +104,10 @@ static void *XcpCalMemAlloc_(size_t size) {
     DBG_PRINTF6("Allocating %zu bytes from calibration memory pool\n", size);
     assert(size > 0);
     assert((size % XCP_CALPAGE_ALIGNMENT) == 0);
-    assert(size <= (size_t)XCP_CAL_MEM_SIZE);
+    // No assert that the size fits the whole pool. A segment larger than OPTION_CAL_MEM_SIZE is a
+    // configuration limit, not a programming error, and the assert aborted the application at
+    // startup from inside XcpCreateCalSeg. The check below refuses it like any allocation the pool
+    // can no longer serve, and XcpCreateCalSeg_ reports the segment as not created.
     assert((uintptr_t)shared.cal_seg_list.cal_mem.pool % XCP_CALPAGE_ALIGNMENT == 0);
     uint_least32_t old_used, new_used;
     do {
@@ -446,6 +449,13 @@ static tXcpCalSegIndex XcpCreateCalSeg_(const char *name, bool lookup, const voi
         // Allocate memory for the new segment from the embedded pool using the thread-safe bump allocator
         // Header + DEFAULT page + ECU page + XCP page + RCU swap page
         calseg = (tXcpCalSeg *)XcpCalMemAlloc_(sizeof(tXcpCalSegHeader) + CALSEG_PAGE_COUNT * (size_t)aligned_page_size);
+        // An exhausted pool returns NULL, which XcpInitCalSeg_ only asserts on: without asserts it
+        // wrote the segment header through the NULL. Report the segment as not created instead,
+        // the same answer a full segment list gives.
+        if (calseg == NULL) {
+            DBG_PRINTF_ERROR("Calibration segment '%s' (%u bytes) does not fit the calibration memory pool, increase OPTION_CAL_MEM_SIZE\n", name, page_size);
+            return XCP_UNDEFINED_CALSEG;
+        }
         DBG_PRINTF3("Create CalSeg '%s' size=%u, type=%s\n", name, page_size, memory_segment ? "seg" : "blk");
         if (!XcpInitCalSeg_(calseg, name, default_page, default_page_file, page_size, memory_segment)) {
             return XCP_UNDEFINED_CALSEG;

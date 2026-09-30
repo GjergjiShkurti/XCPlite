@@ -84,11 +84,20 @@
 #ifdef OPTION_CAL_SEGMENTS
 
 // Maximum number of calibration segments
+// Guarded, like the DAQ sizes below, so an application can size it from its build rather than by
+// editing this file. The EPK segment takes one of these slots, and XcpRegisterCalSeg_ leaves the
+// last one unused: 8 is room for 6 segments of the application's own.
+#ifndef OPTION_CAL_SEGMENT_COUNT
 #define OPTION_CAL_SEGMENT_COUNT 8
+#endif
 
 // Total memory pool size for all calibration segments (header + 4 pages each)
 // Must be large enough for all XcpCreateCalSeg() calls combined
+// Guarded for the same reason: a segment costs four times its own size, so a single table of a
+// few KiB already exceeds the default, and an application only finds out by running out.
+#ifndef OPTION_CAL_MEM_SIZE
 #define OPTION_CAL_MEM_SIZE (1024 * 5) // 5 KB default
+#endif
 
 // Single page mode
 // #define OPTION_CAL_SEGMENTS_SINGLE_PAGE
