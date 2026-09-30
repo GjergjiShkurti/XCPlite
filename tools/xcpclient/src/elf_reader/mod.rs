@@ -366,7 +366,16 @@ impl ElfReader {
                 // @@@@ TODO use the commandline compilation unit filter here
                 let seg_var_info = if let Some(x) = self.debug_data.variables.get(seg_name) {
                     let mut valid_candidates: Vec<_> = x.iter().filter(|var_info| var_info.address.0 == 0 && var_info.address.1 != 0).collect();
-                    if valid_candidates.len() > 1 {
+                    // Changed from upstream (issue 143). A segment declared with mc-instrument's
+                    // MC_CALSEG has its page in namespace mci_pages, inside the namespaces of its
+                    // calseg__<name> marker, which pins it however many other variables share the
+                    // name. The name alone did not: any static of that name in the segment's file --
+                    // `static int Alpha;` in a function -- left more than one candidate, and the
+                    // segment was skipped. Upstream's same-unit tie-break stays for a page declared
+                    // any other way.
+                    if let Some(page) = mci_page(&valid_candidates, var_infos) {
+                        valid_candidates = vec![page];
+                    } else if valid_candidates.len() > 1 {
                         let same_unit_candidates: Vec<_> = valid_candidates.iter().copied().filter(|candidate| candidate.unit_idx == var_info.unit_idx).collect();
                         if same_unit_candidates.len() == 1 {
                             valid_candidates = same_unit_candidates;
@@ -389,12 +398,22 @@ impl ElfReader {
                                 );
                             }
                         }
-                        continue;
+                        // Changed from upstream (issue 143): an error, not a skip. The application
+                        // creates this segment whether or not its page can be found here, and
+                        // segments are numbered and addressed by position, so leaving it out gave
+                        // every later segment the address of the one before it at run time -- an
+                        // A2L that writes to the wrong segment, from a run that exited 0.
+                        return Err(format!(
+                            "calibration segment '{seg_name}': its reference page cannot be told apart from {} variables of that name, \
+                             so no A2L is written (rerun with -v for the candidates)",
+                            valid_candidates.len()
+                        )
+                        .into());
                     }
                     valid_candidates[0]
                 } else {
-                    error!("Could not find calibration segment reference page variable '{}'", seg_name);
-                    continue;
+                    // Changed from upstream (issue 143), for the reason above.
+                    return Err(format!("calibration segment '{seg_name}': no reference page variable of that name, so no A2L is written").into());
                 };
 
                 // Determine segment length
@@ -420,11 +439,13 @@ impl ElfReader {
                 // @@@@ TODO: handle signed relative encoding
                 seg_addr = seg_var_info.address.1;
                 if !(seg_length > 0 && seg_addr > 0 && seg_var_info.address.0 == 0) {
-                    error!(
-                        "Calibration segment from cal_<name> '{}' not found, has invalid address {:#x} or size {:#x}, skipped",
-                        seg_name, seg_addr, seg_length
-                    );
-                    continue; // skip this variable
+                    // Changed from upstream (issue 143): an error, not a skip, as for a page that
+                    // cannot be found above.
+                    return Err(format!(
+                        "calibration segment '{seg_name}': its reference page has an invalid address {seg_addr:#x} or size {seg_length:#x}, \
+                         so no A2L is written"
+                    )
+                    .into());
                 }
 
                 info!(
@@ -1486,6 +1507,21 @@ impl ElfReader {
         let off = (vaddr - *base) as usize;
         read_cstr_at(data, off)
     }
+}
+
+/// The reference page mc-instrument's MC_CALSEG defines for the segment whose calseg__<name>
+/// marker is `markers`: among `candidates`, the one variable in namespace `mci_pages` nested in the
+/// marker's own namespaces (both lists innermost first). Nothing for a page declared any other way,
+/// or when two would match.
+fn mci_page<'a>(candidates: &[&'a VarInfo], markers: &[VarInfo]) -> Option<&'a VarInfo> {
+    let marker = markers.iter().find(|m| m.address.1 != 0)?;
+    let matches = |c: &&&VarInfo| c.namespaces.len() == marker.namespaces.len() + 1 && c.namespaces[0] == "mci_pages" && c.namespaces[1..] == marker.namespaces[..];
+    let mut pages = candidates.iter().filter(matches);
+    let page = pages.next()?;
+    if pages.next().is_some() {
+        return None;
+    }
+    Some(page)
 }
 
 /// What is left of xcplite's room for calibration segments, spent the way XcpCreateCalSeg_
