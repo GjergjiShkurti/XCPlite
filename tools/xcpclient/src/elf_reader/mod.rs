@@ -287,6 +287,27 @@ impl ElfReader {
                 // legal -- a hard stop on a valid program is never the right answer for a
                 // generator.
                 let var_info = var_infos.iter().find(|info| info.address.1 != 0).unwrap_or(&var_infos[0]);
+                // Added to upstream (issue 144): two markers of one name in different namespaces are
+                // two segments -- `one::Params` and `two::Params` -- that xcplite, which keys
+                // segments by name, makes one, and that the A2L could only name alike. The second
+                // reads the first one's page, or is never created. mc-instrument refuses to start such
+                // an application, so no A2L is written for it either. Markers in one namespace stay
+                // one segment, as xcplite has them: its own CalSegDecl in a header defines one per
+                // file that includes it.
+                if let Some(other) = var_infos.iter().find(|info| info.address.1 != 0 && info.namespaces != var_info.namespaces) {
+                    let qualified = |info: &VarInfo| {
+                        let mut path: Vec<&str> = info.namespaces.iter().rev().map(String::as_str).collect();
+                        path.push(seg_name);
+                        path.join("::")
+                    };
+                    return Err(format!(
+                        "two calibration segments are both named '{seg_name}' ({} and {}): xcplite and the A2L would see one segment. \
+                         Rename one; no A2L is written",
+                        qualified(var_info),
+                        qualified(other)
+                    )
+                    .into());
+                }
                 let mut seg_descr_addr = var_info.address.1;
                 if seg_name == "epk" {
                     // EPK segment is a special case, it has always index = 0
