@@ -839,6 +839,12 @@ impl ElfReader {
             let mut a2l_name = var_name.to_string();
             let mut xcp_event_id = 0; // default event id is 0, async event in transmit thread
 
+            // Under identifier addressing a captured variable is not measured from here either (see
+            // the check on each instance below), so its event is not looked up, nor warned about.
+            if id_addressing && var_name.starts_with("daq__") {
+                continue;
+            }
+
             // daq__<event_name>__<var_name> (local scope static variables)
             // Check for captured variables with format "daq__<event_name>__<var_name>"
             if var_name.starts_with("daq__") {
@@ -880,6 +886,20 @@ impl ElfReader {
                     if !re.is_match(&cu_name) {
                         continue;
                     }
+                }
+
+                // Identifier addressing (issue 51). Every measurement comes from the mci_meas
+                // records (register_mci_measurements), so this sweep contributes calibration
+                // characteristics only: variables at an absolute address inside a segment's page.
+                // Anything else is dropped here, before the event lookup and the frame-offset
+                // arithmetic below, which warned -- "Variable 'counter' skipped, has offset ... does not
+                // fit" -- about locals that are measured all the same, through their identifiers. A
+                // swept measurement would also have duplicated one under an absolute address and taken
+                // in the library's own globals.
+                if id_addressing
+                    && (var_info.address.0 != 0 || var_info.address.1 == 0 || reg.cal_seg_list.find_cal_seg_by_mem_address(var_info.address.1).is_none())
+                {
+                    continue;
                 }
 
                 let var_function = if let Some(f) = var_info.function.as_ref() { f.as_str() } else { "" };
@@ -974,14 +994,6 @@ impl ElfReader {
                     // @@@@ NOTE: This might change in the future
                     (McObjectType::Characteristic, McAddress::new_a2l(seg.addr + offset as u32, 0))
                 } else {
-                    // In identifier addressing every measurement comes from the mci_meas
-                    // descriptor section (register_mci_measurements): drop the DWARF-swept
-                    // absolute/stack measurement here, otherwise we would emit a duplicate under an
-                    // absolute address and also sweep up internal library globals. Calibration
-                    // characteristics (the branch above) still come from DWARF.
-                    if id_addressing {
-                        continue;
-                    }
                     // Create a McAddress with event id, mem_addr is relative or absolute
                     // @@@@ TODO: Not implemented dependency on target addressing scheme
                     // Address extension might be 0, 1, 2 depending on the target addressing scheme
