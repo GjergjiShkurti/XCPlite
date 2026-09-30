@@ -330,6 +330,18 @@ impl ElfReader {
             }
         }
 
+        // A segment that does not fit xcplite's build-time room is not created by the application,
+        // so it is left out here too (CalsegRoom). The numbers above assumed every segment exists;
+        // `next_number` hands them out to the segments that do, as the application numbers them.
+        let mut room = self.calseg_room(seg_relative);
+        if room.is_none() && !seg_definitions.is_empty() {
+            warn!(
+                "xcplite's calibration limits (gXcpData.cal_seg_list) are not in this binary's debug info: every calibration segment \
+                 goes into the A2L, including one the application may have had no room for"
+            );
+        }
+        let mut next_number: u8 = 0;
+
         // Step 2
         // Iterate over the segment definitions and register the segments in the registry
         for (seg_index, (seg_name, var_infos, var_address, seg_number)) in seg_definitions.iter().enumerate() {
@@ -460,9 +472,24 @@ impl ElfReader {
             else {
                 info!("Calibration segment '{}' not yet defined in registry", seg_name);
 
+                if let Some(room) = room.as_mut()
+                    && let Err(why) = room.admit(seg_name, seg_length)
+                {
+                    warn!(
+                        "Calibration segment '{}' is left out of the A2L: {}. The application has no room for it either, runs without it, and \
+                         says so at startup",
+                        seg_name, why
+                    );
+                    continue;
+                }
+                let number = seg_number.map(|_| {
+                    next_number += 1;
+                    next_number - 1
+                });
+
                 if seg_relative {
                     // Add in segment relative addressing mode
-                    let res = reg.cal_seg_list.add_cal_seg(seg_name.to_string(), *seg_number, seg_length as u32);
+                    let res = reg.cal_seg_list.add_cal_seg(seg_name.to_string(), number, seg_length as u32);
                     if let Err(e) = res {
                         error!("Failed to add calibration segment '{}': {}", seg_name, e);
                         continue;
@@ -486,7 +513,7 @@ impl ElfReader {
                     }
                     let res = reg
                         .cal_seg_list
-                        .add_cal_seg_by_addr(seg_name.to_string(), *seg_number, 0, seg_addr as u32, seg_length as u32);
+                        .add_cal_seg_by_addr(seg_name.to_string(), number, 0, seg_addr as u32, seg_length as u32);
                     if let Err(e) = res {
                         error!("Failed to add calibration segment '{}': {}", seg_name, e);
                         continue;
@@ -1461,6 +1488,52 @@ impl ElfReader {
     }
 }
 
+/// What is left of xcplite's room for calibration segments, spent the way XcpCreateCalSeg_
+/// (cal.c) spends it. Segments and blocks are created in marker address order, and each takes one
+/// slot of the segment list and `header + pages * size` bytes of the calibration memory pool, the
+/// size rounded up to XCP_CALPAGE_ALIGNMENT. One that does not fit is not created, and the
+/// application runs without it (mc-instrument says so at startup), so the A2L must not describe
+/// it either -- nor give it the number and the address the application gives the next one.
+///
+/// The limits come from the binary (ElfReader::calseg_room). The costs are xcplite's constants,
+/// kept here by hand: XCP_CALSEG_HEADER_SIZE and XCP_CALPAGE_ALIGNMENT (cal.h), and the EPK
+/// segment's size, XCP_EPK_MAX_LENGTH + 1 whatever the EPK string is (XcpInit, xcplite.c). The
+/// fixtures 141 and 142 in test-review-regressions/xcplite run segments to the last byte and the
+/// last slot on both routes, so a constant that drifts fails there.
+struct CalsegRoom {
+    slots: u64,
+    bytes: u64,
+    pages: u64,
+}
+
+const XCP_CALSEG_HEADER_SIZE: u64 = 64;
+const XCP_CALPAGE_ALIGNMENT: u64 = 8;
+const XCP_EPK_SEGMENT_SIZE: u64 = 31 + 1;
+
+impl CalsegRoom {
+    /// Take a segment's slot and memory, or say why it does not fit.
+    fn admit(&mut self, name: &str, size: u16) -> Result<(), String> {
+        let size = if name == "epk" { XCP_EPK_SEGMENT_SIZE } else { size as u64 };
+        let aligned = size.div_ceil(XCP_CALPAGE_ALIGNMENT) * XCP_CALPAGE_ALIGNMENT;
+        let cost = XCP_CALSEG_HEADER_SIZE + self.pages * aligned;
+        if cost > self.bytes {
+            return Err(format!(
+                "it needs {} bytes of xcplite's calibration memory and the segments before it left {} (raise OPTION_CAL_MEM_SIZE; \
+                 MCI_CAL_MEM_SIZE in mc-instrument's CMake)",
+                cost, self.bytes
+            ));
+        }
+        // xcplite allocates before it takes a slot, so a segment refused for want of a slot has
+        // spent its memory as well. That changes nothing: every later one is refused alike.
+        self.bytes -= cost;
+        if self.slots == 0 {
+            return Err("xcplite's list of calibration segments is full (raise OPTION_CAL_SEGMENT_COUNT; MCI_CAL_SEGMENT_COUNT in mc-instrument's CMake)".to_string());
+        }
+        self.slots -= 1;
+        Ok(())
+    }
+}
+
 /// XCP address extension marking an identifier-addressed (application-resolved) object:
 /// ECU_ADDRESS_EXTENSION 0x80. Matches XCP_ADDR_EXT_APP in xcplib and A2lSetIdAddrMode on the
 /// mc-instrument runtime side.
@@ -1925,6 +1998,42 @@ impl ElfReader {
         for (name, (member, _offset)) in members {
             self.walk_for_type(member, owner, format!("{}{}.", prefix, name), found, depth + 1);
         }
+    }
+
+    /// xcplite's room for calibration segments in this binary, or nothing when the debug info does
+    /// not show it. Both limits are build options (OPTION_CAL_SEGMENT_COUNT, OPTION_CAL_MEM_SIZE),
+    /// so they are read from what xcplite was compiled with rather than assumed: the lengths of
+    /// the arrays gXcpData.cal_seg_list.offset and gXcpData.cal_seg_list.cal_mem.pool.
+    fn calseg_room(&self, seg_relative: bool) -> Option<CalsegRoom> {
+        let member = |node: &TypeInfo, name: &str| -> Option<TypeInfo> {
+            let node = self.resolve_type(node)?;
+            match &node.datatype {
+                DbgDataType::Struct { members, .. } | DbgDataType::Union { members, .. } | DbgDataType::Class { members, .. } => {
+                    members.get(name).and_then(|(member, _)| self.resolve_type(member)).cloned()
+                }
+                _ => None,
+            }
+        };
+        let length = |node: &TypeInfo| -> Option<u64> {
+            match &node.datatype {
+                DbgDataType::Array { dim, .. } if dim.len() == 1 => Some(dim[0]),
+                _ => None,
+            }
+        };
+        let var = self.debug_data.variables.get("gXcpData")?.iter().find(|v| v.address.1 != 0)?;
+        let data = self.debug_data.types.get(&var.typeref)?;
+        let list = member(data, "cal_seg_list")?;
+        let slots = length(&member(&list, "offset")?)?;
+        let bytes = length(&member(&member(&list, "cal_mem")?, "pool")?)?;
+        Some(CalsegRoom {
+            // XcpRegisterCalSeg_ refuses an index of XCP_MAX_CALSEG_COUNT - 1 or more, so the last
+            // slot is never used; the EPK segment takes the first.
+            slots: slots.saturating_sub(1),
+            bytes,
+            // cal.h keeps a copy of the default page in the segment in segment relative addressing
+            // (CALSEG_PAGE_COUNT 4), and points at the application's in absolute addressing (3).
+            pages: if seg_relative { 4 } else { 3 },
+        })
     }
 
     /// A type with its TypeRef indirections followed, or nothing when one dangles.
