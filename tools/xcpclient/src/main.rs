@@ -697,6 +697,9 @@ async fn xcp_client(
                 xcp_client.get_event_segment_info(&mut reg).await?;
             }
 
+            // Whether the measurements come from mc-instrument's mci_meas records (issue 140, below)
+            let mut id_addressed = false;
+
             // Read ELF/DWARF information for events, segments and (unless --create-a2l-template) variables
             // Events and calibration segments found in the ELF file, must match the XCP server information if present
             // If not, they are created, but with dummy event id and segment number, which has to be fixed later !!!
@@ -761,6 +764,7 @@ async fn xcp_client(
                     // descriptors (mci_meas), suppress the DWARF measurement sweep and emit the
                     // measurements from the descriptors instead (register_mci_measurements below).
                     let id_addressing = elf_reader.has_id_addressing();
+                    id_addressed = id_addressing;
                     elf_reader.register_variables(&mut reg, segment_relative, verbose, elf_idx_unit_limit, &elf_var_filter, &elf_unit_filter, id_addressing)?;
                     // Apply metadata (XCP_UNIT / XCP_LIMITS / XCP_COMMENT) from the xcp_meta ELF section
                     elf_reader.register_metadata(&mut reg, verbose)?;
@@ -805,6 +809,15 @@ async fn xcp_client(
                     true,
                 )
                 .unwrap();
+                // Added to upstream (issue 140). xcp_registry writes every measurement on event 0 as
+                // `DAQ_EVENT VARIABLE ... DEFAULT_EVENT_LIST`, whatever its addressing -- which lets a
+                // tool offer another event for it -- and has no option to say otherwise. An
+                // identifier-addressed measurement belongs to its own event: xcplite refuses to start
+                // a DAQ list that arms it on any other (XcpCheckIdEvents), and the runtime route
+                // already writes FIXED_EVENT_LIST for it. The offline A2L says the same.
+                if id_addressed {
+                    elf_reader::fix_identifier_event_lists(&a2l_path)?;
+                }
                 info!("Created A2L with file: {} {}", a2l_path.display(), mode);
             }
         }

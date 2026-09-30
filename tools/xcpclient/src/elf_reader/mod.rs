@@ -1605,6 +1605,39 @@ impl CalsegRoom {
 /// bump on both sides), would close this.
 const XCP_ADDR_EXT_APP: u8 = 0x80;
 
+/// Rewrite, in the A2L at `path`, the event list of every identifier-addressed measurement
+/// (ECU_ADDRESS_EXTENSION XCP_ADDR_EXT_APP) from `VARIABLE ... DEFAULT_EVENT_LIST EVENT n` to
+/// `FIXED_EVENT_LIST EVENT n`: its identifier may only be sampled on that event (issue 140).
+/// Measurements on other extensions, which any event can sample, keep what xcp_registry wrote.
+pub fn fix_identifier_event_lists(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let text = std::fs::read_to_string(path)?;
+    let block = Regex::new(r"(?s)/begin MEASUREMENT .*?/end MEASUREMENT")?;
+    let variable = Regex::new(r"DAQ_EVENT\s+VARIABLE\s+/begin\s+DEFAULT_EVENT_LIST\s+EVENT\s+(\S+)\s+/end\s+DEFAULT_EVENT_LIST\s+/end\s+DAQ_EVENT")?;
+    let extension = Regex::new(r"ECU_ADDRESS_EXTENSION\s+(0x[0-9A-Fa-f]+|\d+)\s")?;
+    let is_identifier = |m: &str| {
+        extension.captures(m).is_some_and(|c| {
+            let v = &c[1];
+            let ext = if let Some(hex) = v.strip_prefix("0x") { u8::from_str_radix(hex, 16).ok() } else { v.parse::<u8>().ok() };
+            ext == Some(XCP_ADDR_EXT_APP)
+        })
+    };
+    let mut fixed = 0usize;
+    let out = block.replace_all(&text, |caps: &regex::Captures| {
+        let m = &caps[0];
+        if is_identifier(m) && variable.is_match(m) {
+            fixed += 1;
+            variable.replace(m, "DAQ_EVENT FIXED_EVENT_LIST EVENT $1 /end DAQ_EVENT").into_owned()
+        } else {
+            m.to_string()
+        }
+    });
+    if fixed > 0 {
+        std::fs::write(path, out.as_bytes())?;
+        info!("{} identifier-addressed measurement(s) written with FIXED_EVENT_LIST", fixed);
+    }
+    Ok(())
+}
+
 /// How many low bits of the address field are a byte offset into the object the identifier names.
 /// Must equal XCP_ID_OFFSET_BITS in xcplite's inc/xcp_id_addr.h -- the server decodes what this
 /// encodes. That header is the single definition (xcp_cfg.h and xcplib.h both include it); this
