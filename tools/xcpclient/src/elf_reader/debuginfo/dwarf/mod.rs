@@ -44,6 +44,7 @@ struct DebugDataReader<'elffile> {
     mci_meas_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of mci_meas (mc-instrument measurement descriptors)
     mci_layout_data: Option<Vec<u8>>,      // raw bytes of mci_layout: how to parse an mci_meas record on this ABI
     rodata_data: Option<(u64, Vec<u8>)>,   // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers held in mci_meas
+    xcp_proto_data: Option<Vec<u8>>,       // raw bytes of xcp_proto: what the linked xcplite answers to CONNECT and GET_DAQ_RESOLUTION_INFO
     is_little_endian: bool,
 }
 
@@ -152,6 +153,15 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         let addr = s.address();
         s.data().ok().map(|data| (addr, data.to_vec()))
     });
+    // read the xcp_proto section: one record xcplite.c builds from the definitions its CONNECT and
+    // GET_DAQ_RESOLUTION_INFO answer with, so an A2L written from the ELF can state what the server
+    // answers. Absent from an ELF without xcplite, or with one from before the record existed.
+    let xcp_proto_data: Option<Vec<u8>> = elffile.section_by_name("xcp_proto").and_then(|s| s.data().ok()).map(|d| d.to_vec());
+    if let Some(ref data) = xcp_proto_data {
+        log::info!("xcplite protocol parameter section (xcp_proto) found, {} bytes", data.len());
+    } else {
+        log::debug!("xcplite protocol parameter section (xcp_proto) not found in ELF file");
+    }
 
     let is_little_endian = elffile.endianness() == Endianness::Little;
 
@@ -189,6 +199,7 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         mci_meas_data,
         mci_layout_data,
         rodata_data,
+        xcp_proto_data,
         is_little_endian,
     };
     log::debug!("Reading debug info entries");
@@ -321,6 +332,7 @@ impl DebugDataReader<'_> {
             mci_meas_data: self.mci_meas_data,
             mci_layout_data: self.mci_layout_data,
             rodata_data: self.rodata_data,
+            xcp_proto_data: self.xcp_proto_data,
             is_little_endian: self.is_little_endian,
         }
     }

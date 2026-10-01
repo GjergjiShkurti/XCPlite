@@ -700,6 +700,9 @@ async fn xcp_client(
             // Whether the measurements come from mc-instrument's mci_meas records (issue 140, below)
             let mut id_addressed = false;
 
+            // What the linked xcplite server answers to CONNECT and GET_DAQ_RESOLUTION_INFO (issue 224, below)
+            let mut server_protocol = None;
+
             // Read ELF/DWARF information for events, segments and (unless --create-a2l-template) variables
             // Events and calibration segments found in the ELF file, must match the XCP server information if present
             // If not, they are created, but with dummy event id and segment number, which has to be fixed later !!!
@@ -744,6 +747,13 @@ async fn xcp_client(
                     "Using {} addressing for calibration segments",
                     if segment_relative { "segment relative" } else { "absolute" }
                 );
+
+                // The server's MAX_CTO, MAX_DTO and timestamp, which xcp_registry cannot know (issue 224, below).
+                // An xcplite without the record is one from before it existed, and its A2L keeps xcp_registry's.
+                server_protocol = elf_reader.server_protocol()?;
+                if server_protocol.is_none() && elf_reader.get_target_signature().is_some() {
+                    warn!("The ELF links an xcplite without the xcp_proto section: the A2L states xcp_registry's MAX_CTO, MAX_DTO and timestamp, which may not be the server's");
+                }
 
                 // Get the EPK string and address from debug_data and set it in the registry application version information, if available
                 elf_reader.register_epk_addr_info(&mut reg, segment_relative, verbose);
@@ -817,6 +827,16 @@ async fn xcp_client(
                 // already writes FIXED_EVENT_LIST for it. The offline A2L says the same.
                 if id_addressed {
                     elf_reader::fix_identifier_event_lists(&a2l_path)?;
+                }
+                // Added to upstream (issue 224). xcp_registry states MAX_CTO 252, MAX_DTO 1468 and
+                // timestamps in 1 us for every server, literals in its writer, where xcplite answers
+                // what it is built with -- 248, 1024 and 1 ns by default -- and the runtime route
+                // writes that. The ELF's xcp_proto record carries the answers, so the offline A2L
+                // states them too. One that cannot be corrected is not left behind to misstate them.
+                if let Some(server) = &server_protocol {
+                    elf_reader::fix_protocol_layer(&a2l_path, server).inspect_err(|_| {
+                        let _ = std::fs::remove_file(&a2l_path);
+                    })?;
                 }
                 info!("Created A2L with file: {} {}", a2l_path.display(), mode);
             }

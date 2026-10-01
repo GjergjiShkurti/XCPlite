@@ -181,6 +181,26 @@ const uint16_t XCPLITE__AXSDD = XCP_DRIVER_VERSION;
 #endif
 
 /****************************************************************************/
+/* XCPlite protocol parameters (xcp_proto)                                  */
+/****************************************************************************/
+
+// What this server answers to CONNECT (MAX_CTO, MAX_DTO) and to GET_DAQ_RESOLUTION_INFO
+// (TIMESTAMP_MODE, TIMESTAMP_TICKS), as four uint16_t in that order and the target's byte order,
+// in a section of their own. An A2L created from the ELF instead of by this server (xcpclient
+// --elf --create-a2l) has no other way to learn them: the writer xcpclient uses states literals of
+// its own. The record is built from the definitions both commands answer with, so it cannot say
+// anything they do not.
+#define XCP_TIMESTAMP_MODE (XCP_TIMESTAMP_UNIT | DAQ_TIMESTAMP_FIXED | DAQ_TIMESTAMP_DWORD)
+#if defined(__ELF__)
+#define XCP_PROTO_SECTION_ATTR __attribute__((section("xcp_proto"), used))
+#elif defined(__APPLE__)
+#define XCP_PROTO_SECTION_ATTR __attribute__((section("__DATA,xcp_proto"), used))
+#endif
+#ifdef XCP_PROTO_SECTION_ATTR
+static const uint16_t gXcpProtocolInfo[4] XCP_PROTO_SECTION_ATTR = {XCPTL_MAX_CTO_SIZE, XCPTL_MAX_DTO_SIZE, XCP_TIMESTAMP_MODE, (uint16_t)XCP_TIMESTAMP_TICKS};
+#endif
+
+/****************************************************************************/
 /* Protocol layer state data                                                */
 /****************************************************************************/
 
@@ -2750,7 +2770,7 @@ static uint8_t XcpAsyncCommand(bool async, const uint32_t *cmdBuf, uint8_t cmdLe
 #if ODT_TIMESTAMP_SIZE != 4
 #error "Supports only 32 bit timestamps"
 #endif
-            CRM_GET_DAQ_RESOLUTION_INFO_TIMESTAMP_MODE = XCP_TIMESTAMP_UNIT | DAQ_TIMESTAMP_FIXED | DAQ_TIMESTAMP_DWORD;
+            CRM_GET_DAQ_RESOLUTION_INFO_TIMESTAMP_MODE = XCP_TIMESTAMP_MODE;
             CRM_GET_DAQ_RESOLUTION_INFO_TIMESTAMP_TICKS = XCP_TIMESTAMP_TICKS;
         } break;
 

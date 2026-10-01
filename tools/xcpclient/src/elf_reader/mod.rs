@@ -93,6 +93,47 @@ impl ElfReader {
         self.debug_data.mci_app_name.as_deref()
     }
 
+    /// What the xcplite server linked into the ELF answers to CONNECT and GET_DAQ_RESOLUTION_INFO,
+    /// from the record xcplite.c places in the xcp_proto section: MAX_CTO, MAX_DTO, TIMESTAMP_MODE
+    /// and TIMESTAMP_TICKS, four u16 in the target's byte order. None when the ELF has no such
+    /// section -- no xcplite, or one from before the record existed. A record the A2L cannot state
+    /// is an error rather than a value guessed past.
+    pub fn server_protocol(&self) -> Result<Option<ServerProtocol>, Box<dyn Error>> {
+        let Some(data) = self.debug_data.xcp_proto_data.as_ref() else {
+            return Ok(None);
+        };
+        if data.len() < 8 {
+            return Err(format!(
+                "the xcp_proto section holds {} bytes, short of the 8 of MAX_CTO, MAX_DTO, TIMESTAMP_MODE and TIMESTAMP_TICKS",
+                data.len()
+            )
+            .into());
+        }
+        let is_le = self.debug_data.is_little_endian;
+        let rd_u16 = |o: usize| -> u16 {
+            let a: [u8; 2] = data[o..o + 2].try_into().unwrap();
+            if is_le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) }
+        };
+        let server = ServerProtocol {
+            max_cto: rd_u16(0),
+            max_dto: rd_u16(2),
+            timestamp_mode: rd_u16(4),
+            timestamp_ticks: rd_u16(6),
+        };
+        // CONNECT answers MAX_CTO in one byte, and the AML declares it a uchar
+        if server.max_cto > 0xFF {
+            return Err(format!("the xcp_proto section states a MAX_CTO of {}, which CONNECT cannot answer in one byte", server.max_cto).into());
+        }
+        if let Err(e) = server.timestamp_supported() {
+            return Err(format!(
+                "the xcp_proto section states TIMESTAMP_MODE 0x{:X}, with a {} the A2L has no name for",
+                server.timestamp_mode, e
+            )
+            .into());
+        }
+        Ok(Some(server))
+    }
+
     // Load debug information from the ELF file
     pub fn new(file_name: &str, verbose: usize, unit_idx_limit: usize) -> Option<ElfReader> {
         info!("Loading debug information from ELF file: {}", file_name);
@@ -1647,6 +1688,79 @@ pub fn fix_identifier_event_lists(path: &std::path::Path) -> Result<(), Box<dyn 
         std::fs::write(path, out.as_bytes())?;
         info!("{} identifier-addressed measurement(s) written with FIXED_EVENT_LIST", fixed);
     }
+    Ok(())
+}
+
+/// What an xcplite server answers to CONNECT (MAX_CTO, MAX_DTO) and to GET_DAQ_RESOLUTION_INFO
+/// (TIMESTAMP_MODE, TIMESTAMP_TICKS), as the record in its xcp_proto section states it. xcplite.c
+/// builds the record from the definitions both commands answer with.
+pub struct ServerProtocol {
+    pub max_cto: u16,
+    pub max_dto: u16,
+    pub timestamp_mode: u16,
+    pub timestamp_ticks: u16,
+}
+
+impl ServerProtocol {
+    /// The body of TIMESTAMP_SUPPORTED, in XCP_104.aml's terms: the ticks, the size, the unit, and
+    /// TIMESTAMP_FIXED when the server always sends a timestamp. Err for a code the AML has no name for.
+    fn timestamp_supported(&self) -> Result<String, String> {
+        const UNITS: [&str; 13] = [
+            "UNIT_1NS",
+            "UNIT_10NS",
+            "UNIT_100NS",
+            "UNIT_1US",
+            "UNIT_10US",
+            "UNIT_100US",
+            "UNIT_1MS",
+            "UNIT_10MS",
+            "UNIT_100MS",
+            "UNIT_1S",
+            "UNIT_1PS",
+            "UNIT_10PS",
+            "UNIT_100PS",
+        ];
+        let size = match self.timestamp_mode & 0x07 {
+            0 => "NO_TIME_STAMP",
+            1 => "SIZE_BYTE",
+            2 => "SIZE_WORD",
+            4 => "SIZE_DWORD",
+            code => return Err(format!("timestamp size code {code}")),
+        };
+        let unit = UNITS
+            .get(usize::from(self.timestamp_mode >> 4))
+            .ok_or_else(|| format!("timestamp unit code {}", self.timestamp_mode >> 4))?;
+        let fixed = if self.timestamp_mode & 0x08 != 0 { " TIMESTAMP_FIXED" } else { "" };
+        Ok(format!("0x{:X} {size} {unit}{fixed}", self.timestamp_ticks))
+    }
+}
+
+/// Rewrite, in the A2L at `path`, what xcp_registry states about the server -- MAX_CTO and MAX_DTO
+/// in PROTOCOL_LAYER, and TIMESTAMP_SUPPORTED -- with what the server answers (issue 224).
+/// xcp_registry writes the same literals for every server: 252, 1468, and ticks of 1 us.
+pub fn fix_protocol_layer(path: &std::path::Path, server: &ServerProtocol) -> Result<(), Box<dyn Error>> {
+    let text = std::fs::read_to_string(path)?;
+    // PROTOCOL_LAYER's parameters: the version and the timeouts T1..T7, then MAX_CTO and MAX_DTO.
+    let layer = Regex::new(r"(/begin\s+PROTOCOL_LAYER\s+(?:\S+\s+){8})\S+(\s+)\S+")?;
+    let stamp = Regex::new(r"(?s)(/begin\s+TIMESTAMP_SUPPORTED\s+).*?(\s+/end\s+TIMESTAMP_SUPPORTED)")?;
+    let (layers, stamps) = (layer.find_iter(&text).count(), stamp.find_iter(&text).count());
+    if layers != 1 || stamps != 1 {
+        return Err(format!(
+            "{} has {} PROTOCOL_LAYER and {} TIMESTAMP_SUPPORTED, not the one of each the server's MAX_CTO, MAX_DTO and timestamp go into",
+            path.display(),
+            layers,
+            stamps
+        )
+        .into());
+    }
+    let timestamp = server.timestamp_supported()?;
+    let text = layer.replace(&text, |c: &regex::Captures| format!("{}{}{}{}", &c[1], server.max_cto, &c[2], server.max_dto));
+    let text = stamp.replace(&text, |c: &regex::Captures| format!("{}{}{}", &c[1], timestamp, &c[2]));
+    std::fs::write(path, text.as_bytes())?;
+    info!(
+        "PROTOCOL_LAYER and TIMESTAMP_SUPPORTED written as the server answers: MAX_CTO {}, MAX_DTO {}, timestamp {}",
+        server.max_cto, server.max_dto, timestamp
+    );
     Ok(())
 }
 
