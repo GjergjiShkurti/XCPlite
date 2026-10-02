@@ -910,11 +910,27 @@ impl ElfReader {
         unit_idx_limit: usize,
         name_filter: &str,
         unit_filter: &str,
-        id_addressing: bool,
+        mci: Option<&[MciRecord]>,
     ) -> Result<(), Box<dyn Error>> {
         // Load debug information from the ELF file
         info!("===============================================================");
         info!("Registering variables:");
+
+        // What the mc-instrument records leave to this sweep (MciAddressing). Under identifier
+        // addressing only calibration characteristics. Under absolute addressing everything, except
+        // a twin of a variable a MEASURE already measures as `<event>.<name>`: a bare copy beside
+        // the qualified signal is the same name for another object (the record points at the
+        // MEASURE's shadow), so it is left out. And on a target that is not xcplite a swept
+        // measurement is bound to no event: there is no event 0 to sample it on, and an A2L
+        // without IF_DATA lets the master choose one.
+        let addressing = MciAddressing::of(mci);
+        let id_addressing = addressing == MciAddressing::Identifier;
+        let without_event = addressing == MciAddressing::Absolute && !self.is_xcplite_target();
+        let instrumented = match (addressing, mci) {
+            (MciAddressing::Absolute, Some(records)) => instrumented_names(records, self.debug_data.variables.keys()),
+            _ => std::collections::HashSet::new(),
+        };
+        let mut twins: Vec<&str> = Vec::new();
 
         // Compile name filter regex if specified
         let name_regex: Option<Regex> = if name_filter.is_empty() {
@@ -985,6 +1001,12 @@ impl ElfReader {
                 if !re.is_match(var_name) {
                     continue;
                 }
+            }
+
+            // A twin of a MEASURE'd variable (absolute addressing only, see above)
+            if instrumented.contains(var_name) && !calseg_pages.contains(var_name) {
+                twins.push(var_name);
+                continue;
             }
 
             if var_infos.is_empty() {
@@ -1157,7 +1179,11 @@ impl ElfReader {
                     } else {
                         mem_addr_ext
                     };
-                    (McObjectType::Measurement, McAddress::new_a2l_with_event(xcp_event_id, mem_addr as u32, addr_ext))
+                    if without_event && mem_addr_ext == 0 {
+                        (McObjectType::Measurement, McAddress::new_a2l(mem_addr as u32, addr_ext))
+                    } else {
+                        (McObjectType::Measurement, McAddress::new_a2l_with_event(xcp_event_id, mem_addr as u32, addr_ext))
+                    }
                 };
 
                 // Register measurement variable if possible
@@ -1216,6 +1242,14 @@ impl ElfReader {
                 }
             }
         } // var_infos
+        if !twins.is_empty() {
+            twins.sort_unstable();
+            info!("{} global(s) skipped: measured by MEASURE under <event>.<name>", twins.len());
+            debug!("Skipped as measured by MEASURE: {}", twins.join(", "));
+        }
+        if without_event {
+            info!("Swept measurements are bound to no event: the target is not xcplite");
+        }
         Ok(())
     }
 
@@ -1294,12 +1328,16 @@ impl ElfReader {
         Ok(())
     }
 
-    /// True when the ELF carries mc-instrument measurement descriptors (the mci_meas section):
-    /// identifier-addressed on xcplite, or with absolute addresses from a backend that supplies
-    /// them (VX1000). In that case the DWARF measurement sweep in register_variables is suppressed
-    /// and the measurements are produced by register_mci_measurements instead.
-    pub fn has_id_addressing(&self) -> bool {
-        self.debug_data.mci_meas_data.is_some()
+    /// The mc-instrument measurement records of the ELF (the mci_meas section), or None when it
+    /// has none. Read once and handed to both users: `MciAddressing::of` decides from them what the
+    /// DWARF sweep in register_variables may add, and register_mci_measurements turns them into
+    /// measurements. A layout this reader cannot parse is warned about and gives no records.
+    pub fn mci_records(&self) -> Result<Option<Vec<MciRecord>>, Box<dyn Error>> {
+        let Some((_base, data)) = self.debug_data.mci_meas_data.as_ref() else {
+            return Ok(None);
+        };
+        let cstr = |p: u64| self.read_rodata_cstr(p);
+        parse_mci_records(data, self.debug_data.mci_layout_data.as_deref(), self.debug_data.is_little_endian, &cstr).map(Some)
     }
 
     /// Register the measurements the mci_meas ELF section describes: identifier-addressed, or at
@@ -1317,211 +1355,12 @@ impl ElfReader {
     /// register_measurements() assigns them at runtime (identifier-addressing spec §3). Reproducing
     /// that sort here is what makes the offline A2L agree with a runtime A2L on every id. A name
     /// that occurs twice is refused, as the application refuses it.
-    pub fn register_mci_measurements(&self, reg: &mut Registry, segment_relative: bool, verbose: usize) -> Result<(), Box<dyn Error>> {
-        let Some((_base, data)) = self.debug_data.mci_meas_data.as_ref() else {
+    pub fn register_mci_measurements(&self, reg: &mut Registry, recs: &[MciRecord], segment_relative: bool, verbose: usize) -> Result<(), Box<dyn Error>> {
+        if recs.is_empty() {
             return Ok(());
-        };
+        }
         info!("===============================================================");
-        info!("Registering identifier-addressed measurements from mci_meas section:");
-
-        let is_le = self.debug_data.is_little_endian;
-        let rd_u16_at = |b: &[u8], o: usize| -> u16 {
-            let a: [u8; 2] = b[o..o + 2].try_into().unwrap();
-            if is_le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) }
-        };
-
-        // How to parse a record. mc.hpp emits a MeasLayout into mci_layout precisely so this is
-        // read rather than assumed: MeasMeta holds pointers, so its stride and field offsets move
-        // with the target ABI, and every VX1000 target is 32-bit. Binaries built before that
-        // section existed are all LP64, so their historical layout is the fallback.
-        struct Layout {
-            rec: usize,
-            ptr: usize,
-            o_name: usize,
-            o_type: usize,
-            o_x_dim: usize,
-            o_comment: usize,
-            o_unit: usize,
-            o_min: usize,
-            o_max: usize,
-            // Layout version 2. `None` on a v1 binary, where every object is identifier-addressed.
-            o_event: Option<usize>,
-            o_addr: Option<usize>,
-        }
-        const LP64: Layout = Layout {
-            rec: 56,
-            ptr: 8,
-            o_name: 0,
-            o_type: 8,
-            o_x_dim: 10,
-            o_comment: 16,
-            o_unit: 24,
-            o_min: 32,
-            o_max: 40,
-            o_event: None,
-            o_addr: None,
-        };
-
-        let lay = match self.debug_data.mci_layout_data.as_ref() {
-            Some(b) if b.len() >= 20 => {
-                let ver = b[3];
-                if ver > 2 {
-                    warn!("mci_layout version {} is newer than this reader understands (2); parsing the fields version 2 defines and ignoring the rest", ver);
-                }
-                // v2 appended o_event and o_addr, so every v1 offset is still where it was.
-                let has_v2 = ver >= 2 && b.len() >= 24;
-                let l = Layout {
-                    rec: rd_u16_at(b, 0) as usize,
-                    ptr: b[2] as usize,
-                    o_name: rd_u16_at(b, 4) as usize,
-                    o_type: rd_u16_at(b, 6) as usize,
-                    o_x_dim: rd_u16_at(b, 8) as usize,
-                    o_comment: rd_u16_at(b, 12) as usize,
-                    o_unit: rd_u16_at(b, 14) as usize,
-                    o_min: rd_u16_at(b, 16) as usize,
-                    o_max: rd_u16_at(b, 18) as usize,
-                    o_event: if has_v2 { Some(rd_u16_at(b, 20) as usize) } else { None },
-                    o_addr: if has_v2 { Some(rd_u16_at(b, 22) as usize) } else { None },
-                };
-                info!("mci_meas layout from mci_layout: {}-byte records, {}-bit pointers", l.rec, l.ptr * 8);
-                l
-            }
-            Some(b) => {
-                warn!("mci_layout section is {} bytes, too short for a MeasLayout record; assuming the 64-bit layout", b.len());
-                LP64
-            }
-            None => LP64,
-        };
-
-        if lay.rec == 0 || lay.ptr == 0 || (lay.ptr != 4 && lay.ptr != 8) {
-            warn!("mci_layout describes {}-byte records with {}-byte pointers, which is not parseable; skipping mci_meas", lay.rec, lay.ptr);
-            return Ok(());
-        }
-        // Every field the reader is about to slice has to lie inside a record. Without this a
-        // layout claiming, say, 16-byte records with min at offset 32 passes the chunk-length
-        // check and then panics in rd_f64 with a backtrace instead of a diagnostic.
-        let fits = |offset: usize, width: usize| offset + width <= lay.rec;
-        // o_event and o_addr are Options because v1 records do not have them, but when they are
-        // present they are sliced exactly like the v1 fields (rd_ptr below), so they are checked
-        // exactly like them. Leaving them out let a v2 layout over v1-sized records -- a stale
-        // object file relinked against a newer mci_layout -- reach rd_ptr and panic.
-        let bad = [
-            ("name", Some(lay.o_name), lay.ptr),
-            ("type", Some(lay.o_type), 1),
-            ("x_dim", Some(lay.o_x_dim), 2),
-            ("comment", Some(lay.o_comment), lay.ptr),
-            ("unit", Some(lay.o_unit), lay.ptr),
-            ("min", Some(lay.o_min), 8),
-            ("max", Some(lay.o_max), 8),
-            ("event", lay.o_event, lay.ptr),
-            ("addr", lay.o_addr, lay.ptr),
-        ]
-        .into_iter()
-        .filter_map(|(name, offset, width)| offset.map(|o| (name, o, width)))
-        .find(|(_, offset, width)| !fits(*offset, *width));
-        if let Some((field, offset, width)) = bad {
-            warn!(
-                "mci_layout puts '{}' at offset {} ({} bytes) in a {}-byte record, which does not fit; skipping mci_meas",
-                field, offset, width, lay.rec
-            );
-            return Ok(());
-        }
-
-        if data.len() % lay.rec != 0 {
-            // Not a warning to carry on from: if the stride disagrees, every field read after
-            // the first record lands in the middle of another one, so the measurements this
-            // would emit are fabricated rather than merely incomplete.
-            warn!(
-                "mci_meas section is {} bytes, not a multiple of the {}-byte record stride -- mc.hpp MeasMeta layout and this reader disagree; skipping mci_meas rather than emitting fabricated signals",
-                data.len(),
-                lay.rec
-            );
-            return Ok(());
-        }
-
-        // A pointer field, widened to u64 so the rest of the reader is word-size agnostic.
-        let rd_ptr = |b: &[u8], o: usize| -> u64 {
-            if lay.ptr == 8 {
-                let a: [u8; 8] = b[o..o + 8].try_into().unwrap();
-                if is_le { u64::from_le_bytes(a) } else { u64::from_be_bytes(a) }
-            } else {
-                let a: [u8; 4] = b[o..o + 4].try_into().unwrap();
-                (if is_le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }) as u64
-            }
-        };
-        let rd_u16 = |b: &[u8], o: usize| -> u16 { rd_u16_at(b, o) };
-        let rd_f64 = |b: &[u8], o: usize| -> f64 {
-            let a: [u8; 8] = b[o..o + 8].try_into().unwrap();
-            if is_le { f64::from_le_bytes(a) } else { f64::from_be_bytes(a) }
-        };
-
-        struct MeasRec {
-            name: String,
-            ty: i8,
-            x_dim: u16,
-            comment: String,
-            unit: String,
-            min: f64,
-            max: f64,
-            /// Absolute address, when the backend supplied one. `Some` switches this object from
-            /// identifier addressing to a plain address in the A2L -- what the VX1000 backend
-            /// needs, because the device samples ECU memory from outside the CPU and cannot ask
-            /// the application to resolve an identifier at trigger time.
-            addr: Option<u32>,
-            /// Owning event's name, on both addressing modes: it is the object's event binding in
-            /// the A2L whether or not `addr` is set. Under identifier addressing that binding is
-            /// metadata rather than something the address implies (spec §7), but it still decides
-            /// which event the object is armed on -- see the event_id lookup below.
-            event: String,
-        }
-
-        let mut recs: Vec<MeasRec> = Vec::new();
-        for (i, chunk) in data.chunks(lay.rec).enumerate() {
-            if chunk.len() < lay.rec {
-                break;
-            }
-            let name_ptr = rd_ptr(chunk, lay.o_name);
-            let ty = chunk[lay.o_type] as i8;
-            let x_dim = rd_u16(chunk, lay.o_x_dim);
-            let comment_ptr = rd_ptr(chunk, lay.o_comment);
-            let unit_ptr = rd_ptr(chunk, lay.o_unit);
-            let min = rd_f64(chunk, lay.o_min);
-            let max = rd_f64(chunk, lay.o_max);
-            let addr = lay.o_addr.map(|o| rd_ptr(chunk, o)).filter(|a| *a != 0).map(|a| a as u32);
-            let event = lay
-                .o_event
-                .map(|o| rd_ptr(chunk, o))
-                .and_then(|p| self.read_rodata_cstr(p))
-                .unwrap_or_default();
-
-            // Identifiers are the 1-based position in the sorted, de-duplicated name list, and
-            // the application derives them the same way from *every* descriptor. Dropping a
-            // record here would shift every alphabetically-later identifier by one, so the A2L
-            // would say `spectrum` is 7 while the application resolves 8 -- the kernel would arm
-            // 7, xcplite would resolve it happily, and the user would get another variable's
-            // bytes as plausible-looking numbers. An A2L that cannot reproduce the runtime's
-            // assignment is worse than no A2L, so this is fatal rather than a skip.
-            let Some(name) = self.read_rodata_cstr(name_ptr) else {
-                return Err(format!(
-                    "mci_meas record {} has an unresolvable name pointer 0x{:08X}. Identifiers are \
-                     positional, so skipping it would renumber every later signal and the A2L would \
-                     describe the wrong variables.",
-                    i, name_ptr
-                )
-                .into());
-            };
-            if name.is_empty() {
-                return Err(format!(
-                    "mci_meas record {} has an empty name; identifiers are positional, so it cannot \
-                     be skipped without renumbering every later signal.",
-                    i
-                )
-                .into());
-            }
-            let comment = self.read_rodata_cstr(comment_ptr).unwrap_or_default();
-            let unit = self.read_rodata_cstr(unit_ptr).unwrap_or_default();
-            recs.push(MeasRec { name, ty, x_dim, comment, unit, min, max, addr, event });
-        }
+        info!("Registering measurements from the mci_meas section:");
 
         // Each record's A2L name: `<event>.<name>`, or the bare name for a record built outside any
         // MEASURE -- the rule mc-instrument's a2l_name() applies at runtime. A name alone does not say
@@ -1677,7 +1516,13 @@ impl ElfReader {
                 Err(e) => error!("Failed to register measurement '{}': {}", name, e),
             }
         }
-        info!("Registered {} identifier-addressed measurement(s) from mci_meas", count);
+        let absolute = recs.iter().filter(|r| r.addr.is_some()).count();
+        info!(
+            "Registered {} measurement(s) from mci_meas: {} by identifier, {} at an absolute address",
+            count,
+            recs.len() - absolute,
+            absolute
+        );
         Ok(())
     }
 
@@ -1946,6 +1791,266 @@ fn a2l_splice(text: &str, edits: &[(std::ops::Range<usize>, String)]) -> String 
     }
     out.push_str(&text[at..]);
     out
+}
+
+/// One record of the mci_meas section: an object a MEASURE (or MC outside one) describes.
+pub(crate) struct MciRecord {
+    name: String,
+    ty: i8,
+    x_dim: u16,
+    comment: String,
+    unit: String,
+    min: f64,
+    max: f64,
+    /// Absolute address, when the backend supplied one. `Some` switches this object from
+    /// identifier addressing to a plain address in the A2L -- what the VX1000 backend
+    /// needs, because the device samples ECU memory from outside the CPU and cannot ask
+    /// the application to resolve an identifier at trigger time.
+    addr: Option<u32>,
+    /// Owning event's name, on both addressing modes: it is the object's event binding in
+    /// the A2L whether or not `addr` is set. Under identifier addressing that binding is
+    /// metadata rather than something the address implies (spec §7), but it still decides
+    /// which event the object is armed on -- see the event_id lookup in register_mci_measurements.
+    event: String,
+}
+
+/// How the ELF's mc-instrument measurement records address their objects, which decides what the
+/// DWARF sweep (register_variables) may add next to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MciAddressing {
+    /// No mci_meas section: the sweep is the only source of measurements, as for any ELF.
+    None,
+    /// At least one record has no address, so the application resolves identifiers (xcplite). The
+    /// records are the measurements; the sweep adds calibration characteristics only, because a
+    /// swept measurement would duplicate one under an absolute address and take in the library's
+    /// own globals. A layout v1 record has no address field at all, and a section this reader
+    /// cannot parse is counted here too: both were identifier-addressed before v2 existed.
+    Identifier,
+    /// Every record carries an absolute address (mc_vx.hpp, a VX1000). Nothing resolves anything
+    /// on the target, so the plain globals the sweep finds are as measurable as the records, and
+    /// the sweep runs in full next to them.
+    Absolute,
+}
+
+impl MciAddressing {
+    /// `records` is what ElfReader::mci_records gave: None when the ELF has no mci_meas section.
+    pub(crate) fn of(records: Option<&[MciRecord]>) -> MciAddressing {
+        match records {
+            None => MciAddressing::None,
+            Some(r) if !r.is_empty() && r.iter().all(|r| r.addr.is_some()) => MciAddressing::Absolute,
+            Some(_) => MciAddressing::Identifier,
+        }
+    }
+}
+
+/// Prefix of the static shadow mc_vx.hpp's MC and MC_N copy a measured variable into: the record
+/// points at `__mci_sh_<var>`, not at `<var>`.
+const MCI_SHADOW_PREFIX: &str = "__mci_sh_";
+
+/// The bare names of the variables a MEASURE already measures, whose plain global the sweep must
+/// not add as a twin: every record's name, and `X` for every shadow `__mci_sh_X` in the DWARF
+/// (a record renamed with `.name` still has its variable's shadow).
+fn instrumented_names<'a>(records: &[MciRecord], dwarf_variables: impl Iterator<Item = &'a String>) -> std::collections::HashSet<String> {
+    let mut set: std::collections::HashSet<String> = records.iter().map(|r| r.name.clone()).collect();
+    set.extend(dwarf_variables.filter_map(|v| v.strip_prefix(MCI_SHADOW_PREFIX)).map(str::to_string));
+    set
+}
+
+/// Parse the records of an mci_meas section with the layout its mci_layout record gives (see
+/// register_mci_measurements). `cstr` resolves a string pointer. A layout that does not fit, or a
+/// section that is not a whole number of records, is warned about and gives no records; a record
+/// whose name cannot be read is an error, because identifiers are positional.
+fn parse_mci_records(data: &[u8], layout: Option<&[u8]>, is_le: bool, cstr: &dyn Fn(u64) -> Option<String>) -> Result<Vec<MciRecord>, Box<dyn Error>> {
+    let rd_u16_at = |b: &[u8], o: usize| -> u16 {
+        let a: [u8; 2] = b[o..o + 2].try_into().unwrap();
+        if is_le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) }
+    };
+
+    // How to parse a record. mc.hpp emits a MeasLayout into mci_layout precisely so this is
+    // read rather than assumed: MeasMeta holds pointers, so its stride and field offsets move
+    // with the target ABI, and every VX1000 target is 32-bit. Binaries built before that
+    // section existed are all LP64, so their historical layout is the fallback.
+    struct Layout {
+        rec: usize,
+        ptr: usize,
+        o_name: usize,
+        o_type: usize,
+        o_x_dim: usize,
+        o_comment: usize,
+        o_unit: usize,
+        o_min: usize,
+        o_max: usize,
+        // Layout version 2. `None` on a v1 binary, where every object is identifier-addressed.
+        o_event: Option<usize>,
+        o_addr: Option<usize>,
+    }
+    const LP64: Layout = Layout {
+        rec: 56,
+        ptr: 8,
+        o_name: 0,
+        o_type: 8,
+        o_x_dim: 10,
+        o_comment: 16,
+        o_unit: 24,
+        o_min: 32,
+        o_max: 40,
+        o_event: None,
+        o_addr: None,
+    };
+
+    let lay = match layout {
+        Some(b) if b.len() >= 20 => {
+            let ver = b[3];
+            if ver > 2 {
+                warn!(
+                    "mci_layout version {} is newer than this reader understands (2); parsing the fields version 2 defines and ignoring the rest",
+                    ver
+                );
+            }
+            // v2 appended o_event and o_addr, so every v1 offset is still where it was.
+            let has_v2 = ver >= 2 && b.len() >= 24;
+            let l = Layout {
+                rec: rd_u16_at(b, 0) as usize,
+                ptr: b[2] as usize,
+                o_name: rd_u16_at(b, 4) as usize,
+                o_type: rd_u16_at(b, 6) as usize,
+                o_x_dim: rd_u16_at(b, 8) as usize,
+                o_comment: rd_u16_at(b, 12) as usize,
+                o_unit: rd_u16_at(b, 14) as usize,
+                o_min: rd_u16_at(b, 16) as usize,
+                o_max: rd_u16_at(b, 18) as usize,
+                o_event: if has_v2 { Some(rd_u16_at(b, 20) as usize) } else { None },
+                o_addr: if has_v2 { Some(rd_u16_at(b, 22) as usize) } else { None },
+            };
+            info!("mci_meas layout from mci_layout: {}-byte records, {}-bit pointers", l.rec, l.ptr * 8);
+            l
+        }
+        Some(b) => {
+            warn!("mci_layout section is {} bytes, too short for a MeasLayout record; assuming the 64-bit layout", b.len());
+            LP64
+        }
+        None => LP64,
+    };
+
+    if lay.rec == 0 || lay.ptr == 0 || (lay.ptr != 4 && lay.ptr != 8) {
+        warn!(
+            "mci_layout describes {}-byte records with {}-byte pointers, which is not parseable; skipping mci_meas",
+            lay.rec, lay.ptr
+        );
+        return Ok(Vec::new());
+    }
+    // Every field the reader is about to slice has to lie inside a record. Without this a
+    // layout claiming, say, 16-byte records with min at offset 32 passes the chunk-length
+    // check and then panics in rd_f64 with a backtrace instead of a diagnostic.
+    let fits = |offset: usize, width: usize| offset + width <= lay.rec;
+    // o_event and o_addr are Options because v1 records do not have them, but when they are
+    // present they are sliced exactly like the v1 fields (rd_ptr below), so they are checked
+    // exactly like them. Leaving them out let a v2 layout over v1-sized records -- a stale
+    // object file relinked against a newer mci_layout -- reach rd_ptr and panic.
+    let bad = [
+        ("name", Some(lay.o_name), lay.ptr),
+        ("type", Some(lay.o_type), 1),
+        ("x_dim", Some(lay.o_x_dim), 2),
+        ("comment", Some(lay.o_comment), lay.ptr),
+        ("unit", Some(lay.o_unit), lay.ptr),
+        ("min", Some(lay.o_min), 8),
+        ("max", Some(lay.o_max), 8),
+        ("event", lay.o_event, lay.ptr),
+        ("addr", lay.o_addr, lay.ptr),
+    ]
+    .into_iter()
+    .filter_map(|(name, offset, width)| offset.map(|o| (name, o, width)))
+    .find(|(_, offset, width)| !fits(*offset, *width));
+    if let Some((field, offset, width)) = bad {
+        warn!(
+            "mci_layout puts '{}' at offset {} ({} bytes) in a {}-byte record, which does not fit; skipping mci_meas",
+            field, offset, width, lay.rec
+        );
+        return Ok(Vec::new());
+    }
+
+    if data.len() % lay.rec != 0 {
+        // Not a warning to carry on from: if the stride disagrees, every field read after
+        // the first record lands in the middle of another one, so the measurements this
+        // would emit are fabricated rather than merely incomplete.
+        warn!(
+            "mci_meas section is {} bytes, not a multiple of the {}-byte record stride -- mc.hpp MeasMeta layout and this reader disagree; skipping mci_meas rather than emitting fabricated signals",
+            data.len(),
+            lay.rec
+        );
+        return Ok(Vec::new());
+    }
+
+    // A pointer field, widened to u64 so the rest of the reader is word-size agnostic.
+    let rd_ptr = |b: &[u8], o: usize| -> u64 {
+        if lay.ptr == 8 {
+            let a: [u8; 8] = b[o..o + 8].try_into().unwrap();
+            if is_le { u64::from_le_bytes(a) } else { u64::from_be_bytes(a) }
+        } else {
+            let a: [u8; 4] = b[o..o + 4].try_into().unwrap();
+            (if is_le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }) as u64
+        }
+    };
+    let rd_u16 = |b: &[u8], o: usize| -> u16 { rd_u16_at(b, o) };
+    let rd_f64 = |b: &[u8], o: usize| -> f64 {
+        let a: [u8; 8] = b[o..o + 8].try_into().unwrap();
+        if is_le { f64::from_le_bytes(a) } else { f64::from_be_bytes(a) }
+    };
+
+    let mut recs: Vec<MciRecord> = Vec::new();
+    for (i, chunk) in data.chunks(lay.rec).enumerate() {
+        if chunk.len() < lay.rec {
+            break;
+        }
+        let name_ptr = rd_ptr(chunk, lay.o_name);
+        let ty = chunk[lay.o_type] as i8;
+        let x_dim = rd_u16(chunk, lay.o_x_dim);
+        let comment_ptr = rd_ptr(chunk, lay.o_comment);
+        let unit_ptr = rd_ptr(chunk, lay.o_unit);
+        let min = rd_f64(chunk, lay.o_min);
+        let max = rd_f64(chunk, lay.o_max);
+        let addr = lay.o_addr.map(|o| rd_ptr(chunk, o)).filter(|a| *a != 0).map(|a| a as u32);
+        let event = lay.o_event.map(|o| rd_ptr(chunk, o)).and_then(|p| cstr(p)).unwrap_or_default();
+
+        // Identifiers are the 1-based position in the sorted, de-duplicated name list, and
+        // the application derives them the same way from *every* descriptor. Dropping a
+        // record here would shift every alphabetically-later identifier by one, so the A2L
+        // would say `spectrum` is 7 while the application resolves 8 -- the kernel would arm
+        // 7, xcplite would resolve it happily, and the user would get another variable's
+        // bytes as plausible-looking numbers. An A2L that cannot reproduce the runtime's
+        // assignment is worse than no A2L, so this is fatal rather than a skip.
+        let Some(name) = cstr(name_ptr) else {
+            return Err(format!(
+                "mci_meas record {} has an unresolvable name pointer 0x{:08X}. Identifiers are \
+                 positional, so skipping it would renumber every later signal and the A2L would \
+                 describe the wrong variables.",
+                i, name_ptr
+            )
+            .into());
+        };
+        if name.is_empty() {
+            return Err(format!(
+                "mci_meas record {} has an empty name; identifiers are positional, so it cannot \
+                 be skipped without renumbering every later signal.",
+                i
+            )
+            .into());
+        }
+        let comment = cstr(comment_ptr).unwrap_or_default();
+        let unit = cstr(unit_ptr).unwrap_or_default();
+        recs.push(MciRecord {
+            name,
+            ty,
+            x_dim,
+            comment,
+            unit,
+            min,
+            max,
+            addr,
+            event,
+        });
+    }
+    Ok(recs)
 }
 
 /// Rewrite, in the A2L at `path`, the event list of every identifier-addressed measurement
@@ -2862,6 +2967,94 @@ mod tests {
         assert!(!runs_where_loaded(0x3003_C000, &segments), "zeroed at startup, nothing in the image");
         assert!(!runs_where_loaded(0x3000_0000, &segments), "in no loaded segment");
         assert!(!runs_where_loaded(0x0801_B960, &[]));
+    }
+
+    // A 32-bit little-endian MeasMeta, as mc_vx.hpp lays it out on a VX1000 target: name @0,
+    // type @4, x_dim @6, comment @8, unit @12, min @16, max @24, and from layout v2 on the event
+    // name @32 and the address @36.
+    fn mci_layout(version: u8) -> Vec<u8> {
+        let rec: u16 = if version >= 2 { 40 } else { 32 };
+        let mut b = Vec::new();
+        b.extend_from_slice(&rec.to_le_bytes());
+        b.push(4);
+        b.push(version);
+        for o in [0u16, 4, 6, 0, 8, 12, 16, 24] {
+            b.extend_from_slice(&o.to_le_bytes()); // offset 10 (flags) is not read
+        }
+        if version >= 2 {
+            b.extend_from_slice(&32u16.to_le_bytes());
+            b.extend_from_slice(&36u16.to_le_bytes());
+        }
+        b
+    }
+
+    fn mci_record(version: u8, name: u32, event: u32, addr: u32) -> Vec<u8> {
+        let mut b = vec![0u8; if version >= 2 { 40 } else { 32 }];
+        b[0..4].copy_from_slice(&name.to_le_bytes());
+        b[4] = 2; // uint16
+        b[6..8].copy_from_slice(&1u16.to_le_bytes());
+        if version >= 2 {
+            b[32..36].copy_from_slice(&event.to_le_bytes());
+            b[36..40].copy_from_slice(&addr.to_le_bytes());
+        }
+        b
+    }
+
+    fn mci_strings(p: u64) -> Option<String> {
+        match p {
+            0x100 => Some("level1".into()),
+            0x110 => Some("level2".into()),
+            0x200 => Some("SignalA".into()),
+            _ => None,
+        }
+    }
+
+    fn addressing_of(version: u8, records: &[(u32, u32, u32)]) -> MciAddressing {
+        let data: Vec<u8> = records.iter().flat_map(|&(n, e, a)| mci_record(version, n, e, a)).collect();
+        let recs = parse_mci_records(&data, Some(&mci_layout(version)), true, &mci_strings).expect("the records parse");
+        assert_eq!(recs.len(), records.len());
+        MciAddressing::of(Some(&recs))
+    }
+
+    #[test]
+    fn records_that_all_carry_an_address_leave_the_sweep_its_globals() {
+        assert_eq!(addressing_of(2, &[(0x100, 0x200, 0x3003_E000), (0x110, 0x200, 0x3003_E002)]), MciAddressing::Absolute);
+    }
+
+    #[test]
+    fn one_record_without_an_address_makes_the_elf_identifier_addressed() {
+        assert_eq!(addressing_of(2, &[(0x100, 0x200, 0x3003_E000), (0x110, 0x200, 0)]), MciAddressing::Identifier);
+        assert_eq!(addressing_of(2, &[(0x100, 0x200, 0), (0x110, 0x200, 0)]), MciAddressing::Identifier);
+    }
+
+    #[test]
+    fn a_layout_v1_record_has_no_address_and_counts_as_identifier_addressed() {
+        assert_eq!(addressing_of(1, &[(0x100, 0, 0), (0x110, 0, 0)]), MciAddressing::Identifier);
+    }
+
+    #[test]
+    fn no_section_is_no_addressing_and_an_unparseable_one_is_identifier_addressed() {
+        assert_eq!(MciAddressing::of(None), MciAddressing::None);
+        // 41 bytes are not a whole number of 40-byte records: warned about, no records, and the
+        // sweep stays as restricted as it was before absolute records existed
+        let recs = parse_mci_records(&[0u8; 41], Some(&mci_layout(2)), true, &mci_strings).unwrap();
+        assert!(recs.is_empty());
+        assert_eq!(MciAddressing::of(Some(&recs)), MciAddressing::Identifier);
+        let elf = ElfReader::new(XCPLITE_ELF, 0, usize::MAX).expect("the xcplite example ELF loads");
+        assert_eq!(MciAddressing::of(elf.mci_records().unwrap().as_deref()), MciAddressing::None);
+    }
+
+    #[test]
+    fn the_twins_of_measured_variables_are_the_record_names_and_the_shadowed_variables() {
+        let data: Vec<u8> = [(0x100, 0x200, 0x3003_E000)].iter().flat_map(|&(n, e, a)| mci_record(2, n, e, a)).collect();
+        let recs = parse_mci_records(&data, Some(&mci_layout(2)), true, &mci_strings).unwrap();
+        let dwarf: Vec<String> = ["__mci_sh_level1", "__mci_sh_speed", "speed", "counter", "evt__SignalA"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut twins: Vec<String> = instrumented_names(&recs, dwarf.iter()).into_iter().collect();
+        twins.sort();
+        assert_eq!(twins, ["level1", "speed"]);
     }
 
     #[test]

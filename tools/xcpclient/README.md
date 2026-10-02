@@ -49,6 +49,14 @@ then follow the target rather than XCPlite's server:
   file contents of a `PT_LOAD` segment with `p_vaddr == p_paddr`, for example data copied to
   RAM at startup): keep the EPK `const`, so it stays in flash. An address past 32 bits, or no
   `xcp_epk` section, gives an A2L without an EPK.
+- **The DWARF variable sweep** depends on mc-instrument's measurement records (`mci_meas`).
+  When a record has no address (identifier addressing, XCPlite), the records are the
+  measurements and the sweep adds calibration characteristics only. When every record has an
+  absolute address (`mc_vx.hpp`), the sweep also adds the plain globals in the same run. It
+  leaves out a variable that a `MEASURE` already measures as `<event>.<name>`: a record's name,
+  or `X` of a shadow `__mci_sh_X`. `--elf-var-filter` and `--elf-unit-filter` narrow the sweep
+  as usual. A swept measurement on a target that is not XCPlite has no `IF_DATA` (no event),
+  so the master selects the event that samples it. An ELF without `mci_meas` is swept as before.
 
 
 

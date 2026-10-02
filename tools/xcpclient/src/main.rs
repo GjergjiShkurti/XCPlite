@@ -28,7 +28,7 @@ use xcp_registry::McEvent;
 use xcp_test_executor::test_executor;
 
 pub mod elf_reader;
-use elf_reader::ElfReader;
+use elf_reader::{ElfReader, MciAddressing};
 
 pub mod bin_reader;
 
@@ -831,19 +831,27 @@ async fn xcp_client(
                 // Register all accessible variables and their types
                 // Skipped in --create-a2l-template mode; events and segments are still registered above
                 if !create_a2l_template {
-                    // Identifier addressing: when the ELF carries mc-instrument measurement
-                    // descriptors (mci_meas), suppress the DWARF measurement sweep and emit the
-                    // measurements from the descriptors instead (register_mci_measurements below).
-                    let id_addressing = elf_reader.has_id_addressing();
-                    id_addressed = id_addressing;
-                    elf_reader.register_variables(&mut reg, segment_relative, verbose, elf_idx_unit_limit, &elf_var_filter, &elf_unit_filter, id_addressing)?;
+                    // mc-instrument's measurement records (mci_meas). Identifier-addressed ones
+                    // (xcplite) are the measurements, and the DWARF sweep adds only calibration
+                    // characteristics. Absolute ones (VX1000) leave the sweep its plain globals,
+                    // minus the twins of what a MEASURE measures (issue 361). The records are
+                    // emitted by register_mci_measurements below.
+                    let mci = elf_reader.mci_records()?;
+                    let addressing = MciAddressing::of(mci.as_deref());
+                    if addressing != MciAddressing::None {
+                        info!("mci_meas records: {:?} addressing", addressing);
+                    }
+                    id_addressed = addressing == MciAddressing::Identifier;
+                    elf_reader.register_variables(&mut reg, segment_relative, verbose, elf_idx_unit_limit, &elf_var_filter, &elf_unit_filter, mci.as_deref())?;
                     // Apply metadata (XCP_UNIT / XCP_LIMITS / XCP_COMMENT) from the xcp_meta ELF section
                     elf_reader.register_metadata(&mut reg, verbose)?;
                     // Apply mc-instrument's calibration field metadata from the mci_meta ELF section
                     elf_reader.register_cal_metadata(&mut reg, verbose)?;
                     // Register the measurements the mci_meas descriptor section describes, by identifier
                     // or, where the backend supplied one (VX1000), by absolute address
-                    elf_reader.register_mci_measurements(&mut reg, segment_relative, verbose)?;
+                    if let Some(records) = mci.as_deref() {
+                        elf_reader.register_mci_measurements(&mut reg, records, segment_relative, verbose)?;
+                    }
                     // Added to upstream (issue 223): a measurement named like a calibration object,
                     // an instance's component path included, is refused, and no A2L is written.
                     elf_reader::check_measurement_names(&reg)?;
