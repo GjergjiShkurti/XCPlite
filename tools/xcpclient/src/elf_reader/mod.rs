@@ -240,7 +240,8 @@ impl ElfReader {
                 }
             }
 
-            DbgDataType::Pointer(pointee, size) => {
+            // Pointer(address size, pointee type offset); the sizes were read from the second field
+            DbgDataType::Pointer(size, _pointee) => {
                 if *size == 4 {
                     McValueType::Ulong
                 } else if *size == 8 {
@@ -926,6 +927,8 @@ impl ElfReader {
             _ => std::collections::HashSet::new(),
         };
         let mut twins: Vec<&str> = Vec::new();
+        // Globals left out for a type that has no A2L equivalent (enum, pointer, class, ...)
+        let mut unsupported = 0usize;
 
         // Compile name filter regex if specified
         let name_regex: Option<Regex> = if name_filter.is_empty() {
@@ -1229,7 +1232,8 @@ impl ElfReader {
                             }
                         }
                         _ => {
-                            warn!("Variable '{}' has unsupported type: {}", var_name, type_info);
+                            debug!("Variable '{}' has unsupported type: {}", var_name, type_info);
+                            unsupported += 1;
                         }
                     }
                 } else {
@@ -1241,6 +1245,12 @@ impl ElfReader {
             twins.sort_unstable();
             info!("{} global(s) skipped: measured by MEASURE under <event>.<name>", twins.len());
             debug!("Skipped as measured by MEASURE: {}", twins.join(", "));
+        }
+        if unsupported > 0 {
+            info!(
+                "{} global(s) skipped: a type the A2L cannot state (enum, pointer, class, ...); log level 4 lists them",
+                unsupported
+            );
         }
         if without_event {
             info!("Swept measurements are bound to no event: the target is not xcplite");
@@ -2274,6 +2284,35 @@ pub fn ident_field_for(server: Option<&ServerProtocol>, xcplite_target: bool) ->
         }),
         None => None,
     }
+}
+
+/// What this build does for the A2L, one name per fact, printed by `--print-features`. A caller
+/// that needs one of them (the VS Code extension, for a VX1000) asks for the list instead of
+/// comparing version numbers: the fork does not bump its version. Append a name with the change
+/// that adds it; a name is never reused for different behaviour.
+pub const FEATURES: &[&str] = &[
+    // ADDR_EPK is the ELF address of xcp_epk on a target that is not xcplite (issue 358)
+    "a2l-epk-elf-address",
+    // DW_FORM_loclistx locations resolve (issue 362)
+    "a2l-loclistx",
+    // an ELF with absolute mci records keeps the plain-global sweep in one run (issue 361)
+    "a2l-sweep-absolute",
+    // EVENT cycle comes from the xcp_evts record (issue 360)
+    "a2l-event-cycle",
+    // IDENTIFICATION_FIELD_TYPE comes from the xcp_proto record (issue 364)
+    "a2l-ident-field",
+    // an absolute VX ELF without xcp_proto fails unless --allow-registry-protocol (issue 366)
+    "a2l-require-proto",
+];
+
+/// True when the A2L cannot state what the server sends and must not be written (issue 366): a
+/// target that is not xcplite, whose mci records all carry absolute addresses (a VX1000 built
+/// with mc_vx.hpp), and an ELF with no xcp_proto record. xcp_registry then writes MAX_CTO 252,
+/// MAX_DTO 1468, timestamps fixed and a one byte DTO header, which such a target does not do, and
+/// a master that trusts them loses the samples without an error. Any other ELF without the
+/// record keeps the A2L it always got.
+pub(crate) fn lacks_required_protocol(xcplite_target: bool, addressing: MciAddressing, server: Option<&ServerProtocol>) -> bool {
+    !xcplite_target && addressing == MciAddressing::Absolute && server.is_none()
 }
 
 impl ServerProtocol {
@@ -3432,5 +3471,37 @@ mod tests {
         let elf = ElfReader::new(XCPLITE_ELF, 0, usize::MAX).expect("the xcplite example ELF loads");
         let server = elf.server_protocol().unwrap();
         assert_eq!(ident_field_for(server.as_ref(), elf.is_xcplite_target()), Some(INFERRED));
+    }
+
+    #[test]
+    fn only_an_absolute_target_that_is_not_xcplite_needs_the_protocol_record() {
+        let v2 = parse_server_protocol(&proto(&[255, 250, 0x34, 1, 0xA540], true), true).unwrap();
+        // a VX1000 application without the record: refused
+        assert!(lacks_required_protocol(false, MciAddressing::Absolute, None));
+        // with it, or an xcplite, or records that are not all absolute, or none: as before
+        assert!(!lacks_required_protocol(false, MciAddressing::Absolute, Some(&v2)));
+        assert!(!lacks_required_protocol(true, MciAddressing::Absolute, None));
+        assert!(!lacks_required_protocol(false, MciAddressing::Identifier, None));
+        assert!(!lacks_required_protocol(false, MciAddressing::None, None));
+    }
+
+    #[test]
+    fn the_feature_list_is_stable() {
+        // The extension reads these names; a change here is a change to that contract.
+        assert_eq!(
+            FEATURES,
+            [
+                "a2l-epk-elf-address",
+                "a2l-loclistx",
+                "a2l-sweep-absolute",
+                "a2l-event-cycle",
+                "a2l-ident-field",
+                "a2l-require-proto",
+            ]
+        );
+        let mut names = FEATURES.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), FEATURES.len());
     }
 }

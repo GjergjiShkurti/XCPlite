@@ -77,6 +77,30 @@ then follow the target rather than XCPlite's server:
   or `X` of a shadow `__mci_sh_X`. `--elf-var-filter` and `--elf-unit-filter` narrow the sweep
   as usual. A swept measurement on a target that is not XCPlite has no `IF_DATA` (no event),
   so the master selects the event that samples it. An ELF without `mci_meas` is swept as before.
+- **The `xcp_proto` record is required** for an ELF whose `mci_meas` records all have absolute
+  addresses (`mc_vx.hpp`). Without it the A2L would state xcp_registry's MAX_CTO 252, MAX_DTO 1468,
+  fixed timestamps and `RELATIVE_BYTE`, none of which a VX1000 does, and a master loses the
+  samples without an error. xcpclient then fails with a message and writes no A2L. Rebuild the
+  application with a `mc_vx.hpp` that writes the record, or pass `--allow-registry-protocol` to
+  get the A2L with a warning. Any other ELF without the record is not affected.
+
+### Log levels and `--print-features`
+
+At log level 2 (warnings), a run prints only what needs a decision: a type that went wrong, a
+record that does not fit, an ELF that is not fully usable. The facts of a normal run are at level
+3: the A2L path, an overwritten A2L, no `XCPLITE__` signature (the ELF is not an XCPlite target),
+no CFA data, and one count of the globals left out because the A2L cannot state their type (enum,
+pointer, class). Level 4 lists those globals by name.
+
+`--print-features` prints the names of what this build does for the A2L, one per line, and exits
+with status 0 without reading anything: `a2l-epk-elf-address`, `a2l-loclistx`,
+`a2l-sweep-absolute`, `a2l-event-cycle`, `a2l-ident-field` and `a2l-require-proto`. A tool that
+needs one asks for the list. A build from before the option exits with a usage error, which means
+the same as a name that is missing. `--version` names the commit the build is from (issue 214),
+not what it does; `--print-features` does.
+
+Pointer members of a structure type are `ULONG` or `ULONGLONG` by the target's address size. They
+were typed from the wrong field of the debug information, so a 32-bit target got `ULONGLONG`.
 
 
 
@@ -191,6 +215,12 @@ Options:
 
       --test
           --test Execute a test sequence on the XCP server
+
+      --print-features
+          Print one line per A2L feature this build has, then exit
+
+      --allow-registry-protocol
+          Create the A2L of a VX1000 ELF that has no xcp_proto record anyway
 
   -h, --help
           Print help (see a summary with '-h')

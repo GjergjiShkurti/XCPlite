@@ -196,7 +196,7 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
             if cfa > 0 {
                 log::info!("CFA data found in {cfa} functions");
             } else {
-                log::warn!("CFA data not found");
+                log::info!("CFA data not found");
             }
         }
         Err(err) => {

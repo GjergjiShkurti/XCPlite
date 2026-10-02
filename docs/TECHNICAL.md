@@ -157,7 +157,11 @@ clear, and type 0 is not stated: a section padded by the linker, or two version 
 side, read as "not stated" instead of as a type. xcpclient writes the record's values into
 `PROTOCOL_LAYER`, `TIMESTAMP_SUPPORTED` and `IDENTIFICATION_FIELD_TYPE_…` of the offline A2L.
 Without word 4, an XCPlite ELF gets `RELATIVE_WORD_ALIGNED` (every XCPlite before the word sent a
-4-byte header), and any other ELF keeps `RELATIVE_BYTE`.
+4-byte header), and any other ELF keeps `RELATIVE_BYTE`. The exception is an ELF that is not
+XCPlite, whose `mci_meas` records all carry absolute addresses (a VX1000, `mc_vx.hpp`), and that
+has no record: xcpclient fails and writes no A2L, because xcp_registry's `PROTOCOL_LAYER`,
+timestamp and header are wrong for it. `--allow-registry-protocol` writes the A2L with a warning.
+`xcpclient --print-features` lists what a build does (see the xcpclient README).
 
 #### Trigger point DWARF scope anchors — `trg__` naming convention
 

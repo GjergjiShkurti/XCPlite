@@ -216,6 +216,20 @@ struct Args {
     /// Execute a test sequence on the XCP server.
     #[arg(long, default_value_t = false)]
     test: bool,
+
+    // --print-features
+    /// Print one line per A2L feature this build has, then exit.
+    /// A caller asks for the list instead of comparing versions. An older build does not know the
+    /// option and exits with a usage error.
+    #[arg(long, default_value_t = false)]
+    print_features: bool,
+
+    // --allow-registry-protocol
+    /// Create the A2L of a VX1000 ELF (absolute mci records) that has no xcp_proto record anyway.
+    /// The A2L then states xcp_registry's MAX_CTO 252, MAX_DTO 1468, fixed timestamps and
+    /// RELATIVE_BYTE, which a VX1000 does not do. Without this option the run fails.
+    #[arg(long, default_value_t = false)]
+    allow_registry_protocol: bool,
 }
 
 //----------------------------------------------------------------------------------------------
@@ -551,6 +565,7 @@ async fn xcp_client(
     cal_args: Vec<String>,
     csv_filename: String,
     stated_endpoint: StatedEndpoint,
+    allow_registry_protocol: bool,
 ) -> Result<(), Box<dyn Error>> {
     // Create xcp_client
     let mut xcp_client = XcpClient::new(protocol, dest_addr, local_addr, baud_rate);
@@ -682,7 +697,7 @@ async fn xcp_client(
         } else {
             return Err("^No A2L file name specified, use --a2l commandline parameter".into());
         };
-        warn!("A2L path: {}", a2l_path.display());
+        info!("A2L path: {}", a2l_path.display());
 
         //----------------------------------------------------------------
         // Upload A2L
@@ -803,7 +818,7 @@ async fn xcp_client(
                         info!("Target signature found: {}", sig);
                         if sig.starts_with("C") { true } else { false }
                     } else {
-                        warn!("No target signature found in ELF file");
+                        info!("No XCPLITE__ signature in the ELF file: not an xcplite target");
                         false
                     }
                 };
@@ -817,6 +832,19 @@ async fn xcp_client(
                 server_protocol = elf_reader.server_protocol()?;
                 if server_protocol.is_none() && elf_reader.is_xcplite_target() {
                     warn!("The ELF links an xcplite without the xcp_proto section: the A2L states xcp_registry's MAX_CTO, MAX_DTO and timestamp, which may not be the server's");
+                }
+
+                // The mci_meas records, read once: the check below and the sweep use them (issue 361)
+                let mci = elf_reader.mci_records()?;
+                let addressing = MciAddressing::of(mci.as_deref());
+
+                // A VX1000 application without the record (issue 366): xcp_registry's text is wrong for it
+                if elf_reader::lacks_required_protocol(elf_reader.is_xcplite_target(), addressing, server_protocol.as_ref()) {
+                    let why = "The ELF has absolute mci records (a VX1000) but no xcp_proto record: the A2L would state xcp_registry's MAX_CTO 252, MAX_DTO 1468, fixed timestamps and RELATIVE_BYTE, which a VX1000 does not do, and a master would lose samples without an error. Rebuild the application with the mc_vx.hpp of a CANsole that writes the record, or pass --allow-registry-protocol to create the A2L anyway";
+                    if !allow_registry_protocol {
+                        return Err(why.into());
+                    }
+                    warn!("{}", why);
                 }
 
                 // The identification field type the server sends (issue 364, below), where it is known
@@ -842,8 +870,6 @@ async fn xcp_client(
                     // characteristics. Absolute ones (VX1000) leave the sweep its plain globals,
                     // minus the twins of what a MEASURE measures (issue 361). The records are
                     // emitted by register_mci_measurements below.
-                    let mci = elf_reader.mci_records()?;
-                    let addressing = MciAddressing::of(mci.as_deref());
                     if addressing != MciAddressing::None {
                         info!("mci_meas records: {:?} addressing", addressing);
                     }
@@ -899,7 +925,7 @@ async fn xcp_client(
             // Write the registry to A2L file
             if !a2l_path.as_os_str().is_empty() {
                 if a2l_path.exists() {
-                    warn!("Overwriting existing A2L file: {}", a2l_path.display());
+                    info!("Overwriting existing A2L file: {}", a2l_path.display());
                 }
                 if ecu_name.is_empty() {
                     ecu_name = "project_name".into();
@@ -1278,6 +1304,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = <Args as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let from_command_line = |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
 
+    // The feature probe prints nothing else, not even the banner, and connects to nothing
+    if args.print_features {
+        for feature in elf_reader::FEATURES {
+            println!("{feature}");
+        }
+        return Ok(());
+    }
+
     // Initialize logging
     let log_level = args.log_level.to_log_level_filter();
     env_logger::Builder::new()
@@ -1373,6 +1407,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             args.cal,
             args.csv,
             stated_endpoint,
+            args.allow_registry_protocol,
         )
         .await;
         if let Err(e) = res {
