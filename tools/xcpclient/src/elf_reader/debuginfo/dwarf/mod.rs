@@ -41,6 +41,7 @@ struct DebugDataReader<'elffile> {
     xcp_meta_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes)
     mci_meta_data: Option<Vec<u8>>,        // raw bytes of the mci_meta section (mc-instrument calibration metadata)
     mci_app_name: Option<String>,          // the application's own name, from the mci_app section
+    mci_app_data: Option<Vec<u8>>,         // raw bytes of mci_app: the application record, its name and, since issue 225, its endpoint
     mci_meas_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of mci_meas (mc-instrument measurement descriptors)
     mci_layout_data: Option<Vec<u8>>,      // raw bytes of mci_layout: how to parse an mci_meas record on this ABI
     rodata_data: Option<(u64, Vec<u8>)>,   // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers held in mci_meas
@@ -111,13 +112,19 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
     } else {
         log::debug!("mc-instrument calibration metadata section (mci_meta) not found in ELF file");
     }
-    // read the mci_app section: the application's own name, as characters. The runtime A2L route
-    // takes it from the same Cfg the server is started with; without this the offline route had
-    // nothing to call the project but a placeholder.
-    let mci_app_name: Option<String> = elffile
-        .section_by_name("mci_app")
-        .and_then(|s| s.data().ok())
-        .map(|data| String::from_utf8_lossy(data).trim_end_matches('\0').trim().to_string())
+    // read the mci_app section: the application record (AppMeta in mc_meas_abi.hpp) -- the name as
+    // characters, then, since issue 225, the endpoint its XCP server listens on. The runtime A2L
+    // route takes both from the same Cfg the server is started with; without this the offline route
+    // had nothing to call the project but a placeholder, and no endpoint but its command line's.
+    // The name is the C string in the record's first 64 bytes: the endpoint follows it.
+    let mci_app_data: Option<Vec<u8>> = elffile.section_by_name("mci_app").and_then(|s| s.data().ok()).map(|data| data.to_vec());
+    let mci_app_name: Option<String> = mci_app_data
+        .as_ref()
+        .map(|data| {
+            let name = &data[..data.len().min(64)];
+            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            String::from_utf8_lossy(&name[..end]).trim().to_string()
+        })
         .filter(|name| !name.is_empty());
     if let Some(ref name) = mci_app_name {
         log::info!("mc-instrument application name section (mci_app) found: '{}'", name);
@@ -196,6 +203,7 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         xcp_meta_data,
         mci_meta_data,
         mci_app_name,
+        mci_app_data,
         mci_meas_data,
         mci_layout_data,
         rodata_data,
@@ -329,6 +337,7 @@ impl DebugDataReader<'_> {
             xcp_meta_data: self.xcp_meta_data,
             mci_meta_data: self.mci_meta_data,
             mci_app_name: self.mci_app_name,
+            mci_app_data: self.mci_app_data,
             mci_meas_data: self.mci_meas_data,
             mci_layout_data: self.mci_layout_data,
             rodata_data: self.rodata_data,

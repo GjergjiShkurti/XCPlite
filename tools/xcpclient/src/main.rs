@@ -468,6 +468,59 @@ impl XcpTextDecoder for ServTextDecoder {
 }
 
 //------------------------------------------------------------------------
+// The endpoint the command line states (added to upstream, issue 225)
+
+/// The parts of the XCP endpoint the command line states, as opposed to the defaults clap fills
+/// in. The offline A2L of an mc-instrument application takes its endpoint from the application's
+/// own mci_app record, and these may agree with it but not contradict it: the build rule used to
+/// pass 127.0.0.1, its own port and TCP for every application, and the A2L then named an endpoint
+/// the application does not serve.
+#[derive(Debug, Clone, Default)]
+struct StatedEndpoint {
+    /// --dest-addr
+    addr: Option<std::net::IpAddr>,
+    /// --port, or the port of a --dest-addr IP:port
+    port: Option<u16>,
+    /// --tcp (true) or --udp (false)
+    tcp: Option<bool>,
+}
+
+impl StatedEndpoint {
+    /// Refuses a stated part that is not the application's: `addr`:`port` over `tcp`, from a
+    /// `.bind` written as `bind` ("" when unset).
+    fn check(&self, addr: Ipv4Addr, port: u16, tcp: bool, bind: &str) -> Result<(), Box<dyn Error>> {
+        let mut wrong: Vec<String> = Vec::new();
+        if let Some(stated) = self.addr
+            && stated != std::net::IpAddr::V4(addr)
+        {
+            wrong.push(format!("--dest-addr {stated}"));
+        }
+        if let Some(stated) = self.port
+            && stated != port
+        {
+            wrong.push(format!("--port {stated}"));
+        }
+        if let Some(stated) = self.tcp
+            && stated != tcp
+        {
+            wrong.push(if stated { "--tcp".to_string() } else { "--udp".to_string() });
+        }
+        if wrong.is_empty() {
+            return Ok(());
+        }
+        let bind = if bind.is_empty() { "unset".to_string() } else { format!("\"{bind}\"") };
+        Err(format!(
+            "{} contradict{} the application's own endpoint, {} {addr}:{port}, which its MC_APP states in the mci_app record (.bind {bind}, .port {port}, .tcp {tcp}). \
+             The offline A2L takes the endpoint from the application: drop the flag, or change MC_APP",
+            wrong.join(" "),
+            if wrong.len() == 1 { "s" } else { "" },
+            if tcp { "TCP" } else { "UDP" },
+        )
+        .into())
+    }
+}
+
+//------------------------------------------------------------------------
 //  XCP client
 
 async fn xcp_client(
@@ -497,6 +550,7 @@ async fn xcp_client(
     measurement_duration_ms: u64,
     cal_args: Vec<String>,
     csv_filename: String,
+    stated_endpoint: StatedEndpoint,
 ) -> Result<(), Box<dyn Error>> {
     // Create xcp_client
     let mut xcp_client = XcpClient::new(protocol, dest_addr, local_addr, baud_rate);
@@ -802,6 +856,23 @@ async fn xcp_client(
                     && let Some(name) = elf_reader.app_name()
                 {
                     ecu_name = name.to_string();
+                }
+
+                // Added to upstream (issue 225). Offline, the transport block is where the
+                // application's own XCP server listens -- MC_APP's .bind, .port and .tcp, which the
+                // mci_app record carries -- not what the command line says: the build rule passed
+                // 127.0.0.1, its own port and TCP for every application, and the kernel dialled
+                // that. A flag that contradicts the record is refused rather than obeyed, and a
+                // record from before it held the endpoint is refused too. Online, the endpoint is
+                // the one that answered, and an application without the record (no MC_APP, or the
+                // VX1000 backend, which serves no XCP of its own) keeps the command line's.
+                if !xcp_client.is_connected()
+                    && let Some(elf_reader::AppEndpoint::Server { addr, port, tcp, bind }) = elf_reader.app_endpoint()?
+                {
+                    stated_endpoint.check(addr, port, tcp, &bind)?;
+                    let protocol = if tcp { "TCP" } else { "UDP" };
+                    info!("The A2L's XCP_ON_{protocol}_IP block is the application's own endpoint, {addr}:{port}, from its MC_APP (the mci_app record)");
+                    reg.set_xcp_eth_params(protocol, addr, port);
                 }
             }
 
@@ -1174,8 +1245,11 @@ fn parse_dest_addr(dest_addr: &str, default_port: u16) -> Result<std::net::Socke
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Parse command line arguments
-    let args = Args::parse();
+    // Parse command line arguments. Through the matches rather than Args::parse(), so the parts of
+    // the endpoint the command line states can be told from clap's defaults (issue 225).
+    let matches = <Args as clap::CommandFactory>::command().get_matches();
+    let args = <Args as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let from_command_line = |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
 
     // Initialize logging
     let log_level = args.log_level.to_log_level_filter();
@@ -1202,10 +1276,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else if args.sxi {
         "SxI"
     } else {
-        warn!("No protocol specified, defaulting to TCP");
+        // Offline, an mc-instrument application's own record decides the transport (issue 225),
+        // so no protocol is the ordinary case there and the default is not a warning.
+        if args.offline {
+            info!("No protocol specified: TCP, unless the ELF's mci_app record states the application's own");
+        } else {
+            warn!("No protocol specified, defaulting to TCP");
+        }
         "TCP"
     };
     let dest_addr: std::net::SocketAddr = parse_dest_addr(&args.dest_addr, args.port)?;
+    let stated_endpoint = StatedEndpoint {
+        addr: from_command_line("dest_addr").then(|| dest_addr.ip()),
+        port: (from_command_line("port") || (from_command_line("dest_addr") && args.dest_addr.parse::<std::net::SocketAddr>().is_ok())).then(|| dest_addr.port()),
+        tcp: if args.tcp {
+            Some(true)
+        } else if args.udp {
+            Some(false)
+        } else {
+            None
+        },
+    };
     let local_addr: std::net::SocketAddr = parse_dest_addr(&args.bind_addr, 0)?;
     let mut baud_rate = args.baud_rate;
     if args.offline {
@@ -1254,6 +1345,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             args.time * 1000,
             args.cal,
             args.csv,
+            stated_endpoint,
         )
         .await;
         if let Err(e) = res {

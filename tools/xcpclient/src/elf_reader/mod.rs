@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use regex::Regex;
 use std::error::Error;
 use std::ffi::OsStr;
+use std::net::Ipv4Addr;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
@@ -91,6 +92,58 @@ impl ElfReader {
     /// that is the same for every application and so cannot tell two of them apart.
     pub fn app_name(&self) -> Option<&str> {
         self.debug_data.mci_app_name.as_deref()
+    }
+
+    /// Where the application's XCP server listens, as its MC_APP states it in the mci_app record
+    /// (AppMeta in mc_meas_abi.hpp: name[64], bind[16], port u16 in the target's byte order, tcp u8,
+    /// endpoint u8). None when the ELF has no mci_app section -- no MC_APP, so no server of
+    /// mc-instrument's to describe.
+    ///
+    /// The offline A2L's transport block used to come from the command line alone, and the build
+    /// rule passed 127.0.0.1, its own port and TCP for every application (issues 158, 225). An unset
+    /// `.bind` and "0.0.0.0" are every interface, which 127.0.0.1 reaches; anything else is the one
+    /// address the server listens on. A record that predates the endpoint -- the name alone, 64
+    /// bytes -- is an error rather than a reason to fall back on the command line: that fallback is
+    /// the guess this replaces.
+    pub fn app_endpoint(&self) -> Result<Option<AppEndpoint>, Box<dyn Error>> {
+        let Some(data) = self.debug_data.mci_app_data.as_ref() else {
+            return Ok(None);
+        };
+        if data.len() == MCI_APP_NAME_LEN {
+            return Err(format!(
+                "the ELF's mci_app record names the application ('{}') but not where it listens: it was built before MC_APP recorded .bind, .port and .tcp there. \
+                 Rebuild it, so that its offline A2L states the application's own endpoint",
+                self.app_name().unwrap_or("")
+            )
+            .into());
+        }
+        if data.len() != MCI_APP_RECORD_LEN {
+            return Err(format!(
+                "the mci_app section holds {} bytes, which is not one application record of {MCI_APP_RECORD_LEN}: an application has one MC_APP",
+                data.len()
+            )
+            .into());
+        }
+        let bind_bytes = &data[MCI_APP_NAME_LEN..MCI_APP_NAME_LEN + MCI_APP_BIND_LEN];
+        let bind_end = bind_bytes.iter().position(|&b| b == 0).unwrap_or(bind_bytes.len());
+        let bind = String::from_utf8_lossy(&bind_bytes[..bind_end]).to_string();
+        let at = MCI_APP_NAME_LEN + MCI_APP_BIND_LEN;
+        let port_bytes: [u8; 2] = data[at..at + 2].try_into().unwrap();
+        let port = if self.debug_data.is_little_endian { u16::from_le_bytes(port_bytes) } else { u16::from_be_bytes(port_bytes) };
+        let tcp = data[at + 2] != 0;
+        match data[at + 3] {
+            MCI_APP_NO_SERVER => Ok(Some(AppEndpoint::NoServer)),
+            MCI_APP_SERVER => {
+                let addr = if bind.is_empty() || bind == "0.0.0.0" {
+                    Ipv4Addr::LOCALHOST
+                } else {
+                    bind.parse::<Ipv4Addr>()
+                        .map_err(|_| format!("MC_APP's .bind \"{bind}\" in the mci_app record is not a dotted IPv4 address, and the application stops at startup on it"))?
+                };
+                Ok(Some(AppEndpoint::Server { addr, port, tcp, bind }))
+            }
+            other => Err(format!("the mci_app record says endpoint kind {other}, which this reader does not know").into()),
+        }
     }
 
     /// What the xcplite server linked into the ELF answers to CONNECT and GET_DAQ_RESOLUTION_INFO,
@@ -1731,6 +1784,24 @@ pub fn fix_identifier_read_write(path: &std::path::Path) -> Result<(), Box<dyn E
         info!("{} identifier-addressed measurement(s) written without READ_WRITE", fixed);
     }
     Ok(())
+}
+
+/// The size of the mci_app record before it held the endpoint -- the name alone -- and since.
+const MCI_APP_NAME_LEN: usize = 64;
+const MCI_APP_BIND_LEN: usize = 16;
+const MCI_APP_RECORD_LEN: usize = MCI_APP_NAME_LEN + MCI_APP_BIND_LEN + 4;
+/// AppMeta::endpoint: the application runs no XCP server (the VX1000 backend), or it runs one.
+const MCI_APP_NO_SERVER: u8 = 0;
+const MCI_APP_SERVER: u8 = 1;
+
+/// What an mc-instrument application's mci_app record says about its XCP endpoint (issue 225).
+pub enum AppEndpoint {
+    /// It serves XCP at `addr`:`port` over TCP or UDP; `bind` is `.bind` as written, "" when unset.
+    /// The offline A2L's transport block is this.
+    Server { addr: Ipv4Addr, port: u16, tcp: bool, bind: String },
+    /// It serves none -- the VX1000 backend, whose device is the transport -- so the command
+    /// line's endpoint stands.
+    NoServer,
 }
 
 /// What an xcplite server answers to CONNECT (MAX_CTO, MAX_DTO) and to GET_DAQ_RESOLUTION_INFO
