@@ -730,6 +730,24 @@ impl ElfReader {
         Ok(())
     }
 
+    /// The cycle time in ns an event's record in the xcp_evts section states, 0 (sporadic) when
+    /// the record cannot be read. `addr` is the address of the record's `evt__<name>` variable.
+    fn event_cycle_time_ns(&self, evt_name: &str, addr: u64) -> u32 {
+        let Some((base, data)) = &self.debug_data.xcp_evts_data else {
+            return 0;
+        };
+        match read_event_cycle_ns(data, *base, addr, self.debug_data.ptr_size, self.debug_data.is_little_endian) {
+            Some(ns) => ns,
+            None => {
+                warn!(
+                    "Event '{}': its record at 0x{:08X} is not inside the xcp_evts section contents, cycle time taken as 0 (sporadic)",
+                    evt_name, addr
+                );
+                0
+            }
+        }
+    }
+
     // Register events from event creation markers (evt__name) in the code
     pub fn register_events(&self, reg: &mut Registry, verbose: usize) -> Result<(), Box<dyn Error>> {
         info!("===============================================================");
@@ -814,8 +832,9 @@ impl ElfReader {
                 else {
                     if xcp_event_section_addr > 0 {
                         let event_id: u16 = ((var_infos[0].address.1 - xcp_event_section_addr) / 16) as u16; // @@@@ size of tXcpEventDescriptor hardcoded
-                        reg.event_list.add_event(McEvent::new(evt_name.to_string(), 0, event_id, 0)).unwrap();
-                        info!("New event '{}' found: event id = {}", evt_name, event_id);
+                        let cycle_time_ns = self.event_cycle_time_ns(evt_name, var_infos[0].address.1);
+                        reg.event_list.add_event(McEvent::new(evt_name.to_string(), 0, event_id, cycle_time_ns)).unwrap();
+                        info!("New event '{}' found: event id = {}, cycle time = {} ns", evt_name, event_id, cycle_time_ns);
                         continue; // event id has to be fixed later, for now we just create it with a unique id based on the address of the event marker variable
                     } else {
                         reg.event_list.add_event(McEvent::new(evt_name.to_string(), 0, 0xFFFF, 0)).unwrap();
@@ -2842,6 +2861,17 @@ impl ElfReader {
     }
 }
 
+/// The cycle time of an event descriptor record: a `uint32_t` right behind the name pointer,
+/// `ptr_size` bytes into the 16-byte record (`tXcpEventDescriptor`, xcplite.h), in the target's
+/// byte order. `base` is the address of the first record in `section`. `None` when the record is
+/// not inside the section contents.
+fn read_event_cycle_ns(section: &[u8], base: u64, record_addr: u64, ptr_size: u8, little_endian: bool) -> Option<u32> {
+    let off = usize::try_from(record_addr.checked_sub(base)?).ok()?;
+    let at = off.checked_add(ptr_size as usize)?;
+    let bytes: [u8; 4] = section.get(at..at.checked_add(4)?)?.try_into().ok()?;
+    Some(if little_endian { u32::from_le_bytes(bytes) } else { u32::from_be_bytes(bytes) })
+}
+
 /// Added to upstream (issue 258): A2L's string rules, which the offline A2L reaches only in part --
 /// our writer escapes a quote as `\"`, never as `""`.
 #[cfg(test)]
@@ -2925,6 +2955,43 @@ mod tests {
     use super::*;
 
     const XCPLITE_ELF: &str = "../../examples/no_a2l_demo/CANape/no_a2l_demo.elf";
+
+    // two 16-byte records, the second one with the cycle time at `ptr_size`
+    fn evts_section(ptr_size: usize, cycle_ns: u32, little_endian: bool) -> Vec<u8> {
+        let mut data = vec![0xAA; 32];
+        let bytes = if little_endian { cycle_ns.to_le_bytes() } else { cycle_ns.to_be_bytes() };
+        data[16 + ptr_size..16 + ptr_size + 4].copy_from_slice(&bytes);
+        data
+    }
+
+    #[test]
+    fn event_cycle_is_read_behind_the_name_pointer() {
+        // 32-bit target, little endian: the cycle time of the second record at base + 16 + 4
+        let data = evts_section(4, 100_000_000, true);
+        assert_eq!(read_event_cycle_ns(&data, 0x2000_0100, 0x2000_0110, 4, true), Some(100_000_000));
+        // 64-bit target: behind an 8 byte pointer
+        let data = evts_section(8, 1_000_000_000, true);
+        assert_eq!(read_event_cycle_ns(&data, 0x4000, 0x4010, 8, true), Some(1_000_000_000));
+        // big endian
+        let data = evts_section(4, 20_000_000, false);
+        assert_eq!(read_event_cycle_ns(&data, 0x4000, 0x4010, 4, false), Some(20_000_000));
+        // a sporadic event states 0
+        let data = evts_section(4, 0, true);
+        assert_eq!(read_event_cycle_ns(&data, 0x4000, 0x4010, 4, true), Some(0));
+    }
+
+    #[test]
+    fn event_cycle_outside_the_section_is_none() {
+        let data = evts_section(8, 5, true);
+        // below the section, past its end, and a record whose cycle time is cut off
+        assert_eq!(read_event_cycle_ns(&data, 0x4000, 0x3FF0, 8, true), None);
+        assert_eq!(read_event_cycle_ns(&data, 0x4000, 0x4020, 8, true), None);
+        assert_eq!(read_event_cycle_ns(&data[..20], 0x4000, 0x4010, 8, true), None);
+        // an empty section (NOBITS)
+        assert_eq!(read_event_cycle_ns(&[], 0x4000, 0x4000, 4, true), None);
+        // no overflow on a wild address
+        assert_eq!(read_event_cycle_ns(&data, 0, u64::MAX, 8, true), None);
+    }
 
     #[test]
     fn epk_address_is_the_protocol_address_on_xcplite() {

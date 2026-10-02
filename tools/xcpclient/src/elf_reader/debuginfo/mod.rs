@@ -102,6 +102,8 @@ pub(crate) struct DebugData {
     pub(crate) mci_layout_data: Option<Vec<u8>>,          // raw bytes of the mci_layout section: how to parse an mci_meas record on this ABI
     pub(crate) rodata_data: Option<(u64, Vec<u8>)>,       // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers in mci_meas
     pub(crate) xcp_proto_data: Option<Vec<u8>>,           // raw bytes of the xcp_proto section: what the linked xcplite answers to CONNECT and GET_DAQ_RESOLUTION_INFO
+    pub(crate) xcp_evts_data: Option<(u64, Vec<u8>)>,     // (section_base_addr, raw_bytes) of the xcp_evts section: the event descriptor records, with the cycle times
+    pub(crate) ptr_size: u8,                              // size of a pointer on the target, 4 or 8, from the ELF class
     pub(crate) is_little_endian: bool,                    // ELF endianness
     pub(crate) load_segments: Vec<LoadSegment>,           // the PT_LOAD program headers: where each loaded range runs and where it is stored
 }
@@ -146,7 +148,8 @@ impl DebugData {
         let sections: Vec<(&String, &(u64, u64))> = self.sections.iter().collect();
         for (name, (addr, size)) in sections {
             if name == "xcp_evts" {
-                log::info!("Found XCP event descriptor memory section at address = 0x{:08X}, size = {} bytes", *addr, *size);
+                // the map holds (start, end), not (start, size)
+                log::info!("Found XCP event descriptor memory section at address = 0x{:08X}, size = {} bytes", *addr, *size - *addr);
                 return *addr;
             }
         }

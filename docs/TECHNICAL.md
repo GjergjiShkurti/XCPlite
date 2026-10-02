@@ -111,9 +111,11 @@ static const tXcpEventDescriptor evt__task
     __attribute__((section("xcp_evts"), used)) = { "task", 0, 0 };
 ```
 
-`tXcpEventDescriptor` contains the event name string, cycle time, and priority.
+`tXcpEventDescriptor` contains the event name string, cycle time (`cycle_time_ns`, a `uint32_t`
+right behind the name pointer), and priority.
 xcpclient iterates all entries in `xcp_evts` to discover **every event** defined in the
 firmware, regardless of whether that code path has executed at the time of A2L generation.
+The event id is the record's index and the `EVENT` line of the A2L states the record's cycle time.
 
 #### `xcp_cals` section — calibration segment descriptors
 

@@ -37,6 +37,14 @@ For the full technical specification — ELF section layouts, the `trg__` anchor
 convention, and the `AddrExt` encoding — see
 [docs/TECHNICAL.md — Offline A2L Generation](../../docs/TECHNICAL.md#offline-a2l-generation--elfdwarf-internals).
 
+### Event cycle times
+
+Every `EVENT` of an offline A2L states the cycle time of its `xcp_evts` record: the
+`cycle_time_ns` field of the 16-byte `tXcpEventDescriptor`, read from the ELF in the target's
+byte order (100 000 000 ns is `100 6`, 100 ms). A record with 0 is a sporadic event (`0 0`).
+Events made with `DaqCreateEventExt` therefore carry their cycle in the offline A2L as they do
+in the runtime one.
+
 ### ELFs that do not link XCPlite
 
 An ELF without an `XCPLITE__<signature>` variable is a target that is not XCPlite — for

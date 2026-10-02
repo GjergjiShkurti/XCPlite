@@ -46,6 +46,8 @@ struct DebugDataReader<'elffile> {
     mci_layout_data: Option<Vec<u8>>,      // raw bytes of mci_layout: how to parse an mci_meas record on this ABI
     rodata_data: Option<(u64, Vec<u8>)>,   // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers held in mci_meas
     xcp_proto_data: Option<Vec<u8>>,       // raw bytes of xcp_proto: what the linked xcplite answers to CONNECT and GET_DAQ_RESOLUTION_INFO
+    xcp_evts_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of xcp_evts: the event descriptor records
+    ptr_size: u8,                          // size of a pointer on the target, from the ELF class
     is_little_endian: bool,
     load_segments: Vec<LoadSegment>, // the PT_LOAD program headers
 }
@@ -171,6 +173,15 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         log::debug!("xcplite protocol parameter section (xcp_proto) not found in ELF file");
     }
 
+    // read the xcp_evts section: the event descriptor records (`{name, cycle_time_ns, priority}`,
+    // 16 bytes each), so an event's cycle time can be read next to its id. The pointer size
+    // locates the cycle time inside a record.
+    let xcp_evts_data: Option<(u64, Vec<u8>)> = elffile.section_by_name("xcp_evts").and_then(|s| {
+        let addr = s.address();
+        s.data().ok().map(|data| (addr, data.to_vec()))
+    });
+    let ptr_size: u8 = if elffile.is_64() { 8 } else { 4 };
+
     let is_little_endian = elffile.endianness() == Endianness::Little;
 
     // the PT_LOAD program headers, so a reader can tell whether an address holds its contents in
@@ -213,6 +224,8 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         mci_layout_data,
         rodata_data,
         xcp_proto_data,
+        xcp_evts_data,
+        ptr_size,
         is_little_endian,
         load_segments,
     };
@@ -370,6 +383,8 @@ impl DebugDataReader<'_> {
             mci_layout_data: self.mci_layout_data,
             rodata_data: self.rodata_data,
             xcp_proto_data: self.xcp_proto_data,
+            xcp_evts_data: self.xcp_evts_data,
+            ptr_size: self.ptr_size,
             is_little_endian: self.is_little_endian,
             load_segments: self.load_segments,
         }
