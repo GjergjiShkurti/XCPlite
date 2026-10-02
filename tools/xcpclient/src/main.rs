@@ -37,11 +37,16 @@ pub mod bin_reader;
 
 use clap::Parser;
 
+// Added to upstream (VsCANape issue 214). `--version` says which sources the binary is: the crate's
+// version and the commit build.rs found, `3.0.1 (00f647a1b2c3)`. The VS Code extension compares it
+// with the version it was packaged with before it runs an xcpclient named in a setting.
+const XCPCLIENT_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("XCPCLIENT_COMMIT"), ")");
+
 #[derive(Parser, Debug)]
 #[command(name = "xcpclient")]
 #[command(about = concat!("XCP client v", env!("CARGO_PKG_VERSION"), " for testing XCP servers and managing A2L and HEX files"))]
 #[command(long_about = concat!("XCP client v", env!("CARGO_PKG_VERSION"), " for testing XCP servers and managing A2L and HEX files"))]
-#[command(version)]
+#[command(version = XCPCLIENT_VERSION)]
 struct Args {
     // -l --log-level
     /// Log level (Off=0, Error=1, Warn=2, Info=3, Debug=4, Trace=5)
