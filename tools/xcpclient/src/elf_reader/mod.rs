@@ -1773,10 +1773,13 @@ pub fn check_measurement_names(reg: &Registry) -> Result<(), Box<dyn Error>> {
 /// Added to upstream (issue 258): one token of an A2L text, and where it starts in the text.
 ///
 /// A quoted string is one token, its quotes included, by A2L's rules: inside it `\"` and `""` are a
-/// quote and `\\` a backslash, so none of them ends it. Any other token runs to white space or a
-/// quote. The passes below find a measurement's block and read its keywords from these, so that a
-/// description or a unit holding `/end MEASUREMENT` or `ECU_ADDRESS_EXTENSION 1` decides nothing: a
-/// quoted token is never equal to a keyword.
+/// quote and `\\` a backslash, so none of them ends it. Outside one, `/* ... */` and `//` to the end
+/// of the line are comments, which are no token (issue 294). Any other token runs to white space, a
+/// quote or a comment. The passes below find a measurement's block and read its keywords from these,
+/// so that a description or a unit holding `/end MEASUREMENT` or `ECU_ADDRESS_EXTENSION 1` decides
+/// nothing: a quoted token is never equal to a keyword. Nor does a comment, whatever it holds:
+/// xcp_registry writes the function each event triggers in into one, and a quote in that name --
+/// `step<'\"'>`, an explicit specialization -- opened a string that turned every later quote round.
 struct A2lToken<'a> {
     start: usize,
     text: &'a str,
@@ -1791,7 +1794,13 @@ impl A2lToken<'_> {
     }
 }
 
-/// The tokens of an A2L text. A string still open at the end of the text runs to its end.
+/// Whether a comment starts at `at` in `bytes`: `/*` or `//`.
+fn a2l_comment_at(bytes: &[u8], at: usize) -> bool {
+    bytes[at] == b'/' && matches!(bytes.get(at + 1), Some(b'*' | b'/'))
+}
+
+/// The tokens of an A2L text. A string or a block comment still open at the end of the text runs to
+/// its end.
 fn a2l_tokens(text: &str) -> Vec<A2lToken<'_>> {
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
@@ -1799,6 +1808,15 @@ fn a2l_tokens(text: &str) -> Vec<A2lToken<'_>> {
     while at < bytes.len() {
         if bytes[at].is_ascii_whitespace() {
             at += 1;
+            continue;
+        }
+        if a2l_comment_at(bytes, at) {
+            at = if bytes[at + 1] == b'*' {
+                // The `*` that opens it does not close it: `/*/` is still open, as a2lfile reads it.
+                text[at + 2..].find("*/").map_or(bytes.len(), |end| at + 2 + end + 2)
+            } else {
+                text[at..].find('\n').map_or(bytes.len(), |end| at + end)
+            };
             continue;
         }
         let start = at;
@@ -1817,7 +1835,7 @@ fn a2l_tokens(text: &str) -> Vec<A2lToken<'_>> {
             }
             at = at.min(bytes.len());
         } else {
-            while at < bytes.len() && !bytes[at].is_ascii_whitespace() && bytes[at] != b'"' {
+            while at < bytes.len() && !bytes[at].is_ascii_whitespace() && bytes[at] != b'"' && !a2l_comment_at(bytes, at) {
                 at += 1;
             }
         }
@@ -2595,6 +2613,31 @@ mod a2l_token_tests {
         assert_eq!(texts(r#""say ""/end MEASUREMENT"" here" X"#), [r#""say ""/end MEASUREMENT"" here""#, "X"]);
         assert_eq!(texts(r#""C:\\" ECU_ADDRESS_EXTENSION 1"#), [r#""C:\\""#, "ECU_ADDRESS_EXTENSION", "1"]);
         assert_eq!(texts(r#""" X "open"#), [r#""""#, "X", r#""open"#]);
+    }
+
+    /// Added to upstream (issue 294): a comment is no token, and a quote in one opens no string.
+    #[test]
+    fn a_comment_is_skipped_whatever_it_holds() {
+        assert_eq!(
+            texts("/* function = step<'\\\"'>, CFA = 16 */ /begin EVENT \"e\" 0 /end EVENT"),
+            ["/begin", "EVENT", "\"e\"", "0", "/end", "EVENT"]
+        );
+        assert_eq!(texts("A // a \"line /end MEASUREMENT\nB"), ["A", "B"]);
+        assert_eq!(texts("A/*x*/B C//y"), ["A", "B", "C"]);
+        assert_eq!(texts(r#""/* in a string */" "// too""#), [r#""/* in a string */""#, r#""// too""#]);
+        assert_eq!(texts("A /**/ B /*/ C */ D"), ["A", "B", "D"]);
+        assert_eq!(texts("A /* never closed \" B"), ["A"]);
+        assert_eq!(texts("/begin /include x"), ["/begin", "/include", "x"]);
+    }
+
+    #[test]
+    fn a_quote_in_a_comment_moves_no_block() {
+        let text = "/* function = step<'\\\"'> */ /begin MEASUREMENT m \"c\" ULONG ECU_ADDRESS_EXTENSION 127 READ_WRITE /end MEASUREMENT";
+        let tokens = a2l_tokens(text);
+        let blocks = a2l_measurements(&tokens);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(a2l_address_extension(blocks[0]), Some(XCP_ADDR_EXT_ID));
+        assert!(blocks[0].iter().any(|t| t.text == "READ_WRITE"));
     }
 
     #[test]
