@@ -827,6 +827,10 @@ async fn xcp_client(
                 // already writes FIXED_EVENT_LIST for it. The offline A2L says the same.
                 if id_addressed {
                     elf_reader::fix_identifier_event_lists(&a2l_path)?;
+                    // Added to upstream (issue 230). xcp_registry makes every A2L-addressed object
+                    // READ_WRITE, and the server refuses a write to an identifier (issue 18), so a
+                    // tool offered writes that fail. The runtime route writes none for them.
+                    elf_reader::fix_identifier_read_write(&a2l_path)?;
                 }
                 // Added to upstream (issue 224). xcp_registry states MAX_CTO 252, MAX_DTO 1468 and
                 // timestamps in 1 us for every server, literals in its writer, where xcplite answers

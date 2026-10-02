@@ -1687,6 +1687,52 @@ pub fn fix_identifier_event_lists(path: &std::path::Path) -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// Take READ_WRITE off, in the A2L at `path`, every identifier-addressed measurement (ECU_ADDRESS_EXTENSION
+/// XCP_ADDR_EXT_ID). xcp_registry gives READ_WRITE to every A2L-addressed object, but the server
+/// refuses a write to an identifier -- a measurement has no reference page and no consistent-write
+/// discipline (issue 18) -- so a tool offered writes that fail (issue 230). The runtime route
+/// writes no READ_WRITE for them. A measurement on another extension, an absolute one a write
+/// reaches, keeps what xcp_registry wrote.
+///
+/// The extension and the keyword are read outside quoted strings, so a description or a unit that
+/// mentions either is left as it is and decides nothing.
+pub fn fix_identifier_read_write(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let text = std::fs::read_to_string(path)?;
+    let block = Regex::new(r"(?s)/begin MEASUREMENT .*?/end MEASUREMENT")?;
+    let token = Regex::new(r#""(?:[^"\\]|\\.)*"|ECU_ADDRESS_EXTENSION\s+(0x[0-9A-Fa-f]+|\d+)|\s+READ_WRITE\b"#)?;
+    let extension = |m: &str| {
+        token.captures_iter(m).find_map(|c| c.get(1)).and_then(|v| {
+            let v = v.as_str();
+            if let Some(hex) = v.strip_prefix("0x") { u8::from_str_radix(hex, 16).ok() } else { v.parse::<u8>().ok() }
+        })
+    };
+    let mut fixed = 0usize;
+    let out = block.replace_all(&text, |caps: &regex::Captures| {
+        let m = &caps[0];
+        if extension(m) != Some(XCP_ADDR_EXT_ID) {
+            return m.to_string();
+        }
+        let mut removed = false;
+        let body = token.replace_all(m, |t: &regex::Captures| {
+            if t[0].trim_start().starts_with("READ_WRITE") {
+                removed = true;
+                String::new()
+            } else {
+                t[0].to_string()
+            }
+        });
+        if removed {
+            fixed += 1;
+        }
+        body.into_owned()
+    });
+    if fixed > 0 {
+        std::fs::write(path, out.as_bytes())?;
+        info!("{} identifier-addressed measurement(s) written without READ_WRITE", fixed);
+    }
+    Ok(())
+}
+
 /// What an xcplite server answers to CONNECT (MAX_CTO, MAX_DTO) and to GET_DAQ_RESOLUTION_INFO
 /// (TIMESTAMP_MODE, TIMESTAMP_TICKS), as the record in its xcp_proto section states it. xcplite.c
 /// builds the record from the definitions both commands answer with.
