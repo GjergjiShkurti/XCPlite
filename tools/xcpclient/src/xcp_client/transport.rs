@@ -272,64 +272,7 @@ impl XcpClient {
         T: XcpTextDecoder + Send + 'static,
         D: XcpDaqDecoder + Send + 'static,
     {
-        // Create socket
-        let socket = if self.protocol == "TCP" {
-            // Create TCP socket and connect
-            let stream = TcpStream::connect(self.dest_addr).await?;
-            debug!("TCP connection established to {:?}", stream.peer_addr()?);
-            debug!("TCP local address: {:?}", stream.local_addr()?);
-            // Give the server a moment to set up the connection
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            XcpSocket::Tcp(Arc::new(stream))
-        } else {
-            // Create UDP socket
-            let udp_socket = UdpSocket::bind(self.bind_addr).await?;
-            XcpSocket::Udp(Arc::new(udp_socket))
-        };
-        self.socket = Some(socket);
-
-        // Spawn a rx task to handle incoming data
-        // Hand over the DAQ decoder and the text decoder
-        // clone the socket
-        // Create channels for command responses and DAQ state control
-        debug!("Start RX task");
-        {
-            let socket = match &self.socket {
-                Some(XcpSocket::Udp(udp_sock)) => XcpSocket::Udp(Arc::clone(udp_sock)),
-                Some(XcpSocket::Tcp(tcp_stream)) => XcpSocket::Tcp(Arc::clone(tcp_stream)),
-                None => unreachable!(),
-            };
-            let (tx_resp, rx_resp) = tokio::sync::mpsc::channel(1);
-            self.rx_cmd_resp = Some(rx_resp); // rx XCP command response channel
-            let (tx_daq, rx_daq) = tokio::sync::mpsc::channel(3);
-            self.tx_task_control = Some(tx_daq); // tx XCP DAQ control channel
-            let daq_decoder_clone = Arc::clone(&daq_decoder);
-            self.receive_task = Some(tokio::spawn(async move {
-                let _res = XcpClient::receive_task(socket, tx_resp, rx_daq, text_decoder, daq_decoder_clone).await;
-            }));
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // wait for the receive task to start
-        }
-
-        // Connect
-        debug!("XCP CONNECT");
-        let data = self.send_command(XcpCommandBuilder::new(CC_CONNECT).add_u8(connect_mode).build()).await?;
-        assert!(data.len() >= 8);
-        let resources = data[1];
-        let comm_mode_basic = data[2];
-        let max_cto_size: u8 = data[3];
-        let max_dto_size: u16 = (data[4] as u16) | ((data[5] as u16) << 8);
-        let protocol_version: u8 = data[6];
-        let transport_layer_version: u8 = data[7];
-        self.resources = resources;
-        self.comm_mode_basic = comm_mode_basic;
-        self.max_cto_size = max_cto_size;
-        self.max_dto_size = max_dto_size;
-        self.protocol_version = protocol_version as u16;
-        self.transport_layer_version = transport_layer_version as u16;
-        debug!(
-            "XCP CONNECT -> resources=0x{:02X} comm_mode_basic=0x{:02X} max_cto_size={} max_dto_size={} protocol_version=0x{:02X} transport_layer_version=0x{:02X}",
-            resources, comm_mode_basic, max_cto_size, max_dto_size, protocol_version, transport_layer_version
-        );
+        self.open_session(connect_mode, &daq_decoder, text_decoder).await?;
 
         // Get version info
         let data = self.send_command(XcpCommandBuilder::new(CC_GET_VERSION).add_u8(0).build()).await?;
@@ -377,11 +320,7 @@ impl XcpClient {
         self.get_daq_processor_info().await?;
 
         // Notify the rx task
-        self.task_control.connected = true; // the task will end, when it gets connected = false over the XcpControl channel
-        self.task_control.running = false;
-        self.tx_task_control.as_ref().unwrap().send(self.task_control).await.unwrap();
-
-        assert!(self.is_connected());
+        self.notify_connected().await;
 
         // Initialize DAQ clock
         self.time_correlation_properties().await?; // Set 64 bit response format for GET_DAQ_CLOCK
@@ -392,6 +331,98 @@ impl XcpClient {
 
         // Keep the the DAQ decoder for measurement start
         self.daq_decoder = Some(daq_decoder);
+
+        Ok(())
+    }
+
+    /// Connect for memory access only: CONNECT, and nothing that sets up DAQ.
+    ///
+    /// `connect` also asks for the DAQ processor, the timestamp resolution and time correlation,
+    /// and stops at a server that answers them differently than XCPlite does (a VX1000 has no fixed
+    /// timestamps). Reading memory, the EPK check (`--check-epk`), needs none of that. Added to
+    /// upstream (issue 371).
+    pub async fn connect_memory_access<D, T>(&mut self, connect_mode: u8, daq_decoder: Arc<Mutex<D>>, text_decoder: T) -> Result<(), Box<dyn Error>>
+    where
+        T: XcpTextDecoder + Send + 'static,
+        D: XcpDaqDecoder + Send + 'static,
+    {
+        self.open_session(connect_mode, &daq_decoder, text_decoder).await?;
+        self.notify_connected().await;
+        Ok(())
+    }
+
+    // Tell the rx task that the session is up; it ends when it gets connected = false
+    async fn notify_connected(&mut self) {
+        self.task_control.connected = true; // the task will end, when it gets connected = false over the XcpControl channel
+        self.task_control.running = false;
+        self.tx_task_control.as_ref().unwrap().send(self.task_control).await.unwrap();
+        assert!(self.is_connected());
+    }
+
+    // Open the socket, start the rx task and send CONNECT
+    async fn open_session<D, T>(&mut self, connect_mode: u8, daq_decoder: &Arc<Mutex<D>>, text_decoder: T) -> Result<(), Box<dyn Error>>
+    where
+        T: XcpTextDecoder + Send + 'static,
+        D: XcpDaqDecoder + Send + 'static,
+    {
+        // Create socket
+        let socket = if self.protocol == "TCP" {
+            // Create TCP socket and connect
+            let stream = TcpStream::connect(self.dest_addr).await?;
+            debug!("TCP connection established to {:?}", stream.peer_addr()?);
+            debug!("TCP local address: {:?}", stream.local_addr()?);
+            // Give the server a moment to set up the connection
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            XcpSocket::Tcp(Arc::new(stream))
+        } else {
+            // Create UDP socket
+            let udp_socket = UdpSocket::bind(self.bind_addr).await?;
+            XcpSocket::Udp(Arc::new(udp_socket))
+        };
+        self.socket = Some(socket);
+
+        // Spawn a rx task to handle incoming data
+        // Hand over the DAQ decoder and the text decoder
+        // clone the socket
+        // Create channels for command responses and DAQ state control
+        debug!("Start RX task");
+        {
+            let socket = match &self.socket {
+                Some(XcpSocket::Udp(udp_sock)) => XcpSocket::Udp(Arc::clone(udp_sock)),
+                Some(XcpSocket::Tcp(tcp_stream)) => XcpSocket::Tcp(Arc::clone(tcp_stream)),
+                None => unreachable!(),
+            };
+            let (tx_resp, rx_resp) = tokio::sync::mpsc::channel(1);
+            self.rx_cmd_resp = Some(rx_resp); // rx XCP command response channel
+            let (tx_daq, rx_daq) = tokio::sync::mpsc::channel(3);
+            self.tx_task_control = Some(tx_daq); // tx XCP DAQ control channel
+            let daq_decoder_clone = Arc::clone(daq_decoder);
+            self.receive_task = Some(tokio::spawn(async move {
+                let _res = XcpClient::receive_task(socket, tx_resp, rx_daq, text_decoder, daq_decoder_clone).await;
+            }));
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // wait for the receive task to start
+        }
+
+        // Connect
+        debug!("XCP CONNECT");
+        let data = self.send_command(XcpCommandBuilder::new(CC_CONNECT).add_u8(connect_mode).build()).await?;
+        assert!(data.len() >= 8);
+        let resources = data[1];
+        let comm_mode_basic = data[2];
+        let max_cto_size: u8 = data[3];
+        let max_dto_size: u16 = (data[4] as u16) | ((data[5] as u16) << 8);
+        let protocol_version: u8 = data[6];
+        let transport_layer_version: u8 = data[7];
+        self.resources = resources;
+        self.comm_mode_basic = comm_mode_basic;
+        self.max_cto_size = max_cto_size;
+        self.max_dto_size = max_dto_size;
+        self.protocol_version = protocol_version as u16;
+        self.transport_layer_version = transport_layer_version as u16;
+        debug!(
+            "XCP CONNECT -> resources=0x{:02X} comm_mode_basic=0x{:02X} max_cto_size={} max_dto_size={} protocol_version=0x{:02X} transport_layer_version=0x{:02X}",
+            resources, comm_mode_basic, max_cto_size, max_dto_size, protocol_version, transport_layer_version
+        );
 
         Ok(())
     }

@@ -9,4 +9,5 @@
 
 pub mod bin_reader;
 pub mod elf_reader;
+pub mod epk_check;
 pub mod xcp_client;

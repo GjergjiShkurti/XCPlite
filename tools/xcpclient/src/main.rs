@@ -9,6 +9,7 @@
 // - Configure and acquire measurement data (DAQ)
 // - List available variables and parameters with regex patterns
 // - Execute test sequences
+// - Check that the device runs the build an ELF or A2L describes (--check-epk)
 //
 // xcpclient --help
 //-----------------------------------------------------------------------------
@@ -31,6 +32,8 @@ pub mod elf_reader;
 use elf_reader::{ElfReader, IdentField, MciAddressing};
 
 pub mod bin_reader;
+
+mod epk_check;
 
 //-----------------------------------------------------------------------------
 // Command line arguments
@@ -218,11 +221,18 @@ struct Args {
     test: bool,
 
     // --print-features
-    /// Print one line per A2L feature this build has, then exit.
+    /// Print one line per feature this build has (A2L facts, device checks), then exit.
     /// A caller asks for the list instead of comparing versions. An older build does not know the
     /// option and exits with a usage error.
     #[arg(long, default_value_t = false)]
     print_features: bool,
+
+    // --check-epk
+    /// Compare the device's EPK with the ELF's (--elf) or else the A2L's (--a2l), then exit.
+    /// Uploads the EPK's length from ADDR_EPK, or asks GET_ID where there is no ADDR_EPK or the
+    /// upload is refused. Prints one line; exit status 0 match, 2 mismatch, 1 error.
+    #[arg(long, default_value_t = false)]
+    check_epk: bool,
 
     // --allow-registry-protocol
     /// Create the A2L of a VX1000 ELF (absolute mci records) that has no xcp_proto record anyway.
@@ -1370,6 +1380,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if protocol == "TCP" || protocol == "UDP" {
             info!("XCP server dest addr: {}", dest_addr);
             info!("XCP client local bind addr: {}", local_addr);
+        }
+    }
+
+    // The EPK check (issue 371) reads the device and does nothing else
+    if args.check_epk {
+        if args.offline {
+            error!("--check-epk reads the device and cannot run with --offline");
+            std::process::exit(epk_check::EXIT_ERROR);
+        }
+        let expected = match epk_check::expected_epk(&args.elf, &args.a2l, args.elf_unit_limit) {
+            Ok(expected) => expected,
+            Err(e) => {
+                error!("{}", e);
+                std::process::exit(epk_check::EXIT_ERROR);
+            }
+        };
+        match epk_check::check_epk(&expected, protocol, dest_addr, local_addr, args.connect_mode).await {
+            Ok((verdict, from)) => {
+                println!("{}", epk_check::verdict_line(&expected, &verdict, from));
+                std::process::exit(if verdict == epk_check::Verdict::Match {
+                    epk_check::EXIT_MATCH
+                } else {
+                    epk_check::EXIT_MISMATCH
+                });
+            }
+            Err(e) => {
+                error!("{}", e);
+                std::process::exit(epk_check::EXIT_ERROR);
+            }
         }
     }
 

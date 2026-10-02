@@ -388,6 +388,19 @@ impl ElfReader {
         reg.application.set_version(epk, epk_addr);
     }
 
+    /// The EPK text and the ADDR_EPK the A2L of this ELF states, as `register_epk_addr_info` writes
+    /// them; the address is None when it does not fit 32 bits. None when there is no `xcp_epk`
+    /// section or no text in it. The EPK check (`--check-epk`, issue 371) compares the device with this.
+    pub fn epk(&self) -> Option<(String, Option<u32>)> {
+        let elf_addr = self.debug_data.epk_addr;
+        if elf_addr == 0 {
+            return None;
+        }
+        let text = self.debug_data.epk_string.clone().filter(|s| !s.is_empty())?;
+        let segment_relative = self.get_target_signature().is_some_and(|sig| sig.starts_with('C'));
+        Some((text, epk_a2l_address(self.is_xcplite_target(), segment_relative, elf_addr)))
+    }
+
     // Register segments from segment creation markers (calseg__name) found in the code
     pub fn register_segments(&self, reg: &mut Registry, seg_relative: bool, verbose: usize) -> Result<(), Box<dyn Error>> {
         info!("===============================================================");
@@ -2286,10 +2299,11 @@ pub fn ident_field_for(server: Option<&ServerProtocol>, xcplite_target: bool) ->
     }
 }
 
-/// What this build does for the A2L, one name per fact, printed by `--print-features`. A caller
-/// that needs one of them (the VS Code extension, for a VX1000) asks for the list instead of
-/// comparing version numbers: the fork does not bump its version. Append a name with the change
-/// that adds it; a name is never reused for different behaviour.
+/// What this build does, one name per fact, printed by `--print-features`: the A2L facts
+/// (`a2l-*`) and the device checks. A caller that needs one of them (the VS Code extension, for a
+/// VX1000) asks for the list instead of comparing version numbers: the fork does not bump its
+/// version. Append a name with the change that adds it; a name is never reused for different
+/// behaviour.
 pub const FEATURES: &[&str] = &[
     // ADDR_EPK is the ELF address of xcp_epk on a target that is not xcplite (issue 358)
     "a2l-epk-elf-address",
@@ -2303,6 +2317,8 @@ pub const FEATURES: &[&str] = &[
     "a2l-ident-field",
     // an absolute VX ELF without xcp_proto fails unless --allow-registry-protocol (issue 366)
     "a2l-require-proto",
+    // --check-epk compares the device's EPK with the ELF's or the A2L's (issue 371)
+    "check-epk",
 ];
 
 /// True when the A2L cannot state what the server sends and must not be written (issue 366): a
@@ -3296,6 +3312,15 @@ mod tests {
         assert!(runs_where_loaded(elf.debug_data.epk_addr, &elf.debug_data.load_segments));
     }
 
+    #[test]
+    fn the_epk_to_check_is_the_text_and_the_address_the_a2l_states() {
+        let elf = ElfReader::new(XCPLITE_ELF, 0, usize::MAX).expect("the xcplite example ELF loads");
+        let (text, addr) = elf.epk().expect("the xcplite example has an EPK");
+        assert_eq!(Some(&text), elf.debug_data.epk_string.as_ref());
+        let segment_relative = elf.get_target_signature().unwrap().starts_with('C');
+        assert_eq!(addr, Some(if segment_relative { 0x8000_0000 } else { 0xFFFF_FF00 }));
+    }
+
     // an xcp_proto record of the given words, in the given byte order
     fn proto(words: &[u16], little_endian: bool) -> Vec<u8> {
         words.iter().flat_map(|w| if little_endian { w.to_le_bytes() } else { w.to_be_bytes() }).collect()
@@ -3497,6 +3522,7 @@ mod tests {
                 "a2l-event-cycle",
                 "a2l-ident-field",
                 "a2l-require-proto",
+                "check-epk",
             ]
         );
         let mut names = FEATURES.to_vec();

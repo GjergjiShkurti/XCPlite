@@ -92,15 +92,44 @@ record that does not fit, an ELF that is not fully usable. The facts of a normal
 no CFA data, and one count of the globals left out because the A2L cannot state their type (enum,
 pointer, class). Level 4 lists those globals by name.
 
-`--print-features` prints the names of what this build does for the A2L, one per line, and exits
-with status 0 without reading anything: `a2l-epk-elf-address`, `a2l-loclistx`,
-`a2l-sweep-absolute`, `a2l-event-cycle`, `a2l-ident-field` and `a2l-require-proto`. A tool that
+`--print-features` prints the names of what this build does, one per line, and exits with status
+0 without reading anything: for the A2L `a2l-epk-elf-address`, `a2l-loclistx`,
+`a2l-sweep-absolute`, `a2l-event-cycle`, `a2l-ident-field` and `a2l-require-proto`, and
+`check-epk` for the EPK check below. A tool that
 needs one asks for the list. A build from before the option exits with a usage error, which means
 the same as a name that is missing. `--version` names the commit the build is from (issue 214),
 not what it does; `--print-features` does.
 
 Pointer members of a structure type are `ULONG` or `ULONGLONG` by the target's address size. They
 were typed from the wrong field of the debug information, so a 32-bit target got `ULONGLONG`.
+
+### `--check-epk`: does the device run the build the A2L describes?
+
+```
+xcpclient --check-epk --tcp --dest-addr 192.168.0.10:5555 --a2l app.a2l
+xcpclient --check-epk --udp --dest-addr 127.0.0.1 --elf app.elf
+```
+
+The EPK is the text a build puts in its image and its A2L states (`MOD_PAR`: `EPK "..."`,
+`ADDR_EPK`). `--check-epk` connects (TCP or UDP), reads the device's EPK and compares it with the
+ELF's (`--elf`: the text and the address that the A2L of that ELF states) or else the A2L's
+(`--a2l`). The read is an upload of the text's length from `ADDR_EPK` with address extension 0,
+which is what a master does when it goes online. Where the A2L has no `ADDR_EPK`, or the device
+refuses the upload, it asks `GET_ID` type 5. The connection is CONNECT only, with no DAQ setup, so
+a server whose DAQ xcpclient cannot use (a VX1000) can also be checked. It prints one line and
+exits:
+
+| exit | line |
+|---|---|
+| 0 | `EPK match: "<epk>" at 0x<ADDR_EPK>` (or `by GET_ID`) |
+| 2 | `EPK mismatch: the device has "<text>", the A2L has "<epk>" (at 0x<ADDR_EPK>)` |
+| 1 | an error: no EPK in the ELF or the A2L, no connection in 5 s, nothing read |
+
+A device byte that is not printable ASCII shows as `\xNN` (erased flash reads `\xFF\xFF...`). An
+upload reads exactly the expected length, as a master does, so a device text that only continues
+the expected one is not seen. The CANape Kernel does not check the EPK, and a device flashed with
+another build then measures plausible values from the wrong addresses. Run the check before a
+measurement.
 
 
 
@@ -217,7 +246,10 @@ Options:
           --test Execute a test sequence on the XCP server
 
       --print-features
-          Print one line per A2L feature this build has, then exit
+          Print one line per feature this build has (A2L facts, device checks), then exit
+
+      --check-epk
+          Compare the device's EPK with the ELF's (--elf) or else the A2L's (--a2l), then exit
 
       --allow-registry-protocol
           Create the A2L of a VX1000 ELF that has no xcp_proto record anyway
