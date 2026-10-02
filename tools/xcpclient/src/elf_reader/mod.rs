@@ -1707,6 +1707,69 @@ impl CalsegRoom {
 /// a binary built in another scheme, whose every WRITE_DAQ the server would then reject (issue 253).
 const XCP_ADDR_EXT_ID: u8 = 0x7F;
 
+/// Added to upstream (issue 223): refuses a measurement whose full name is a calibration
+/// object's.
+///
+/// AXIS_PTS, BLOB, CHARACTERISTIC, INSTANCE and MEASUREMENT names are one namespace in an A2L, and
+/// an INSTANCE's component paths are in it too: `INSTANCE Pump PumpType` with a component `duty` is
+/// `Pump.duty` to every reader. `MC_CALSEG(PumpType, Pump)` with that field, measured by
+/// `MEASURE(Pump, ..., MC(duty))`, gave `MEASUREMENT Pump.duty` beside it, and the generator and
+/// the extension then found two objects under one name. mc-instrument refuses to start such an
+/// application, so no A2L is written for it either, as for two segments of one name. Only a whole
+/// name collides: an event may be named like a segment.
+pub fn check_measurement_names(reg: &Registry) -> Result<(), Box<dyn Error>> {
+    // Every calibration object's full name, and the object it belongs to.
+    let mut calibration: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    fn components(reg: &Registry, typedef: &str, prefix: &str, owner: &str, out: &mut std::collections::HashMap<String, String>, depth: usize) {
+        let Some(typedef) = reg.typedef_list.find_typedef(typedef) else { return };
+        if depth > 16 {
+            return; // a type that contains itself; the cap is cheaper than proving it cannot
+        }
+        for field in &typedef.fields {
+            let path = format!("{prefix}.{}", field.get_name());
+            if let Some(nested) = field.get_typedef_name() {
+                components(reg, nested, &path, owner, out, depth + 1);
+            }
+            out.entry(path).or_insert_with(|| format!("a component of {owner}"));
+        }
+    }
+    for instance in &reg.instance_list {
+        if instance.is_measurement_object() {
+            continue;
+        }
+        let name = instance.get_unique_name(reg).to_string();
+        let kind = if instance.get_typedef_name().is_some() {
+            "INSTANCE"
+        } else if instance.is_axis() {
+            "AXIS_PTS"
+        } else {
+            "CHARACTERISTIC"
+        };
+        let owner = format!("{kind} '{name}'");
+        if let Some(typedef) = instance.get_typedef_name() {
+            components(reg, typedef, &name, &owner, &mut calibration, 0);
+        }
+        calibration.insert(name, owner);
+    }
+    let clashes: Vec<String> = (&reg.instance_list)
+        .into_iter()
+        .filter(|instance| instance.is_measurement_object())
+        .filter_map(|instance| {
+            let name = instance.get_unique_name(reg);
+            calibration.get(name.as_ref()).map(|owner| format!("MEASUREMENT '{name}' has the full name of {owner}"))
+        })
+        .collect();
+    if clashes.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{}. AXIS_PTS, BLOB, CHARACTERISTIC, INSTANCE and MEASUREMENT names are one A2L namespace, an INSTANCE's component paths included, \
+         so a reader would find two objects under one name. Give the measured entry a .name of its own, or rename its event; no A2L is written",
+        clashes.join("; ")
+    )
+    .into())
+}
+
 /// Rewrite, in the A2L at `path`, the event list of every identifier-addressed measurement
 /// (ECU_ADDRESS_EXTENSION XCP_ADDR_EXT_ID) from `VARIABLE ... DEFAULT_EVENT_LIST EVENT n` to
 /// `FIXED_EVENT_LIST EVENT n`: its identifier may only be sampled on that event (issue 140).

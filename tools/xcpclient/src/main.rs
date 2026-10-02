@@ -842,6 +842,9 @@ async fn xcp_client(
                     // Register the measurements the mci_meas descriptor section describes, by identifier
                     // or, where the backend supplied one (VX1000), by absolute address
                     elf_reader.register_mci_measurements(&mut reg, segment_relative, verbose)?;
+                    // Added to upstream (issue 223): a measurement named like a calibration object,
+                    // an instance's component path included, is refused, and no A2L is written.
+                    elf_reader::check_measurement_names(&reg)?;
                 }
 
                 // The application's own name, when it carries one, becomes the A2L's PROJECT and
