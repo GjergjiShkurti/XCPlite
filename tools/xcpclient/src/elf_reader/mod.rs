@@ -1565,20 +1565,20 @@ impl ElfReader {
             //
             // Identifier (xcplite): the identifier travels in ECU_ADDRESS with extension
             // XCP_ADDR_EXT_ID (0x7F). The event association still matters -- it is what the
-            // generator turns into per-event DAQ lists and a non-zero EventId, and it decides
-            // which event refreshes the resolution-table pointer this identifier reads through.
-            // Binding every identifier to event 0 (as this used to) left the 2nd..nth event
-            // arming nothing at all: its signals were sampled on event 0's list instead, at the
-            // wrong rate, and for anything not at a fixed address off a pointer that event never
-            // refreshes.
+            // generator turns into per-event DAQ lists and a non-zero EventId, and it is the one
+            // event whose trigger carries this identifier's address: a MEASURE passes its own
+            // entries' addresses when it triggers its event, and xcplite refuses to start a DAQ
+            // list that samples the identifier on any other (XcpCheckIdEvents). Binding every
+            // identifier to event 0 (as this used to) left the 2nd..nth event arming nothing at
+            // all: its signals were put on event 0's list instead, at the wrong rate, on a
+            // trigger that does not carry their addresses.
             let event_id = match reg.event_list.find_event(&r.event, 0) {
                 Some(e) => e.id,
                 None => {
                     // Event 0 either way, but said out loud either way too. The warning used to be
                     // conditional on the name being non-empty, which silenced the case that needs
                     // it most: a descriptor with no event at all is bound to whichever event
-                    // happens to be 0, and is then sampled at that event's rate through a pointer
-                    // it never refreshes.
+                    // happens to be 0, whose trigger does not carry its address.
                     if r.event.is_empty() {
                         warn!("measurement '{}' names no event; binding it to event 0", r.name);
                     } else {
