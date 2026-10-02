@@ -1770,35 +1770,147 @@ pub fn check_measurement_names(reg: &Registry) -> Result<(), Box<dyn Error>> {
     .into())
 }
 
+/// Added to upstream (issue 258): one token of an A2L text, and where it starts in the text.
+///
+/// A quoted string is one token, its quotes included, by A2L's rules: inside it `\"` and `""` are a
+/// quote and `\\` a backslash, so none of them ends it. Any other token runs to white space or a
+/// quote. The passes below find a measurement's block and read its keywords from these, so that a
+/// description or a unit holding `/end MEASUREMENT` or `ECU_ADDRESS_EXTENSION 1` decides nothing: a
+/// quoted token is never equal to a keyword.
+struct A2lToken<'a> {
+    start: usize,
+    text: &'a str,
+}
+
+impl A2lToken<'_> {
+    fn end(&self) -> usize {
+        self.start + self.text.len()
+    }
+    fn quoted(&self) -> bool {
+        self.text.starts_with('"')
+    }
+}
+
+/// The tokens of an A2L text. A string still open at the end of the text runs to its end.
+fn a2l_tokens(text: &str) -> Vec<A2lToken<'_>> {
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at].is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        if bytes[at] == b'"' {
+            at += 1;
+            while at < bytes.len() {
+                match bytes[at] {
+                    b'\\' => at += 2,
+                    b'"' if bytes.get(at + 1) == Some(&b'"') => at += 2,
+                    b'"' => {
+                        at += 1;
+                        break;
+                    }
+                    _ => at += 1,
+                }
+            }
+            at = at.min(bytes.len());
+        } else {
+            while at < bytes.len() && !bytes[at].is_ascii_whitespace() && bytes[at] != b'"' {
+                at += 1;
+            }
+        }
+        // Every token ends after an ASCII byte or at the end of the text, so this is a char boundary.
+        tokens.push(A2lToken { start, text: &text[start..at] });
+    }
+    tokens
+}
+
+/// The MEASUREMENT blocks among `tokens`, each from its `/begin MEASUREMENT` to its `/end MEASUREMENT`.
+fn a2l_measurements<'t, 'a>(tokens: &'t [A2lToken<'a>]) -> Vec<&'t [A2lToken<'a>]> {
+    let mut blocks = Vec::new();
+    let mut open = None;
+    for (at, pair) in tokens.windows(2).enumerate() {
+        match (pair[0].text, pair[1].text) {
+            ("/begin", "MEASUREMENT") => open = Some(at),
+            ("/end", "MEASUREMENT") => {
+                if let Some(start) = open.take() {
+                    blocks.push(&tokens[start..at + 2]);
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// The ECU_ADDRESS_EXTENSION a measurement block states, decimal or 0x hex.
+fn a2l_address_extension(block: &[A2lToken]) -> Option<u8> {
+    let at = block.iter().position(|t| t.text == "ECU_ADDRESS_EXTENSION")?;
+    let v = block.get(at + 1)?.text;
+    if let Some(hex) = v.strip_prefix("0x") {
+        u8::from_str_radix(hex, 16).ok()
+    } else {
+        v.parse::<u8>().ok()
+    }
+}
+
+/// `text` with each of `edits` -- a byte range and what replaces it, in order and not overlapping.
+fn a2l_splice(text: &str, edits: &[(std::ops::Range<usize>, String)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (range, with) in edits {
+        out.push_str(&text[at..range.start]);
+        out.push_str(with);
+        at = range.end;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
 /// Rewrite, in the A2L at `path`, the event list of every identifier-addressed measurement
 /// (ECU_ADDRESS_EXTENSION XCP_ADDR_EXT_ID) from `VARIABLE ... DEFAULT_EVENT_LIST EVENT n` to
 /// `FIXED_EVENT_LIST EVENT n`: its identifier may only be sampled on that event (issue 140).
 /// Measurements on other extensions, which any event can sample, keep what xcp_registry wrote.
+///
+/// The block, its extension and its event list are read from the A2L's tokens, outside quoted
+/// strings (issue 258), as fix_identifier_read_write reads them.
 pub fn fix_identifier_event_lists(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    // `DAQ_EVENT VARIABLE /begin DEFAULT_EVENT_LIST EVENT n /end DEFAULT_EVENT_LIST /end DAQ_EVENT`,
+    // where None is the event's number.
+    const VARIABLE: [Option<&str>; 10] = [
+        Some("DAQ_EVENT"),
+        Some("VARIABLE"),
+        Some("/begin"),
+        Some("DEFAULT_EVENT_LIST"),
+        Some("EVENT"),
+        None,
+        Some("/end"),
+        Some("DEFAULT_EVENT_LIST"),
+        Some("/end"),
+        Some("DAQ_EVENT"),
+    ];
     let text = std::fs::read_to_string(path)?;
-    let block = Regex::new(r"(?s)/begin MEASUREMENT .*?/end MEASUREMENT")?;
-    let variable = Regex::new(r"DAQ_EVENT\s+VARIABLE\s+/begin\s+DEFAULT_EVENT_LIST\s+EVENT\s+(\S+)\s+/end\s+DEFAULT_EVENT_LIST\s+/end\s+DAQ_EVENT")?;
-    let extension = Regex::new(r"ECU_ADDRESS_EXTENSION\s+(0x[0-9A-Fa-f]+|\d+)\s")?;
-    let is_identifier = |m: &str| {
-        extension.captures(m).is_some_and(|c| {
-            let v = &c[1];
-            let ext = if let Some(hex) = v.strip_prefix("0x") { u8::from_str_radix(hex, 16).ok() } else { v.parse::<u8>().ok() };
-            ext == Some(XCP_ADDR_EXT_ID)
-        })
-    };
-    let mut fixed = 0usize;
-    let out = block.replace_all(&text, |caps: &regex::Captures| {
-        let m = &caps[0];
-        if is_identifier(m) && variable.is_match(m) {
-            fixed += 1;
-            variable.replace(m, "DAQ_EVENT FIXED_EVENT_LIST EVENT $1 /end DAQ_EVENT").into_owned()
-        } else {
-            m.to_string()
+    let tokens = a2l_tokens(&text);
+    let mut edits = Vec::new();
+    for block in a2l_measurements(&tokens) {
+        if a2l_address_extension(block) != Some(XCP_ADDR_EXT_ID) {
+            continue;
         }
-    });
-    if fixed > 0 {
-        std::fs::write(path, out.as_bytes())?;
-        info!("{} identifier-addressed measurement(s) written with FIXED_EVENT_LIST", fixed);
+        let list = block.windows(VARIABLE.len()).find(|w| {
+            w.iter().zip(VARIABLE).all(|(t, want)| match want {
+                Some(keyword) => t.text == keyword,
+                None => !t.quoted(),
+            })
+        });
+        if let Some(list) = list {
+            edits.push((list[0].start..list[9].end(), format!("DAQ_EVENT FIXED_EVENT_LIST EVENT {} /end DAQ_EVENT", list[5].text)));
+        }
+    }
+    if !edits.is_empty() {
+        std::fs::write(path, a2l_splice(&text, &edits).as_bytes())?;
+        info!("{} identifier-addressed measurement(s) written with FIXED_EVENT_LIST", edits.len());
     }
     Ok(())
 }
@@ -1810,40 +1922,29 @@ pub fn fix_identifier_event_lists(path: &std::path::Path) -> Result<(), Box<dyn 
 /// writes no READ_WRITE for them. A measurement on another extension, an absolute one a write
 /// reaches, keeps what xcp_registry wrote.
 ///
-/// The extension and the keyword are read outside quoted strings, so a description or a unit that
-/// mentions either is left as it is and decides nothing.
+/// The block, the extension and the keyword are read from the A2L's tokens, outside quoted strings
+/// (issue 258), so a description or a unit that mentions any of them is left as it is and decides
+/// nothing.
 pub fn fix_identifier_read_write(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
     let text = std::fs::read_to_string(path)?;
-    let block = Regex::new(r"(?s)/begin MEASUREMENT .*?/end MEASUREMENT")?;
-    let token = Regex::new(r#""(?:[^"\\]|\\.)*"|ECU_ADDRESS_EXTENSION\s+(0x[0-9A-Fa-f]+|\d+)|\s+READ_WRITE\b"#)?;
-    let extension = |m: &str| {
-        token.captures_iter(m).find_map(|c| c.get(1)).and_then(|v| {
-            let v = v.as_str();
-            if let Some(hex) = v.strip_prefix("0x") { u8::from_str_radix(hex, 16).ok() } else { v.parse::<u8>().ok() }
-        })
-    };
+    let tokens = a2l_tokens(&text);
+    let mut edits = Vec::new();
     let mut fixed = 0usize;
-    let out = block.replace_all(&text, |caps: &regex::Captures| {
-        let m = &caps[0];
-        if extension(m) != Some(XCP_ADDR_EXT_ID) {
-            return m.to_string();
+    for block in a2l_measurements(&tokens) {
+        if a2l_address_extension(block) != Some(XCP_ADDR_EXT_ID) {
+            continue;
         }
-        let mut removed = false;
-        let body = token.replace_all(m, |t: &regex::Captures| {
-            if t[0].trim_start().starts_with("READ_WRITE") {
-                removed = true;
-                String::new()
-            } else {
-                t[0].to_string()
-            }
-        });
-        if removed {
+        let before = edits.len();
+        // The keyword and the white space before it, as xcp_registry writes ` READ_WRITE`.
+        for pair in block.windows(2).filter(|pair| pair[1].text == "READ_WRITE") {
+            edits.push((pair[0].end()..pair[1].end(), String::new()));
+        }
+        if edits.len() > before {
             fixed += 1;
         }
-        body.into_owned()
-    });
+    }
     if fixed > 0 {
-        std::fs::write(path, out.as_bytes())?;
+        std::fs::write(path, a2l_splice(&text, &edits).as_bytes())?;
         info!("{} identifier-addressed measurement(s) written without READ_WRITE", fixed);
     }
     Ok(())
@@ -2472,5 +2573,37 @@ impl ElfReader {
             current = self.debug_data.types.get(&offset)?;
         }
         None
+    }
+}
+
+/// Added to upstream (issue 258): A2L's string rules, which the offline A2L reaches only in part --
+/// our writer escapes a quote as `\"`, never as `""`.
+#[cfg(test)]
+mod a2l_token_tests {
+    use super::*;
+
+    fn texts(text: &str) -> Vec<&str> {
+        a2l_tokens(text).iter().map(|t| t.text).collect()
+    }
+
+    #[test]
+    fn a_string_is_one_token_whatever_it_holds() {
+        assert_eq!(
+            texts(r#"/begin MEASUREMENT m "a \"q\" /end MEASUREMENT" UBYTE"#),
+            ["/begin", "MEASUREMENT", "m", r#""a \"q\" /end MEASUREMENT""#, "UBYTE"]
+        );
+        assert_eq!(texts(r#""say ""/end MEASUREMENT"" here" X"#), [r#""say ""/end MEASUREMENT"" here""#, "X"]);
+        assert_eq!(texts(r#""C:\\" ECU_ADDRESS_EXTENSION 1"#), [r#""C:\\""#, "ECU_ADDRESS_EXTENSION", "1"]);
+        assert_eq!(texts(r#""" X "open"#), [r#""""#, "X", r#""open"#]);
+    }
+
+    #[test]
+    fn a_block_and_its_extension_are_read_outside_strings() {
+        let text = r#"/begin MEASUREMENT m "ends at /end MEASUREMENT, says ECU_ADDRESS_EXTENSION 1" ULONG ECU_ADDRESS_EXTENSION 0x7F READ_WRITE /end MEASUREMENT"#;
+        let tokens = a2l_tokens(text);
+        let blocks = a2l_measurements(&tokens);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].last().map(|t| t.end()), Some(text.len()));
+        assert_eq!(a2l_address_extension(blocks[0]), Some(XCP_ADDR_EXT_ID));
     }
 }
