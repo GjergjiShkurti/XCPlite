@@ -2124,23 +2124,36 @@ fn apply_instance_metadata(inst: &mut xcp_registry::McInstance, kind: &str, meta
 // declaring *type*; the segments that instantiate it are found here, from the calseg__<name> markers
 // register_segments already relies on.
 
-/// `text` as it has to stand between an A2L string's quotes: every `"` and `\` escaped, as `\"` and
-/// `\\` (issue 222).
+/// `text` as it has to stand between an A2L string's quotes: every `"`, `\`, newline, carriage return
+/// and tab escaped, as `\"`, `\\` (issue 222), `\n`, `\r` and `\t` (issue 256) -- escapes a2lfile
+/// reads, and so does canape-kernel-config's generator.
 ///
 /// xcp_registry's writer puts what it is given between quotes as it is (`"{comment}"`), so a `"` in
-/// a comment, a unit or a segment description ended the string early and a `\` began an escape: the
-/// A2L said something other than the source, and a reader misread the line. The text of an
-/// mc-instrument record is the user's, so it is escaped here, where it is handed to the registry --
-/// the writer itself is upstream's (issue 251). Nothing after this cuts a string short, so there is
-/// no room to count the escapes against: the record's own width capped the text before it was
-/// escaped.
+/// a comment, a unit or a segment description ended the string early and a `\` began an escape, and
+/// a newline split the object's line, which the generator then refused to read: the A2L said
+/// something other than the source. The text of an mc-instrument record is the user's, written as
+/// they mean it, so it is escaped here, where it is handed to the registry -- the writer itself is
+/// upstream's (issue 251). Any other control character is written as it is: an A2L string has no
+/// escape for one, a2lfile's own writer writes it as it is too, and neither a2lfile nor the generator
+/// ends a string or a line at it. Nothing after this cuts a string short, so there is no room to
+/// count the escapes against: the record's own width capped the text before it was escaped.
 fn a2l_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
+        let escape = match c {
+            '"' | '\\' => Some(c),
+            '\n' => Some('n'),
+            '\r' => Some('r'),
+            '\t' => Some('t'),
+            _ => None,
+        };
+        match escape {
+            Some(e) => {
+                out.push('\\');
+                out.push(e);
+            }
+            None => out.push(c),
         }
-        out.push(c);
     }
     out
 }
