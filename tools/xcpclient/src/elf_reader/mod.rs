@@ -1511,7 +1511,7 @@ impl ElfReader {
             // identifier at trigger time and the address has to be in the A2L.
             //
             // Identifier (xcplite): the identifier travels in ECU_ADDRESS with extension
-            // XCP_ADDR_EXT_APP (0x80). The event association still matters -- it is what the
+            // XCP_ADDR_EXT_ID (0x7F). The event association still matters -- it is what the
             // generator turns into per-event DAQ lists and a non-zero EventId, and it decides
             // which event refreshes the resolution-table pointer this identifier reads through.
             // Binding every identifier to event 0 (as this used to) left the 2nd..nth event
@@ -1551,7 +1551,7 @@ impl ElfReader {
                 // i*elemsize, and an object wider than one ODT entry is armed as chunks at
                 // ECU_ADDRESS + k*248. With the whole word spent on the identifier those landed
                 // on unrelated objects. Mirrors XcpAddrEncodeId in xcplite's inc/xcp_id_addr.h.
-                None => McAddress::new_a2l_with_event(event_id, id << XCP_ID_OFFSET_BITS, XCP_ADDR_EXT_APP),
+                None => McAddress::new_a2l_with_event(event_id, id << XCP_ID_OFFSET_BITS, XCP_ADDR_EXT_ID),
             };
             match reg.instance_list.add_instance(name.clone(), dim_type, sd, addr) {
                 Ok(_) => {
@@ -1644,22 +1644,18 @@ impl CalsegRoom {
     }
 }
 
-/// XCP address extension marking an identifier-addressed (application-resolved) object:
-/// ECU_ADDRESS_EXTENSION 0x80. Matches XCP_ADDR_EXT_APP in xcplib and A2lSetIdAddrMode on the
-/// mc-instrument runtime side.
-/// Correct for the default XCPLITE__CASDD scheme, which is what mc-instrument builds. Under
-/// XCPLITE__AXSDD (no calibration segments) and XCPLITE__CXSDD (SHM) the application extension
-/// is 0x01 instead (xcp_cfg.h, the AXSDD and CXSDD blocks). The ELF does name its scheme -- the
-/// XCPLITE__<scheme> marker that get_target_signature reads -- but main.rs uses it only to choose
-/// segment-relative addressing, and this constant does not follow it. An A2L generated from a
-/// binary built in one of those schemes would carry ECU_ADDRESS_EXTENSION 128 while the
-/// application only accepts 1, and every WRITE_DAQ would be rejected. Loud, at least. Deriving
-/// the extension from that marker, or carrying it in the mci_layout record (a layout version
-/// bump on both sides), would close this.
-const XCP_ADDR_EXT_APP: u8 = 0x80;
+/// The address extension of an identifier-addressed object: ECU_ADDRESS_EXTENSION 0x7F. Must equal
+/// XCP_ADDR_EXT_ID in xcplite's inc/xcp_id_addr.h, which A2lSetIdAddrMode writes on the runtime
+/// route and the server's identifier branches test.
+///
+/// One value in every addressing scheme. Identifiers used to travel on the application extension,
+/// XCP_ADDR_EXT_APP, which is 0x80 under XCPLITE__CASDD and 0x01 under AXSDD and CXSDD, and this
+/// constant was 0x80 whatever scheme the ELF named -- right for what mc-instrument builds, wrong for
+/// a binary built in another scheme, whose every WRITE_DAQ the server would then reject (issue 253).
+const XCP_ADDR_EXT_ID: u8 = 0x7F;
 
 /// Rewrite, in the A2L at `path`, the event list of every identifier-addressed measurement
-/// (ECU_ADDRESS_EXTENSION XCP_ADDR_EXT_APP) from `VARIABLE ... DEFAULT_EVENT_LIST EVENT n` to
+/// (ECU_ADDRESS_EXTENSION XCP_ADDR_EXT_ID) from `VARIABLE ... DEFAULT_EVENT_LIST EVENT n` to
 /// `FIXED_EVENT_LIST EVENT n`: its identifier may only be sampled on that event (issue 140).
 /// Measurements on other extensions, which any event can sample, keep what xcp_registry wrote.
 pub fn fix_identifier_event_lists(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
@@ -1671,7 +1667,7 @@ pub fn fix_identifier_event_lists(path: &std::path::Path) -> Result<(), Box<dyn 
         extension.captures(m).is_some_and(|c| {
             let v = &c[1];
             let ext = if let Some(hex) = v.strip_prefix("0x") { u8::from_str_radix(hex, 16).ok() } else { v.parse::<u8>().ok() };
-            ext == Some(XCP_ADDR_EXT_APP)
+            ext == Some(XCP_ADDR_EXT_ID)
         })
     };
     let mut fixed = 0usize;

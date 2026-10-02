@@ -545,6 +545,15 @@ uint8_t XcpWriteMta(uint8_t size, const uint8_t *data) {
     }
 #endif
 
+#ifdef XCP_ENABLE_ID_ADDRESSING
+    // EXT == XCP_ADDR_EXT_ID Identifier addressing: refused. An identifier names a measurement,
+    // which has no reference page and no consistent-write discipline; calibration goes through
+    // the segment mechanism, which has both.
+    if (XcpAddrIsId(local.mta_ext)) {
+        return CRC_ACCESS_DENIED;
+    }
+#endif
+
     // Standard memory access by pointer local.mta_ptr
     if (local.mta_ext == XCP_ADDR_EXT_PTR) {
 
@@ -599,6 +608,15 @@ uint8_t XcpReadMta(uint8_t size, uint8_t *data) {
     // EXT == XCP_ADDR_EXT_APP Application specific memory access
     if (XcpAddrIsApp(local.mta_ext)) {
         uint8_t res = ApplXcpReadMemory(local.mta_addr, size, data);
+        local_mut.mta_addr += size;
+        return res;
+    }
+#endif
+
+#ifdef XCP_ENABLE_ID_ADDRESSING
+    // EXT == XCP_ADDR_EXT_ID Identifier addressing: answered at once from the object's slot
+    if (XcpAddrIsId(local.mta_ext)) {
+        uint8_t res = XcpReadId(local.mta_addr, size, data);
         local_mut.mta_addr += size;
         return res;
     }
@@ -688,6 +706,15 @@ uint8_t XcpSetMta(uint8_t ext_, uint32_t addr_) {
     // Application specific addressing mode
     if (XcpAddrIsApp(local.mta_ext)) {
         DBG_PRINTF6("XcpSetMta: XCP_ADDR_EXT_APP:%08X\n", local_mut.mta_addr);
+        return CRC_CMD_OK;
+    }
+#endif
+
+#ifdef XCP_ENABLE_ID_ADDRESSING
+    // Identifier addressing mode. The identifier is checked by each access, against the table
+    // as it is then: a republication between SET_MTA and UPLOAD would make a check here stale.
+    if (XcpAddrIsId(local.mta_ext)) {
+        DBG_PRINTF6("XcpSetMta: XCP_ADDR_EXT_ID:%08X\n", local_mut.mta_addr);
         return CRC_CMD_OK;
     }
 #endif
@@ -1339,6 +1366,35 @@ static const uint8_t *XcpResolveId(const tXcpResolveView *view, const tXcpIdBase
     return base + offset;
 }
 
+// The command path's read on XCP_ADDR_EXT_ID: SHORT_UPLOAD, UPLOAD and BUILD_CHECKSUM, on the XCP
+// command thread, between the application's triggers. Answered at once from the object's slot, with
+// the same bounds as the sampling loop, and refused rather than answered with a guess: a single read
+// has no later samples to correct it, so a zero for an address not yet published, or bytes read
+// through a stack address whose frame may have returned, would pass for a measured value.
+uint8_t XcpReadId(uint32_t addr, uint8_t size, uint8_t *dst) {
+    const tXcpResolveView view = XcpLoadResolveView();
+    const uint32_t id = XcpAddrDecodeId(addr);
+    const uint32_t offset = XcpAddrDecodeIdOffset(addr);
+    if (view.table == NULL || id == 0 || id >= view.count) {
+        return CRC_OUT_OF_RANGE;
+    }
+    const tXcpResolveEntry *const e = &view.table[id];
+    // Written so neither term can overflow: both halves came off the wire.
+    if (offset > e->size || (uint32_t)size > e->size - offset) {
+        return CRC_OUT_OF_RANGE;
+    }
+    // The mark before the address: see tXcpResolveEntry.transient for why this order.
+    if (__atomic_load_n(&e->transient, __ATOMIC_ACQUIRE) != 0) {
+        return CRC_ACCESS_DENIED;
+    }
+    const uint8_t *const base = (const uint8_t *)e->ptr;
+    if (base == NULL) {
+        return CRC_ACCESS_DENIED; // no trigger has published an address for it
+    }
+    memcpy(dst, base + offset, size);
+    return 0;
+}
+
 // Whether every identifier-addressed ODT entry of a DAQ list may be sampled on the list's event.
 // An identifier whose entry names an owning event (XCP_RESOLVE_FLAG_EVENT) may not: its object
 // lives where that event's trigger says, and on another event the only address available is
@@ -1445,14 +1501,12 @@ static uint8_t XcpAddOdtEntry(uint32_t addr, uint8_t ext, uint8_t size) {
 #endif // SHM_MODE
             } else
 #endif
-#ifdef XCP_ENABLE_APP_ADDRESSING
-                if (XcpAddrIsApp(ext)) {
-                base_offset = XcpAddrDecodeAppOffset(addr);
 #ifdef XCP_ENABLE_ID_ADDRESSING
-                // Identifier addressing travels on the application address
-                // extension. Validate the identifier, its offset and the requested
-                // size now, so a bad WRITE_DAQ fails at arm time instead of
+                // Identifier addressing, on its own extension. Validate the identifier, its offset
+                // and the requested size now, so a bad WRITE_DAQ fails at arm time instead of
                 // sampling garbage.
+                if (XcpAddrIsId(ext)) {
+                base_offset = addr;
                 // No table means nothing can resolve. Accepting the entry armed a DAQ list
                 // that samples defined zeros for every identifier -- a successful
                 // START_STOP_DAQ_LIST and a screen full of 0.0, with nothing in the log.
@@ -1483,7 +1537,11 @@ static uint8_t XcpAddOdtEntry(uint32_t addr, uint8_t ext, uint8_t size) {
                         return CRC_OUT_OF_RANGE;
                     }
                 }
+            } else
 #endif
+#ifdef XCP_ENABLE_APP_ADDRESSING
+                if (XcpAddrIsApp(ext)) {
+                base_offset = XcpAddrDecodeAppOffset(addr);
             } else
 #endif
                 return CRC_ACCESS_DENIED;
@@ -1821,7 +1879,7 @@ static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, const ui
                 uint32_t offset = *addr_ptr++;
 #ifdef XCP_ENABLE_ID_ADDRESSING
                 // Identifier addressing: the ODT entry carries an identifier and a
-                // byte offset (xcp_id_addr.h) on the application address extension.
+                // byte offset (xcp_id_addr.h) on its own extension, XCP_ADDR_EXT_ID.
                 // Resolve it to a live pointer through the trigger's own addresses,
                 // or the table published by XcpSetResolveTable() for a trigger that
                 // passed none. An identifier that is not currently available, or

@@ -439,6 +439,14 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 /// @param count Number of entries in the table.
 void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count);
 
+/// Read an identifier-addressed object the way the command path does on XCP_ADDR_EXT_ID
+/// (SHORT_UPLOAD, UPLOAD, BUILD_CHECKSUM): at once, from the object's slot in the table.
+/// @param addr The packed identifier and byte offset (XcpAddrEncodeId).
+/// @return 0; CRC_OUT_OF_RANGE for identifier 0, one the table does not hold, or bytes outside the
+/// object; CRC_ACCESS_DENIED for an object with no address, or one whose last trigger found it on
+/// a stack (tXcpResolveEntry.transient).
+uint8_t XcpReadId(uint32_t addr, uint8_t size, uint8_t *dst);
+
 /// Trigger an event, sampling identifier-addressed ODT entries through the addresses this call
 /// passes rather than through the resolution table's shared `ptr` fields. Otherwise the same as
 /// XcpEventExtAt_.

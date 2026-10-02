@@ -66,7 +66,6 @@ static uint8_t gA2lAutoAddrExt = XCP_UNDEFINED_ADDR_EXT; // Address extension ca
 static const uint8_t *gA2lFramePtr = NULL;               // Frame address for rel and dyn mode
 static const uint8_t *gA2lBasePtr = NULL;                // Base address for rel and dyn mode
 static tXcpCalSegIndex gA2lAddrIndex = 0;                // Segment index for seg mode
-static bool gA2lIdMode = false;                          // Identifier (resolve-table) addressing: address field is an identifier and a byte offset, not a memory address
 
 // Input quantities
 static const char *gA2lInputQuantity_x = NULL;
@@ -407,11 +406,10 @@ static void A2lCreateMeasurement_IF_DATA(void) {
         }
 #endif
 #ifdef XCP_ENABLE_ID_ADDRESSING
-        // Identifier addressing shares the application address extension, so it is not caught
-        // by the addr_ext tests above; the id-mode flag is what distinguishes it. An identifier
-        // belongs to exactly one event, and the server refuses to start it on any other
-        // (XcpCheckIdEvents), so the association is FIXED: a tool must not offer another event.
-        else if (gA2lIdMode) {
+        // Identifier addressing. An identifier belongs to exactly one event, and the server
+        // refuses to start it on any other (XcpCheckIdEvents), so the association is FIXED: a
+        // tool must not offer another event.
+        else if (XcpAddrIsId(addr_ext)) {
             if (gA2lFixedEvent != XCP_UNDEFINED_EVENT_ID) {
                 fprintf(gA2lFile, " /begin IF_DATA XCP /begin DAQ_EVENT FIXED_EVENT_LIST EVENT 0x%X /end DAQ_EVENT /end IF_DATA", gA2lFixedEvent);
             }
@@ -472,7 +470,6 @@ static void A2lSetSegAddrMode(tXcpCalSegIndex calseg_index, const uint8_t *calse
     gA2lAddrIndex = calseg_index;
     gA2lBasePtr = calseg_instance_addr; // Address of the calibration segment instance which is used in the macros to create the components
     gA2lAddrExt = XCP_ADDR_EXT_SEG;
-    gA2lIdMode = false;
 }
 #endif
 
@@ -483,7 +480,6 @@ static void A2lSetAbsAddrMode(tXcpEventId default_event_id) {
     gA2lDefaultEvent = default_event_id; // May be XCP_UNDEFINED_EVENT_ID
     gA2lFramePtr = NULL;
     gA2lBasePtr = NULL;
-    gA2lIdMode = false;
 #ifdef XCP_ENABLE_ABS_ADDRESSING
     gA2lAddrExt = ApplXcpGetAddrExt(NULL);
 #else
@@ -501,7 +497,6 @@ void A2lSetRelAddrMode(tXcpEventId event_id, const uint8_t *base_ptr) {
     gA2lFixedEvent = event_id;
     gA2lDefaultEvent = XCP_UNDEFINED_EVENT_ID;
     gA2lAddrExt = XCP_ADDR_EXT_REL;
-    gA2lIdMode = false;
 }
 #endif
 
@@ -514,7 +509,6 @@ void A2lSetDynAddrMode(tXcpEventId event_id, uint8_t i, const uint8_t *base_ptr)
     gA2lFixedEvent = event_id;
     gA2lDefaultEvent = XCP_UNDEFINED_EVENT_ID;
     gA2lAddrExt = XCP_ADDR_EXT_DYN + i;
-    gA2lIdMode = false;
     assert(gA2lAddrExt <= XCP_ADDR_EXT_DYN_MAX);
 }
 
@@ -527,7 +521,6 @@ void A2lSetAutoAddrMode(tXcpEventId event_id, const uint8_t *frame_ptr, const ui
     gA2lFixedEvent = event_id;
     gA2lDefaultEvent = XCP_UNDEFINED_EVENT_ID;
     gA2lAddrExt = XCP_UNDEFINED_ADDR_EXT; // Auto
-    gA2lIdMode = false;
 }
 
 static void A2lRstAddrMode(void) {
@@ -538,7 +531,6 @@ static void A2lRstAddrMode(void) {
     gA2lAddrIndex = 0;
     gA2lAddrExt = XCP_UNDEFINED_ADDR_EXT;
     gA2lAutoAddrExt = XCP_UNDEFINED_ADDR_EXT;
-    gA2lIdMode = false;
 }
 
 //----------------------------------------------------------------------------------
@@ -719,7 +711,6 @@ void A2lSetApplicationAddrMode(void) {
         gA2lFramePtr = NULL;
         gA2lBasePtr = NULL;
         gA2lAddrExt = XCP_ADDR_EXT_APP;
-        gA2lIdMode = false;
         A2lEndGroup();
         // fprintf(gA2lFile, "\n/* Application specific addressing mode */\n");
     }
@@ -730,8 +721,8 @@ void A2lSetApplicationAddrMode(void) {
 // Identifier (resolve-table) addressing mode.
 //
 // The A2L address field carries a deterministic identifier and a byte offset into the object
-// (XcpAddrEncodeId, xcp_id_addr.h), not a memory address; the address extension is
-// XCP_ADDR_EXT_ID (== XCP_ADDR_EXT_APP) and serves only as a mode tag. A2lCreateMeasurement_ is
+// (XcpAddrEncodeId, xcp_id_addr.h), not a memory address, on the identifier's own address
+// extension, XCP_ADDR_EXT_ID, which is what selects the mode everywhere. A2lCreateMeasurement_ is
 // called with that encoded address cast to a pointer, and A2lGetAddr_ then passes it through
 // unchanged (see below). event_id, when set, is emitted as a FIXED_EVENT_LIST: it is the one
 // event that samples the object. XCP_UNDEFINED_EVENT_ID emits no event association at all.
@@ -742,7 +733,6 @@ void A2lSetIdAddrMode(tXcpEventId event_id) {
         gA2lFramePtr = NULL;
         gA2lBasePtr = NULL;
         gA2lAddrExt = XCP_ADDR_EXT_ID;
-        gA2lIdMode = true;
         if (event_id != XCP_UNDEFINED_EVENT_ID) {
             beginEventGroup(event_id);
         }
@@ -854,9 +844,8 @@ static uint32_t A2lGetAddr_(const void *p) {
 
         // Identifier: p is not a pointer, it carries the encoded identifier address itself
         // (XcpAddrEncodeId). Passed through unchanged so the A2L address field becomes it.
-        // Checked before the application branch, which shares the same address extension.
 #ifdef XCP_ENABLE_ID_ADDRESSING
-        else if (gA2lIdMode) {
+        else if (XcpAddrIsId(gA2lAddrExt)) {
             return (uint32_t)(uintptr_t)p;
         }
 #endif

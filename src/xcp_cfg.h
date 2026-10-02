@@ -360,26 +360,31 @@ XCPlite multi application absolute addressing: XCP_ADDRESS_MODE_XCPLITE__CXSDD (
 // Enable individual address extensions for each ODT entry, otherwise address extension must be unique for each DAQ list
 #define XCP_ENABLE_DAQ_ADDREXT
 
-// --- Identifier (resolve-table) addressing mode for DAQ
-// Optional. A DAQ ODT entry stores a deterministic identifier and a byte offset
-// into the object it names in its 32 bit address field (split below), and is
-// tagged with the application address extension (XCP_ADDR_EXT_APP) purely to
-// select this mode -- the extension carries no data. The DAQ sampling loop uses
-// the identifier as a key into a table published by XcpSetResolveTable() to get
-// the live pointer, and adds the offset, instead of the usual base+offset.
-// One addressing mode then covers globals, stack locals and heap/pointer
-// reachable data without a per-kind address extension, and there is no dynamic
-// base slot limit for pointer reachable objects. Only the DAQ path is affected
-// here: the command path (SHORT_UPLOAD/DOWNLOAD/CALC_CHECKSUM) routes the
-// application address extension to ApplXcpReadMemory/ApplXcpWriteMemory, which
-// resolve nothing on their own -- they answer CRC_ACCESS_DENIED unless the
-// application registers a callback. This used to read as though the command path
-// worked already; it works if and only if something registers one, which
-// mc-instrument now does for reads.
+// --- Identifier (resolve-table) addressing mode
+// Optional. An object is named by a deterministic identifier and a byte offset into it, packed into
+// the 32 bit address field (split below), on an address extension of its own, XCP_ADDR_EXT_ID.
+// The identifier is a key into a table published by XcpSetResolveTable(), which holds each
+// object's live location and size. One addressing mode then covers globals, stack locals and
+// heap/pointer reachable data without a per-kind address extension, and there is no dynamic base
+// slot limit for pointer reachable objects.
+//
+// The extension has branches of its own wherever xcplite dispatches on one: SET_MTA, the upload
+// and download paths (XcpSetMta, XcpReadMta, XcpWriteMta), WRITE_DAQ (XcpAddOdtEntry) and the DAQ
+// sampling loop (XcpTriggerDaqList_). A read is answered at once from the object's slot in the
+// table (XcpReadId); a write is refused, because a measurement has no reference page and no
+// consistent-write discipline (calibration goes through the segment mechanism, which has both).
+//
+// It used to travel on the application address extension, XCP_ADDR_EXT_APP, and so took on what
+// upstream assumes of that extension: its command path goes to the application's callbacks,
+// a2l.c gives its measurements READ_WRITE, and its value is 0x80 under XCPLITE__CASDD, 0x01 under
+// AXSDD and CXSDD and nothing under ACSDD (issue 253). XCP_ADDR_EXT_APP is upstream's again.
+//
+// 0x7F (xcp_id_addr.h): the range 0x10..0x7F is used by no addressing scheme above -- DYN ends at
+// XCP_ADDR_EXT_DYN_MAX (0x0F), CASDD's APP and SHM's per-application ABS start at 0x80, FILE and
+// PTR are 0xFD and 0xFE -- so one value serves every scheme. The top of that range is the
+// farthest from the DYN block, which grows upwards with XCP_ADDR_EXT_DYN_COUNT, and stays a
+// positive byte for a tool that reads the extension as a signed char.
 #ifdef OPTION_ID_ADDRESSING
-#ifndef XCP_ENABLE_APP_ADDRESSING
-#error "OPTION_ID_ADDRESSING requires application addressing (identifiers travel on XCP_ADDR_EXT_APP)"
-#endif
 // Per-ODT-entry address extensions, without which identifier addressing does not merely degrade --
 // it reads wild memory. The sampling loop's identifier branch is inside #ifdef
 // XCP_ENABLE_DAQ_ADDREXT (XcpTriggerDaqList_), because that is where the entry's extension is
@@ -391,16 +396,18 @@ XCPlite multi application absolute addressing: XCP_ADDRESS_MODE_XCPLITE__CXSDD (
 #error "OPTION_ID_ADDRESSING requires XCP_ENABLE_DAQ_ADDREXT: the DAQ sampling loop can only recognise an identifier by the ODT entry's own address extension"
 #endif
 #define XCP_ENABLE_ID_ADDRESSING
-// Identifiers travel on the application address extension.
-#define XCP_ADDR_EXT_ID XCP_ADDR_EXT_APP
-#define XcpAddrIsId(addr_ext) ((addr_ext) == XCP_ADDR_EXT_ID)
 
 // The 32 bit address field is SPLIT, exactly as segment relative addressing splits it further up
 // in this file (XcpAddrEncodeSegIndex): the identifier names the object, the low bits are a byte offset
 // into it. The layout, and why it has to be split, live in one dependency-free header -- an
 // application sees only inc/xcplib.h and the server compiles against this file, so the definition
-// cannot sit in either.
+// cannot sit in either. XCP_ADDR_EXT_ID is defined there too, for the same reason.
 #include "xcp_id_addr.h"
+
+#define XcpAddrIsId(addr_ext) ((addr_ext) == XCP_ADDR_EXT_ID)
+#if XCP_ADDR_EXT_ID <= XCP_ADDR_EXT_DYN_MAX || XCP_ADDR_EXT_ID >= 0x80
+#error "XCP_ADDR_EXT_ID must lie in 0x10..0x7F, above the dynamic extensions and below the application and per-application absolute ones"
+#endif
 #endif // OPTION_ID_ADDRESSING
 
 // Static allocated memory for DAQ tables

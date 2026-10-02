@@ -154,23 +154,23 @@
 // Create an cyclic DAQ event for asynchronous data acquisition
 // #define OPTION_DAQ_ASYNC_EVENT
 
-// Enable identifier (resolve-table) addressing for DAQ
-// A measurement (ODT entry) may carry an identifier (plus a byte offset into the
-// object) that is resolved to a live pointer at sample time through a table
-// published by XcpSetResolveTable(), instead of the usual base+offset. One
-// addressing mode then covers globals, stack locals and heap/pointer-reachable
-// data without a per-kind address extension, and there is no dynamic-base slot
-// limit for pointer-reachable objects. The identifier travels on the application
-// address extension, so the command path hands it to ApplXcpReadMemory /
-// ApplXcpWriteMemory, which resolve it only if the application registers a
-// callback; the library itself changes only the DAQ path. See xcp_cfg.h and
+// Enable identifier (resolve-table) addressing
+// A measurement may carry an identifier (plus a byte offset into the object) that
+// is resolved to a live pointer through a table published by
+// XcpSetResolveTable(), instead of the usual base+offset. One addressing mode
+// then covers globals, stack locals and heap/pointer-reachable data without a
+// per-kind address extension, and there is no dynamic-base slot limit for
+// pointer-reachable objects. The identifier travels on an address extension of
+// its own, XCP_ADDR_EXT_ID: DAQ samples it, SHORT_UPLOAD / UPLOAD read it from
+// the table, and a write to it is refused. See xcp_cfg.h and
 // XcpSetResolveTable() in xcplib.h.
 // NOT defined here on purpose. Identifier addressing is our fork's addition, and defining it
 // in the shared default configuration turned it on for every XCPLITE_CONFIGURATION=default
 // build -- upstream's own examples and tests included -- so any ODT entry tagged with the
-// application address extension was silently routed through the resolve table. mc-instrument
-// sets it from its own build instead (target_compile_definitions in its CMakeLists.txt), which
-// keeps this file closer to upstream and makes the next rebase smaller.
+// application address extension (which identifiers then travelled on) was silently routed through
+// the resolve table. mc-instrument sets it from its own build instead (target_compile_definitions
+// in its CMakeLists.txt), which keeps this file closer to upstream and makes the next rebase
+// smaller.
 //
 // #define OPTION_ID_ADDRESSING
 

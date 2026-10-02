@@ -40,6 +40,12 @@
 /// The most bytes one identifier can address, offset field inclusive.
 #define XCP_ID_OBJECT_MAX_BYTES ((uint32_t)XCP_ID_OFFSET_MASK + 1u)
 
+/// The address extension an identifier travels on: SET_MTA, SHORT_UPLOAD, UPLOAD, BUILD_CHECKSUM and
+/// WRITE_DAQ carry it with the packed address, and an A2L states it as ECU_ADDRESS_EXTENSION. One
+/// value in every addressing scheme, and none of them uses it for anything else -- xcp_cfg.h says why
+/// it is 0x7F and refuses a value that would collide.
+#define XCP_ADDR_EXT_ID 0x7F
+
 /// Pack an identifier and a byte offset into an ODT entry's address field.
 #define XcpAddrEncodeId(id, offset) (uint32_t)((((uint32_t)(id)) << XCP_ID_OFFSET_BITS) | (((uint32_t)(offset)) & XCP_ID_OFFSET_MASK))
 
@@ -68,11 +74,11 @@
 typedef struct {
     /// The object's live location as the last trigger stored it, or NULL if not currently available.
     ///
-    /// Read by two consumers: ApplXcpReadMemory -- the callback registered through
-    /// ApplXcpRegisterReadCallback, serving SHORT_UPLOAD / UPLOAD / CALC_CHECKSUM on the XCP
-    /// command thread -- and the DAQ sampling loop, but only for a trigger that passes no addresses
-    /// of its own (XcpEventExtAt_ and the other XcpEvent* calls). A trigger through XcpEventIdsAt_
-    /// is sampled through the addresses it passes and never through this field.
+    /// Read by two consumers: XcpReadId -- the command path on XCP_ADDR_EXT_ID, serving
+    /// SHORT_UPLOAD / UPLOAD / BUILD_CHECKSUM on the XCP command thread -- and the DAQ sampling loop,
+    /// but only for a trigger that passes no addresses of its own (XcpEventExtAt_ and the other
+    /// XcpEvent* calls). A trigger through XcpEventIdsAt_ is sampled through the addresses it passes
+    /// and never through this field.
     ///
     /// Written by the application per trigger, as a plain access. **One identifier must be updated
     /// from one thread:** with two writers, a reader may be handed either one's address. The value
@@ -86,6 +92,16 @@ typedef struct {
     uint16_t seg;   ///< Calibration segment index, or XCP_RESOLVE_SEG_NONE for a measurement
     uint16_t flags; ///< XCP_RESOLVE_FLAG_*
     uint16_t event; ///< The owning event, when flags has XCP_RESOLVE_FLAG_EVENT
+    /// Nonzero when the command path must not serve ptr: the trigger that stored it found the object
+    /// on a stack, and between two triggers that frame may have returned. XcpReadId refuses such an
+    /// identifier. The DAQ sampling loop does not read it -- a trigger samples inside itself, while the
+    /// frame is live.
+    ///
+    /// Stored with each ptr, after it, with release; XcpReadId loads it before ptr, with acquire. A
+    /// read that sees the mark of a stored address therefore sees that address or a later one, never
+    /// an earlier one: an address that has been replaced is never served under the mark of its
+    /// replacement. Through the __atomic builtins on a plain byte, for the reason ptr is not an atomic.
+    uint8_t transient;
 } tXcpResolveEntry;
 
 /// The addresses one trigger passes for its own objects, to XcpEventIdsAt_: ptrs[i] is the live

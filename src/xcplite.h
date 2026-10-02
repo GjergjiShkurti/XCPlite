@@ -195,15 +195,13 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 // trigger through table[id].ptr, and an identifier with no address is sampled as
 // zero (a defined "not currently available"), so an armed but not yet live
 // signal produces no fault. An identifier whose entry names an owning event
-// (XCP_RESOLVE_FLAG_EVENT) cannot be started on any other event. Identifiers travel on the application address extension
-// (XCP_ADDR_EXT_APP). The command path resolves them only if the application
-// registers a resolver: ApplXcpReadMemory / ApplXcpWriteMemory reach
-// ApplXcpRegisterReadCallback / ApplXcpRegisterWriteCallback, and xcpappl.c's
-// default with no callback is CRC_ACCESS_DENIED. mc-instrument registers the READ
-// side over this same table, so SHORT_UPLOAD / UPLOAD / CALC_CHECKSUM of a
-// measurement work without arming DAQ; it deliberately registers no write side,
-// because a measurement has no reference page and no consistent-write discipline
-// (calibration goes through the segment mechanism, which has both).
+// (XCP_RESOLVE_FLAG_EVENT) cannot be started on any other event. Identifiers travel on an address
+// extension of their own, XCP_ADDR_EXT_ID, with branches of their own in the command path. A read
+// (SHORT_UPLOAD / UPLOAD / BUILD_CHECKSUM) is answered at once from the object's slot in this same
+// table (XcpReadId), so a measurement can be read without arming DAQ; a write (SHORT_DOWNLOAD /
+// DOWNLOAD) is refused, because a measurement has no reference page and no consistent-write
+// discipline (calibration goes through the segment mechanism, which has both). The application
+// address extension and its callbacks (ApplXcpReadMemory / ApplXcpWriteMemory) are not involved.
 // Identifier 0 is reserved as invalid; valid identifiers are 1..count-1 and index
 // the table directly. tXcpResolveEntry and tXcpIdBases are defined in
 // xcp_id_addr.h, which xcp_cfg.h includes.
@@ -211,6 +209,11 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 // Publish (table != NULL) or clear (table == NULL) the identifier resolution
 // table. The table is indexed directly by identifier; index 0 is reserved.
 void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count);
+
+// Read size bytes of the identifier-addressed object at addr (identifier and byte offset), as the
+// command path does on XCP_ADDR_EXT_ID: 0, or CRC_OUT_OF_RANGE for an identifier the table does not
+// hold or bytes outside its object, or CRC_ACCESS_DENIED for an object with no servable address.
+uint8_t XcpReadId(uint32_t addr, uint8_t size, uint8_t *dst);
 
 // Trigger an event and sample its identifier-addressed ODT entries through the
 // addresses this call passes (ids->ptrs[i] is identifier ids->first + i), not
