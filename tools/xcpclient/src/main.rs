@@ -28,7 +28,7 @@ use xcp_registry::McEvent;
 use xcp_test_executor::test_executor;
 
 pub mod elf_reader;
-use elf_reader::{ElfReader, MciAddressing};
+use elf_reader::{ElfReader, IdentField, MciAddressing};
 
 pub mod bin_reader;
 
@@ -764,6 +764,9 @@ async fn xcp_client(
             // Added to upstream (issue 186): the A2L's PROJECT description, MC_APP's .desc, which was always "".
             let mut project_description = String::new();
 
+            // The DTO identification field the server sends, where it is known (issue 364, below)
+            let mut ident_field: Option<IdentField> = None;
+
             // Read ELF/DWARF information for events, segments and (unless --create-a2l-template) variables
             // Events and calibration segments found in the ELF file, must match the XCP server information if present
             // If not, they are created, but with dummy event id and segment number, which has to be fixed later !!!
@@ -815,6 +818,9 @@ async fn xcp_client(
                 if server_protocol.is_none() && elf_reader.is_xcplite_target() {
                     warn!("The ELF links an xcplite without the xcp_proto section: the A2L states xcp_registry's MAX_CTO, MAX_DTO and timestamp, which may not be the server's");
                 }
+
+                // The identification field type the server sends (issue 364, below), where it is known
+                ident_field = elf_reader::ident_field_for(server_protocol.as_ref(), elf_reader.is_xcplite_target());
 
                 // Get the EPK string and address from debug_data and set it in the registry application version information, if available
                 elf_reader.register_epk_addr_info(&mut reg, segment_relative, verbose);
@@ -931,8 +937,11 @@ async fn xcp_client(
                 // what it is built with -- 248, 1024 and 1 ns by default -- and the runtime route
                 // writes that. The ELF's xcp_proto record carries the answers, so the offline A2L
                 // states them too. One that cannot be corrected is not left behind to misstate them.
-                if let Some(server) = &server_protocol {
-                    elf_reader::fix_protocol_layer(&a2l_path, server).inspect_err(|_| {
+                // Added to upstream (issue 364). xcp_registry also states IDENTIFICATION_FIELD_TYPE_
+                // RELATIVE_BYTE for every server, where xcplite sends a 4 byte header
+                // (RELATIVE_WORD_ALIGNED) by default. The same rewrite states the server's.
+                if server_protocol.is_some() || ident_field.is_some() {
+                    elf_reader::fix_server_facts(&a2l_path, server_protocol.as_ref(), ident_field).inspect_err(|_| {
                         let _ = std::fs::remove_file(&a2l_path);
                     })?;
                 }

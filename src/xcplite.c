@@ -184,20 +184,35 @@ const uint16_t XCPLITE__AXSDD = XCP_DRIVER_VERSION;
 /* XCPlite protocol parameters (xcp_proto)                                  */
 /****************************************************************************/
 
-// What this server answers to CONNECT (MAX_CTO, MAX_DTO) and to GET_DAQ_RESOLUTION_INFO
-// (TIMESTAMP_MODE, TIMESTAMP_TICKS), as four uint16_t in that order and the target's byte order,
-// in a section of their own. An A2L created from the ELF instead of by this server (xcpclient
-// --elf --create-a2l) has no other way to learn them: the writer xcpclient uses states literals of
-// its own. The record is built from the definitions both commands answer with, so it cannot say
-// anything they do not.
+// What this server answers to CONNECT (MAX_CTO, MAX_DTO), to GET_DAQ_RESOLUTION_INFO
+// (TIMESTAMP_MODE, TIMESTAMP_TICKS) and to GET_DAQ_PROCESSOR_INFO (the identification field
+// type), as uint16_t words in the target's byte order, in a section of their own. An A2L created
+// from the ELF instead of by this server (xcpclient --elf --create-a2l) has no other way to learn
+// them: the writer xcpclient uses states literals of its own. The record is built from the
+// definitions the commands answer with, so it cannot say anything they do not.
+//
+// Record version 2:
+//   word 0  MAX_CTO (<= 255)                                                    since version 1
+//   word 1  MAX_DTO                                                             since version 1
+//   word 2  TIMESTAMP_MODE: bits 0-2 size, bit 3 FIXED, bits 4-7 unit           since version 1
+//   word 3  TIMESTAMP_TICKS                                                     since version 1
+//   word 4  0xA500 | the identification field type in bits 7-6, where the       since version 2
+//           GET_DAQ_PROCESSOR_INFO key byte has it: 0xA540 RELATIVE_BYTE, 0xA5C0
+//           RELATIVE_WORD_ALIGNED. Only those bits: the address extension bits of the key byte
+//           are not in the record, and bits 0-5 are 0.
+// Words are only appended, never moved or given another meaning. A reader needs words 0-3 and reads
+// a later word only when the section holds it. Word 4 is valid only with its high byte 0xA5 and
+// bits 0-5 clear: a section the linker pads, or two version 1 records next to each other, give
+// another value there, and that, like a type 0 (0xA500), reads as "not stated".
 #define XCP_TIMESTAMP_MODE (XCP_TIMESTAMP_UNIT | DAQ_TIMESTAMP_FIXED | DAQ_TIMESTAMP_DWORD)
+#define XCP_PROTO_IDENT_WORD (0xA500 | XCP_DAQ_KEY_HDR)
 #if defined(__ELF__)
 #define XCP_PROTO_SECTION_ATTR __attribute__((section("xcp_proto"), used))
 #elif defined(__APPLE__)
 #define XCP_PROTO_SECTION_ATTR __attribute__((section("__DATA,xcp_proto"), used))
 #endif
 #ifdef XCP_PROTO_SECTION_ATTR
-static const uint16_t gXcpProtocolInfo[4] XCP_PROTO_SECTION_ATTR = {XCPTL_MAX_CTO_SIZE, XCPTL_MAX_DTO_SIZE, XCP_TIMESTAMP_MODE, (uint16_t)XCP_TIMESTAMP_TICKS};
+static const uint16_t gXcpProtocolInfo[5] XCP_PROTO_SECTION_ATTR = {XCPTL_MAX_CTO_SIZE, XCPTL_MAX_DTO_SIZE, XCP_TIMESTAMP_MODE, (uint16_t)XCP_TIMESTAMP_TICKS, XCP_PROTO_IDENT_WORD};
 #endif
 
 /****************************************************************************/
@@ -1112,8 +1127,7 @@ tXcpEventId XcpFindEvent(const char *name) {
 /* Data Acquisition Setup                                                    */
 /****************************************************************************/
 
-// ODT header size is hardcoded to 4 bytes
-#define ODT_HEADER_SIZE 4 // ODT,align,DAQ_WORD header
+// ODT header size: ODT_HEADER_SIZE in xcp_cfg.h, 4 (ODT,align,DAQ_WORD) or 2 (ODT,DAQ_BYTE)
 
 // Timestamp size is hardcoded to 4 bytes
 #define ODT_TIMESTAMP_SIZE 4
@@ -2768,11 +2782,7 @@ static uint8_t XcpAsyncCommand(bool async, const uint32_t *cmdBuf, uint8_t cmdLe
             // DTO identification field type:
             //   DAQ_HDR_ODT_DAQB: Relative ODT number (BYTE), absolute DAQ list number (BYTE)
             //   DAQ_HDR_ODT_FIL_DAQW: Relative ODT number (BYTE), fill byte, absolute DAQ list number (WORD, aligned)
-#if ODT_HEADER_SIZE == 4
-            CRM_GET_DAQ_PROCESSOR_INFO_DAQ_KEY_BYTE = DAQ_HDR_ODT_FIL_DAQW;
-#else
-            CRM_GET_DAQ_PROCESSOR_INFO_DAQ_KEY_BYTE = DAQ_HDR_ODT_DAQB;
-#endif
+            CRM_GET_DAQ_PROCESSOR_INFO_DAQ_KEY_BYTE = XCP_DAQ_KEY_HDR; // from ODT_HEADER_SIZE, as the A2L and xcp_proto state it
 #ifdef XCP_ENABLE_DAQ_ADDREXT
             CRM_GET_DAQ_PROCESSOR_INFO_DAQ_KEY_BYTE |= DAQ_EXT_FREE;
 #else

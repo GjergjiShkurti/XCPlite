@@ -138,6 +138,27 @@ static const tXcpCalSegDescriptor calseg__params
 the type (segment vs. block). xcpclient reads these to discover all calibration segments and
 their exact layout in memory — without any A2L registration calls in the application code.
 
+#### `xcp_proto` section — what the server answers
+
+xcplite.c places one record of `uint16_t` words, in the target's byte order, into the
+`xcp_proto` section. It holds what the server answers and the writer xcpclient uses cannot know:
+
+| word | content | since |
+|---|---|---|
+| 0 | MAX_CTO (≤ 255), as CONNECT answers it | version 1 |
+| 1 | MAX_DTO | version 1 |
+| 2 | TIMESTAMP_MODE of GET_DAQ_RESOLUTION_INFO: bits 0-2 size, bit 3 FIXED, bits 4-7 unit | version 1 |
+| 3 | TIMESTAMP_TICKS | version 1 |
+| 4 | `0xA500` + the identification field type in bits 7-6, where the GET_DAQ_PROCESSOR_INFO key byte has it: `0xA5C0` RELATIVE_WORD_ALIGNED (`ODT_HEADER_SIZE` 4), `0xA540` RELATIVE_BYTE (2) | version 2 |
+
+Words are only appended. A reader needs words 0-3 and reads a later word only when the section
+holds it; an odd length is an error. Word 4 is valid only with the high byte `0xA5` and bits 0-5
+clear, and type 0 is not stated: a section padded by the linker, or two version 1 records side by
+side, read as "not stated" instead of as a type. xcpclient writes the record's values into
+`PROTOCOL_LAYER`, `TIMESTAMP_SUPPORTED` and `IDENTIFICATION_FIELD_TYPE_…` of the offline A2L.
+Without word 4, an XCPlite ELF gets `RELATIVE_WORD_ALIGNED` (every XCPlite before the word sent a
+4-byte header), and any other ELF keeps `RELATIVE_BYTE`.
+
 #### Trigger point DWARF scope anchors — `trg__` naming convention
 
 Every event trigger macro emits a **named static local variable** whose name encodes
@@ -230,6 +251,7 @@ xcpclient counts them to know how many individual base addresses to expect.
 |---|---|---|
 | `.xcp_evts` section | `DaqCreateEvent`, `DaqCreateEventInstance`, `DaqCreateAndTriggerEvent` | Discover all events, names, cycle times |
 | `.xcp_cals` section | `CalSegDecl` + `CalSegCreate` | Discover all calibration segments, default page addresses and sizes |
+| `xcp_proto` section | xcplite.c (one record) | MAX_CTO, MAX_DTO, timestamp and DTO identification field of the A2L |
 | DWARF scope of `trg__AAS__name` | `DaqTriggerEvent`, `DaqCreateAndTriggerEvent`, `DaqEventVar` (C) | Find stack-local and absolute variables — ext=0,1: Absolute, ext=2: Stack |
 | DWARF scope of `trg__AASD__name` | `DaqTriggerEventExt` | Same plus a dynamic base pointer slot — ext=3: Dynamic |
 | DWARF scope of `trg__AASDD__name` | `DaqEventVar` / `DaqEventAtVar` (C++) | Per-variable dynamic slots — ext=3+: one per measurement |

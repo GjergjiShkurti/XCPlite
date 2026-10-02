@@ -38,6 +38,18 @@
 #define XCP_A2L_FILENAME_MAX_LENGTH 255
 
 /*----------------------------------------------------------------------------*/
+/* DAQ */
+
+// Size of the DTO identification field (ODT header) in bytes:
+//   4 - relative ODT number (BYTE), fill byte, absolute DAQ list number (WORD, aligned)
+//   2 - relative ODT number (BYTE), absolute DAQ list number (BYTE), at most 256 DAQ lists
+// GET_DAQ_PROCESSOR_INFO, the A2L this server writes and the xcp_proto record all state the value
+// from here (XCP_DAQ_KEY_HDR and XCP_A2L_IDENT in xcp.h)
+#ifndef ODT_HEADER_SIZE
+#define ODT_HEADER_SIZE 4
+#endif
+
+/*----------------------------------------------------------------------------*/
 /* DAQ event management */
 
 // Maximum length of event name without the trailing 0

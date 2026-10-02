@@ -173,43 +173,19 @@ impl ElfReader {
         }
     }
 
-    /// What the xcplite server linked into the ELF answers to CONNECT and GET_DAQ_RESOLUTION_INFO,
-    /// from the record xcplite.c places in the xcp_proto section: MAX_CTO, MAX_DTO, TIMESTAMP_MODE
-    /// and TIMESTAMP_TICKS, four u16 in the target's byte order. None when the ELF has no such
-    /// section -- no xcplite, or one from before the record existed. A record the A2L cannot state
-    /// is an error rather than a value guessed past.
+    /// What the server linked into the ELF answers to CONNECT, GET_DAQ_RESOLUTION_INFO and
+    /// GET_DAQ_PROCESSOR_INFO, from the record in the xcp_proto section (`parse_server_protocol`).
+    /// None when the ELF has no such section -- no xcplite, or one from before the record existed.
+    /// A record the A2L cannot state is an error rather than a value guessed past.
     pub fn server_protocol(&self) -> Result<Option<ServerProtocol>, Box<dyn Error>> {
         let Some(data) = self.debug_data.xcp_proto_data.as_ref() else {
             return Ok(None);
         };
-        if data.len() < 8 {
-            return Err(format!(
-                "the xcp_proto section holds {} bytes, short of the 8 of MAX_CTO, MAX_DTO, TIMESTAMP_MODE and TIMESTAMP_TICKS",
-                data.len()
-            )
-            .into());
-        }
-        let is_le = self.debug_data.is_little_endian;
-        let rd_u16 = |o: usize| -> u16 {
-            let a: [u8; 2] = data[o..o + 2].try_into().unwrap();
-            if is_le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) }
-        };
-        let server = ServerProtocol {
-            max_cto: rd_u16(0),
-            max_dto: rd_u16(2),
-            timestamp_mode: rd_u16(4),
-            timestamp_ticks: rd_u16(6),
-        };
-        // CONNECT answers MAX_CTO in one byte, and the AML declares it a uchar
-        if server.max_cto > 0xFF {
-            return Err(format!("the xcp_proto section states a MAX_CTO of {}, which CONNECT cannot answer in one byte", server.max_cto).into());
-        }
-        if let Err(e) = server.timestamp_supported() {
-            return Err(format!(
-                "the xcp_proto section states TIMESTAMP_MODE 0x{:X}, with a {} the A2L has no name for",
-                server.timestamp_mode, e
-            )
-            .into());
+        let server = parse_server_protocol(data, self.debug_data.is_little_endian)?;
+        match server.ident_keyword() {
+            Some(ident) => info!("xcp_proto record version 2: the server sends IDENTIFICATION_FIELD_TYPE_{}", ident),
+            None if data.len() >= 10 => info!("xcp_proto word 4 is not a valid identification field word: the record does not state the type"),
+            None => debug!("xcp_proto record version 1: no identification field type"),
         }
         Ok(Some(server))
     }
@@ -2197,17 +2173,115 @@ fn runs_where_loaded(addr: u64, segments: &[LoadSegment]) -> bool {
     segments.iter().any(|s| s.vaddr == s.paddr && addr >= s.vaddr && addr - s.vaddr < s.filesz)
 }
 
-/// What an xcplite server answers to CONNECT (MAX_CTO, MAX_DTO) and to GET_DAQ_RESOLUTION_INFO
-/// (TIMESTAMP_MODE, TIMESTAMP_TICKS), as the record in its xcp_proto section states it. xcplite.c
-/// builds the record from the definitions both commands answer with.
+/// What a server answers to CONNECT (MAX_CTO, MAX_DTO), to GET_DAQ_RESOLUTION_INFO
+/// (TIMESTAMP_MODE, TIMESTAMP_TICKS) and, from record version 2 on, to GET_DAQ_PROCESSOR_INFO (the
+/// identification field type), as the record in its xcp_proto section states it. xcplite.c builds
+/// the record from the definitions the commands answer with; the layout is documented there.
+#[derive(Debug, PartialEq)]
 pub struct ServerProtocol {
     pub max_cto: u16,
     pub max_dto: u16,
     pub timestamp_mode: u16,
     pub timestamp_ticks: u16,
+    /// The identification field type, bits 7-6 of the GET_DAQ_PROCESSOR_INFO key byte (1..=3).
+    /// None when the record does not state it: version 1, or a word 4 without its marker.
+    pub ident_field_type: Option<u8>,
+}
+
+/// Word 4 of the xcp_proto record with the type bits masked out (XCP_PROTO_IDENT_WORD in xcplite.c)
+const XCP_PROTO_IDENT_MARKER: u16 = 0xA500;
+
+/// Parse the xcp_proto record: words 0-3 are required, word 4 is read when the section holds it.
+/// The length alone never makes word 4 valid -- a linker can pad a version 1 record, and two
+/// version 1 records can sit next to each other -- only the marker 0xA5 in its high byte, with
+/// bits 0-5 clear and a type that is not 0, does.
+pub fn parse_server_protocol(data: &[u8], is_le: bool) -> Result<ServerProtocol, String> {
+    if data.len() < 8 {
+        return Err(format!(
+            "the xcp_proto section holds {} bytes, short of the 8 of MAX_CTO, MAX_DTO, TIMESTAMP_MODE and TIMESTAMP_TICKS",
+            data.len()
+        ));
+    }
+    if data.len() % 2 != 0 {
+        return Err(format!("the xcp_proto section holds {} bytes, which is not a whole number of 16 bit words", data.len()));
+    }
+    let rd_u16 = |o: usize| -> u16 {
+        let a: [u8; 2] = data[o..o + 2].try_into().unwrap();
+        if is_le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) }
+    };
+    let ident_field_type = if data.len() >= 10 {
+        let word = rd_u16(8);
+        let field_type = ((word >> 6) & 0x3) as u8;
+        (word & 0xFF3F == XCP_PROTO_IDENT_MARKER && field_type != 0).then_some(field_type)
+    } else {
+        None
+    };
+    let server = ServerProtocol {
+        max_cto: rd_u16(0),
+        max_dto: rd_u16(2),
+        timestamp_mode: rd_u16(4),
+        timestamp_ticks: rd_u16(6),
+        ident_field_type,
+    };
+    // CONNECT answers MAX_CTO in one byte, and the AML declares it a uchar
+    if server.max_cto > 0xFF {
+        return Err(format!(
+            "the xcp_proto section states a MAX_CTO of {}, which CONNECT cannot answer in one byte",
+            server.max_cto
+        ));
+    }
+    if let Err(e) = server.timestamp_supported() {
+        return Err(format!(
+            "the xcp_proto section states TIMESTAMP_MODE 0x{:X}, with a {} the A2L has no name for",
+            server.timestamp_mode, e
+        ));
+    }
+    Ok(server)
+}
+
+/// The A2L keyword, after IDENTIFICATION_FIELD_TYPE_, for bits 7-6 of a GET_DAQ_PROCESSOR_INFO
+/// key byte. Type 0 (ABSOLUTE) is not one the xcp_proto record states, and reads as unknown.
+pub fn ident_keyword(field_type: u8) -> Option<&'static str> {
+    match field_type {
+        1 => Some("RELATIVE_BYTE"),
+        2 => Some("RELATIVE_WORD"),
+        3 => Some("RELATIVE_WORD_ALIGNED"),
+        _ => None,
+    }
+}
+
+/// The IDENTIFICATION_FIELD_TYPE an A2L created from the ELF states, and how sure that is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IdentField {
+    /// The keyword after IDENTIFICATION_FIELD_TYPE_
+    pub keyword: &'static str,
+    /// True when the ELF's xcp_proto record states it. A rewrite that cannot be made is then an
+    /// error, as for PROTOCOL_LAYER. False when it is inferred (an xcplite from before the record
+    /// stated it): the A2L is then left as written, with a warning.
+    pub stated: bool,
+}
+
+/// The identification field type an A2L created from the ELF states (issue 364): what the
+/// xcp_proto record states; else, for an xcplite, RELATIVE_WORD_ALIGNED -- every xcplite whose
+/// record does not state it sends the 4 byte header, its ODT_HEADER_SIZE was fixed at 4; else
+/// None, nothing is known, and the A2L keeps what xcp_registry writes (RELATIVE_BYTE).
+pub fn ident_field_for(server: Option<&ServerProtocol>, xcplite_target: bool) -> Option<IdentField> {
+    match server.and_then(|s| s.ident_keyword()) {
+        Some(keyword) => Some(IdentField { keyword, stated: true }),
+        None if xcplite_target => Some(IdentField {
+            keyword: "RELATIVE_WORD_ALIGNED",
+            stated: false,
+        }),
+        None => None,
+    }
 }
 
 impl ServerProtocol {
+    /// The A2L keyword of the identification field type the record states, if it states one
+    pub fn ident_keyword(&self) -> Option<&'static str> {
+        self.ident_field_type.and_then(ident_keyword)
+    }
+
     /// The body of TIMESTAMP_SUPPORTED, in XCP_104.aml's terms: the ticks, the size, the unit, and
     /// TIMESTAMP_FIXED when the server always sends a timestamp. Err for a code the AML has no name for.
     fn timestamp_supported(&self) -> Result<String, String> {
@@ -2241,17 +2315,26 @@ impl ServerProtocol {
     }
 }
 
-/// Rewrite, in the A2L at `path`, what xcp_registry states about the server -- MAX_CTO and MAX_DTO
-/// in PROTOCOL_LAYER, and TIMESTAMP_SUPPORTED -- with what the server answers (issue 224).
-/// xcp_registry writes the same literals for every server: 252, 1468, and ticks of 1 us.
+/// Rewrite, in the A2L at `path`, what xcp_registry states about the server with what the server
+/// does: MAX_CTO and MAX_DTO in PROTOCOL_LAYER and TIMESTAMP_SUPPORTED (issue 224) when `server` is
+/// given, and the IDENTIFICATION_FIELD_TYPE in the DAQ block (issue 364) when `ident` is given.
+/// xcp_registry writes the same literals for every server: 252, 1468, ticks of 1 us and RELATIVE_BYTE.
 ///
-/// Both blocks are found among the A2L's tokens, outside quoted strings and comments, as the
-/// identifier passes find a measurement (issues 258, 294). Patterns over the whole text counted a
+/// Every block and keyword is found among the A2L's tokens, outside quoted strings and comments, as
+/// the identifier passes find a measurement (issues 258, 294). Patterns over the whole text counted a
 /// measurement's description holding `/begin TIMESTAMP_SUPPORTED` as a second block, and the A2L
 /// was refused (issue 314).
-pub fn fix_protocol_layer(path: &std::path::Path, server: &ServerProtocol) -> Result<(), Box<dyn Error>> {
+pub fn fix_server_facts(path: &std::path::Path, server: Option<&ServerProtocol>, ident: Option<IdentField>) -> Result<(), Box<dyn Error>> {
     let text = std::fs::read_to_string(path)?;
-    let tokens = a2l_tokens(&text);
+    let text = server_facts_text(&text, server, ident).map_err(|e| format!("{} has {}", path.display(), e))?;
+    std::fs::write(path, text.as_bytes())?;
+    Ok(())
+}
+
+/// `fix_server_facts` on the A2L text. Err when a stated fact has not exactly one place to go;
+/// an inferred identification field without one leaves the text as it is, with a warning.
+fn server_facts_text(text: &str, server: Option<&ServerProtocol>, ident: Option<IdentField>) -> Result<String, String> {
+    let tokens = a2l_tokens(text);
     // Where each `/begin <name>` block's body starts: the token after its name.
     let bodies = |name: &str| -> Vec<usize> {
         tokens
@@ -2261,40 +2344,75 @@ pub fn fix_protocol_layer(path: &std::path::Path, server: &ServerProtocol) -> Re
             .map(|(at, _)| at + 2)
             .collect()
     };
-    let (layers, stamps) = (bodies("PROTOCOL_LAYER"), bodies("TIMESTAMP_SUPPORTED"));
-    if layers.len() != 1 || stamps.len() != 1 {
-        return Err(format!(
-            "{} has {} PROTOCOL_LAYER and {} TIMESTAMP_SUPPORTED, not the one of each the server's MAX_CTO, MAX_DTO and timestamp go into",
-            path.display(),
-            layers.len(),
-            stamps.len()
-        )
-        .into());
+    // The body of the block that starts at `body`: every token before its `/end <name>`.
+    let body_of = |body: usize, name: &str| -> Option<&[A2lToken]> {
+        let rest = &tokens[body..];
+        rest.windows(2).position(|pair| pair[0].text == "/end" && pair[1].text == name).map(|end| &rest[..end])
+    };
+    let mut edits = Vec::new();
+    if let Some(server) = server {
+        let (layers, stamps) = (bodies("PROTOCOL_LAYER"), bodies("TIMESTAMP_SUPPORTED"));
+        if layers.len() != 1 || stamps.len() != 1 {
+            return Err(format!(
+                "{} PROTOCOL_LAYER and {} TIMESTAMP_SUPPORTED, not the one of each the server's MAX_CTO, MAX_DTO and timestamp go into",
+                layers.len(),
+                stamps.len()
+            ));
+        }
+        // PROTOCOL_LAYER's parameters: the version and the timeouts T1..T7, then MAX_CTO and MAX_DTO.
+        let layer = &tokens[layers[0]..];
+        let (Some(cto), Some(dto)) = (layer.get(8).filter(|t| !t.quoted()), layer.get(9).filter(|t| !t.quoted())) else {
+            return Err("a PROTOCOL_LAYER with no MAX_CTO and MAX_DTO after its version and seven timeouts".into());
+        };
+        let Some(stamp) = body_of(stamps[0], "TIMESTAMP_SUPPORTED").filter(|b| !b.is_empty() && !b.iter().any(|t| t.text == "/begin" || t.text == "/end")) else {
+            return Err("a TIMESTAMP_SUPPORTED that is empty or not closed".into());
+        };
+        let timestamp = server.timestamp_supported()?;
+        edits.push((cto.start..cto.end(), server.max_cto.to_string()));
+        edits.push((dto.start..dto.end(), server.max_dto.to_string()));
+        edits.push((stamp[0].start..stamp[stamp.len() - 1].end(), timestamp.clone()));
+        info!(
+            "PROTOCOL_LAYER and TIMESTAMP_SUPPORTED written as the server answers: MAX_CTO {}, MAX_DTO {}, timestamp {}",
+            server.max_cto, server.max_dto, timestamp
+        );
     }
-    // PROTOCOL_LAYER's parameters: the version and the timeouts T1..T7, then MAX_CTO and MAX_DTO.
-    let layer = &tokens[layers[0]..];
-    let (Some(cto), Some(dto)) = (layer.get(8).filter(|t| !t.quoted()), layer.get(9).filter(|t| !t.quoted())) else {
-        return Err(format!("{}'s PROTOCOL_LAYER has no MAX_CTO and MAX_DTO after its version and seven timeouts", path.display()).into());
-    };
-    // TIMESTAMP_SUPPORTED's body: every token before its `/end TIMESTAMP_SUPPORTED`.
-    let stamp = &tokens[stamps[0]..];
-    let end = stamp.windows(2).position(|pair| pair[0].text == "/end" && pair[1].text == "TIMESTAMP_SUPPORTED");
-    let Some(end) = end.filter(|&end| end > 0 && !stamp[..end].iter().any(|t| t.text == "/begin" || t.text == "/end")) else {
-        return Err(format!("{}'s TIMESTAMP_SUPPORTED is empty or not closed", path.display()).into());
-    };
-    let timestamp = server.timestamp_supported()?;
-    let mut edits = vec![
-        (cto.start..cto.end(), server.max_cto.to_string()),
-        (dto.start..dto.end(), server.max_dto.to_string()),
-        (stamp[0].start..stamp[end - 1].end(), timestamp.clone()),
-    ];
+    if let Some(ident) = ident {
+        // Only the DAQ block's keyword, as a token of its own: an A2ML that is inlined instead of
+        // included names every IDENTIFICATION_FIELD_TYPE_ value too, in quotes.
+        let blocks = bodies("DAQ");
+        let found: Vec<&A2lToken> = match blocks.as_slice() {
+            [body] => body_of(*body, "DAQ")
+                .unwrap_or_default()
+                .iter()
+                .filter(|t| !t.quoted() && t.text.starts_with("IDENTIFICATION_FIELD_TYPE_"))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let [keyword] = found.as_slice() {
+            edits.push((keyword.start..keyword.end(), format!("IDENTIFICATION_FIELD_TYPE_{}", ident.keyword)));
+            if ident.stated {
+                info!("IDENTIFICATION_FIELD_TYPE_{} written, as the xcp_proto record states it", ident.keyword);
+            } else {
+                info!(
+                    "IDENTIFICATION_FIELD_TYPE_{} written: an xcplite whose xcp_proto record does not state the type sends it",
+                    ident.keyword
+                );
+            }
+        } else {
+            let problem = format!(
+                "{} DAQ block(s) and {} IDENTIFICATION_FIELD_TYPE in it, not the one the server's IDENTIFICATION_FIELD_TYPE_{} goes into",
+                blocks.len(),
+                found.len(),
+                ident.keyword
+            );
+            if ident.stated {
+                return Err(problem);
+            }
+            warn!("The A2L has {problem}: it keeps the identification field type it was written with");
+        }
+    }
     edits.sort_by_key(|(range, _)| range.start);
-    std::fs::write(path, a2l_splice(&text, &edits).as_bytes())?;
-    info!(
-        "PROTOCOL_LAYER and TIMESTAMP_SUPPORTED written as the server answers: MAX_CTO {}, MAX_DTO {}, timestamp {}",
-        server.max_cto, server.max_dto, timestamp
-    );
-    Ok(())
+    Ok(a2l_splice(text, &edits))
 }
 
 /// Added to upstream (issue 276): the XCP IF_DATA description every A2L xcp_registry writes
@@ -2930,8 +3048,14 @@ mod a2l_token_tests {
         );
         let path = std::env::temp_dir().join(format!("xcpclient_314_{}.a2l", std::process::id()));
         std::fs::write(&path, &text).unwrap();
-        let server = ServerProtocol { max_cto: 248, max_dto: 1024, timestamp_mode: 0x04 | 0x08, timestamp_ticks: 1 };
-        let fixed = fix_protocol_layer(&path, &server).map(|_| std::fs::read_to_string(&path).unwrap());
+        let server = ServerProtocol {
+            max_cto: 248,
+            max_dto: 1024,
+            timestamp_mode: 0x04 | 0x08,
+            timestamp_ticks: 1,
+            ident_field_type: None,
+        };
+        let fixed = fix_server_facts(&path, Some(&server), None).map(|_| std::fs::read_to_string(&path).unwrap());
         let _ = std::fs::remove_file(&path);
         let fixed = fixed.unwrap();
         assert!(fixed.contains(named));
@@ -3131,5 +3255,182 @@ mod tests {
         assert!(!elf.debug_data.load_segments.is_empty());
         assert_ne!(elf.debug_data.epk_addr, 0);
         assert!(runs_where_loaded(elf.debug_data.epk_addr, &elf.debug_data.load_segments));
+    }
+
+    // an xcp_proto record of the given words, in the given byte order
+    fn proto(words: &[u16], little_endian: bool) -> Vec<u8> {
+        words.iter().flat_map(|w| if little_endian { w.to_le_bytes() } else { w.to_be_bytes() }).collect()
+    }
+
+    const PROTO_V1: [u16; 4] = [248, 1024, 0x0C, 1]; // xcplite's defaults: DWORD, FIXED, 1 ns
+
+    #[test]
+    fn a_version_1_record_states_no_identification_field() {
+        let server = parse_server_protocol(&proto(&PROTO_V1, true), true).unwrap();
+        assert_eq!((server.max_cto, server.max_dto, server.timestamp_mode, server.timestamp_ticks), (248, 1024, 0x0C, 1));
+        assert_eq!(server.ident_field_type, None);
+        assert_eq!(server.ident_keyword(), None);
+    }
+
+    #[test]
+    fn a_version_2_record_states_the_identification_field_in_word_4() {
+        for little_endian in [true, false] {
+            let server = parse_server_protocol(&proto(&[248, 1024, 0x0C, 1, 0xA5C0], little_endian), little_endian).unwrap();
+            assert_eq!(server.ident_keyword(), Some("RELATIVE_WORD_ALIGNED"));
+            let server = parse_server_protocol(&proto(&[255, 250, 0x34, 1, 0xA540], little_endian), little_endian).unwrap();
+            assert_eq!(server.ident_keyword(), Some("RELATIVE_BYTE"));
+            assert_eq!((server.max_cto, server.max_dto), (255, 250));
+        }
+        // a word appended later does not change what word 4 says
+        let server = parse_server_protocol(&proto(&[248, 1024, 0x0C, 1, 0xA580, 0x1234], true), true).unwrap();
+        assert_eq!(server.ident_keyword(), Some("RELATIVE_WORD"));
+    }
+
+    #[test]
+    fn word_4_without_its_marker_states_nothing() {
+        let unknown = |words: &[u16]| parse_server_protocol(&proto(words, true), true).unwrap().ident_field_type;
+        // a version 1 record the linker padded to 10, 12 or 16 bytes
+        assert_eq!(unknown(&[248, 1024, 0x0C, 1, 0]), None);
+        assert_eq!(unknown(&[248, 1024, 0x0C, 1, 0, 0, 0, 0]), None);
+        // two version 1 records next to each other: word 4 is the second one's MAX_CTO
+        assert_eq!(unknown(&[248, 1024, 0x0C, 1, 0xFF, 1024, 0x0C, 1]), None);
+        assert_eq!(unknown(&[248, 1024, 0x0C, 1, 0xC0, 1024, 0x0C, 1]), None);
+        // the marker with type 0, with reserved bits set, or in the wrong byte order
+        assert_eq!(unknown(&[248, 1024, 0x0C, 1, 0xA500]), None);
+        assert_eq!(unknown(&[248, 1024, 0x0C, 1, 0xA5F0]), None);
+        assert_eq!(unknown(&[248, 1024, 0x0C, 1, 0xC0A5]), None);
+    }
+
+    #[test]
+    fn a_record_short_of_4_words_or_of_whole_words_is_an_error() {
+        assert!(parse_server_protocol(&proto(&PROTO_V1[..3], true), true).unwrap_err().contains("short of the 8"));
+        let mut odd = proto(&[248, 1024, 0x0C, 1], true);
+        odd.push(0xC0);
+        assert!(parse_server_protocol(&odd, true).unwrap_err().contains("9 bytes"));
+        // what was already refused stays refused
+        assert!(parse_server_protocol(&proto(&[256, 1024, 0x0C, 1, 0xA5C0], true), true).is_err());
+        assert!(parse_server_protocol(&proto(&[248, 1024, 0x03, 1, 0xA5C0], true), true).is_err());
+    }
+
+    #[test]
+    fn the_identification_field_types_have_their_a2l_keywords() {
+        assert_eq!(ident_keyword(0), None, "ABSOLUTE is not stated by the record");
+        assert_eq!(ident_keyword(1), Some("RELATIVE_BYTE"));
+        assert_eq!(ident_keyword(2), Some("RELATIVE_WORD"));
+        assert_eq!(ident_keyword(3), Some("RELATIVE_WORD_ALIGNED"));
+        assert_eq!(ident_keyword(4), None);
+    }
+
+    // what xcp_registry writes for an IF_DATA XCP, cut down to the parts the rewrite touches
+    fn daq_a2l_text(daq_blocks: usize) -> String {
+        let daq = "/begin DAQ\n DYNAMIC 0 4 0 OPTIMISATION_TYPE_DEFAULT ADDRESS_EXTENSION_FREE IDENTIFICATION_FIELD_TYPE_RELATIVE_BYTE GRANULARITY_ODT_ENTRY_SIZE_DAQ_BYTE 0xF8 OVERLOAD_INDICATION_PID\n /begin TIMESTAMP_SUPPORTED\n 0x1 SIZE_DWORD UNIT_1US TIMESTAMP_FIXED\n /end TIMESTAMP_SUPPORTED\n /begin EVENT \"e\" \"e\" 0 DAQ 0xFF 0 0 0 CONSISTENCY DAQ /end EVENT\n/end DAQ\n";
+        let mut text = String::from("/begin IF_DATA XCP\n/begin PROTOCOL_LAYER\n 0x104 1000 2000 0 0 0 0 0 252 1468 BYTE_ORDER_MSB_LAST\n/end PROTOCOL_LAYER\n");
+        for _ in 0..daq_blocks {
+            text.push_str(daq);
+        }
+        text.push_str("/end IF_DATA\n/begin MEASUREMENT m \"\" UBYTE NO_COMPU_METHOD 0 0 0 255 /begin IF_DATA XCP /begin DAQ_EVENT VARIABLE /begin DEFAULT_EVENT_LIST EVENT 0 /end DEFAULT_EVENT_LIST /end DAQ_EVENT /end IF_DATA /end MEASUREMENT\n");
+        text
+    }
+
+    const STATED: IdentField = IdentField {
+        keyword: "RELATIVE_WORD_ALIGNED",
+        stated: true,
+    };
+    const INFERRED: IdentField = IdentField {
+        keyword: "RELATIVE_WORD_ALIGNED",
+        stated: false,
+    };
+
+    #[test]
+    fn the_identification_field_of_the_one_daq_block_is_rewritten() {
+        let text = daq_a2l_text(1);
+        for ident in [STATED, INFERRED] {
+            let fixed = server_facts_text(&text, None, Some(ident)).unwrap();
+            assert_eq!(
+                fixed,
+                text.replace("IDENTIFICATION_FIELD_TYPE_RELATIVE_BYTE", "IDENTIFICATION_FIELD_TYPE_RELATIVE_WORD_ALIGNED")
+            );
+        }
+        // with the protocol layer, from one record
+        let server = parse_server_protocol(&proto(&[255, 250, 0x34, 1, 0xA540], true), true).unwrap();
+        let ident = IdentField {
+            keyword: server.ident_keyword().unwrap(),
+            stated: true,
+        };
+        let fixed = server_facts_text(&text, Some(&server), Some(ident)).unwrap();
+        assert!(fixed.contains(" 255 250 BYTE_ORDER_MSB_LAST"));
+        assert!(fixed.contains("0x1 SIZE_DWORD UNIT_1US\n"));
+        assert!(fixed.contains("IDENTIFICATION_FIELD_TYPE_RELATIVE_BYTE"));
+        // nothing to state, nothing changed
+        assert_eq!(server_facts_text(&text, None, None).unwrap(), text);
+    }
+
+    #[test]
+    fn an_inlined_a2ml_does_not_count_as_a_place_for_the_identification_field() {
+        let aml =
+            "/begin A2ML\n enum {\n \"IDENTIFICATION_FIELD_TYPE_ABSOLUTE\" = 0,\n \"IDENTIFICATION_FIELD_TYPE_RELATIVE_BYTE\" = 1\n };\n block \"DAQ\" struct { };\n/end A2ML\n";
+        let text = format!("{aml}{}", daq_a2l_text(1));
+        let fixed = server_facts_text(&text, None, Some(STATED)).unwrap();
+        assert!(fixed.starts_with(aml), "the A2ML is not touched");
+        assert!(fixed.contains("ADDRESS_EXTENSION_FREE IDENTIFICATION_FIELD_TYPE_RELATIVE_WORD_ALIGNED GRANULARITY"));
+    }
+
+    #[test]
+    fn a_daq_block_in_a_description_or_a_comment_is_not_a_place_for_the_identification_field() {
+        let named = r#""/begin DAQ IDENTIFICATION_FIELD_TYPE_ABSOLUTE /end DAQ""#;
+        let measurement = format!("/* /begin DAQ */\n/begin MEASUREMENT d {named} UBYTE NO_COMPU_METHOD 0 0 0 255 /end MEASUREMENT\n");
+        let text = format!("{measurement}{}", daq_a2l_text(1));
+        for ident in [STATED, INFERRED] {
+            let fixed = server_facts_text(&text, None, Some(ident)).unwrap();
+            assert!(fixed.starts_with(&measurement), "the description and the comment are not touched");
+            assert_eq!(
+                fixed,
+                text.replace(
+                    "ADDRESS_EXTENSION_FREE IDENTIFICATION_FIELD_TYPE_RELATIVE_BYTE",
+                    "ADDRESS_EXTENSION_FREE IDENTIFICATION_FIELD_TYPE_RELATIVE_WORD_ALIGNED"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn no_daq_block_or_two_fail_a_stated_identification_field_and_leave_an_inferred_one() {
+        for blocks in [0, 2] {
+            let text = daq_a2l_text(blocks);
+            let err = server_facts_text(&text, None, Some(STATED)).unwrap_err();
+            assert!(err.starts_with(&format!("{blocks} DAQ block(s) and 0 IDENTIFICATION_FIELD_TYPE")), "{err}");
+            assert_eq!(server_facts_text(&text, None, Some(INFERRED)).unwrap(), text);
+        }
+        // a DAQ block with the keyword twice
+        let text = daq_a2l_text(1).replace("OVERLOAD_INDICATION_PID", "IDENTIFICATION_FIELD_TYPE_RELATIVE_BYTE");
+        assert!(
+            server_facts_text(&text, None, Some(STATED))
+                .unwrap_err()
+                .starts_with("1 DAQ block(s) and 2 IDENTIFICATION_FIELD_TYPE")
+        );
+        assert_eq!(server_facts_text(&text, None, Some(INFERRED)).unwrap(), text);
+    }
+
+    #[test]
+    fn the_identification_field_is_the_records_else_an_xcplites_else_unknown() {
+        let v2 = parse_server_protocol(&proto(&[255, 250, 0x34, 1, 0xA540], true), true).unwrap();
+        let v1 = parse_server_protocol(&proto(&PROTO_V1, true), true).unwrap();
+        let byte = IdentField {
+            keyword: "RELATIVE_BYTE",
+            stated: true,
+        };
+        // the record states it, on any target
+        assert_eq!(ident_field_for(Some(&v2), true), Some(byte));
+        assert_eq!(ident_field_for(Some(&v2), false), Some(byte));
+        // an xcplite without a record that states it: the 4 byte header every such xcplite sends
+        assert_eq!(ident_field_for(Some(&v1), true), Some(INFERRED));
+        assert_eq!(ident_field_for(None, true), Some(INFERRED));
+        // any other target: not known
+        assert_eq!(ident_field_for(Some(&v1), false), None);
+        assert_eq!(ident_field_for(None, false), None);
+        // the checked-in xcplite example is from before the record: inferred
+        let elf = ElfReader::new(XCPLITE_ELF, 0, usize::MAX).expect("the xcplite example ELF loads");
+        let server = elf.server_protocol().unwrap();
+        assert_eq!(ident_field_for(server.as_ref(), elf.is_xcplite_target()), Some(INFERRED));
     }
 }

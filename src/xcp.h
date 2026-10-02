@@ -387,6 +387,18 @@
 #define DAQ_HDR_ODT_DAQW (2 << 6)
 #define DAQ_HDR_ODT_FIL_DAQW (3 << 6)
 
+/* The identification field this server sends, from ODT_HEADER_SIZE (xcp_cfg.h): the header bits of the
+   GET_DAQ_PROCESSOR_INFO key byte, and the same as an A2L keyword (IDENTIFICATION_FIELD_TYPE_<...>) */
+#if ODT_HEADER_SIZE == 4
+#define XCP_DAQ_KEY_HDR DAQ_HDR_ODT_FIL_DAQW
+#define XCP_A2L_IDENT "RELATIVE_WORD_ALIGNED"
+#elif ODT_HEADER_SIZE == 2
+#define XCP_DAQ_KEY_HDR DAQ_HDR_ODT_DAQB
+#define XCP_A2L_IDENT "RELATIVE_BYTE"
+#else
+#error "ODT_HEADER_SIZE must be 4 or 2"
+#endif
+
 /*-------------------------------------------------------------------------*/
 /* GET_DAQ_RESOLUTION_INFO */
 

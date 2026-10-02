@@ -45,6 +45,18 @@ byte order (100 000 000 ns is `100 6`, 100 ms). A record with 0 is a sporadic ev
 Events made with `DaqCreateEventExt` therefore carry their cycle in the offline A2L as they do
 in the runtime one.
 
+### What the server answers
+
+The writer xcpclient uses states the same `PROTOCOL_LAYER` sizes (252, 1468), timestamp
+(1 us, fixed) and `IDENTIFICATION_FIELD_TYPE_RELATIVE_BYTE` for every server. xcpclient
+replaces them with the values of the ELF's `xcp_proto` record (layout in
+[docs/TECHNICAL.md](../../docs/TECHNICAL.md#xcp_proto-section--what-the-server-answers)).
+The identification field type comes from word 4 of a version 2 record. Without it, an XCPlite
+ELF gets `RELATIVE_WORD_ALIGNED`, the 4-byte header XCPlite sends, and the A2L keeps its text with
+a warning if it has not exactly one DAQ block to write it into. Any other ELF without word 4 keeps
+`RELATIVE_BYTE`. A value from the record that has no single place in the A2L deletes the A2L and
+fails the run.
+
 ### ELFs that do not link XCPlite
 
 An ELF without an `XCPLITE__<signature>` variable is a target that is not XCPlite — for

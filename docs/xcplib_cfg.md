@@ -137,6 +137,7 @@ This section describes the XCP protocol layer configuration parameters in xcp_cf
 
 | Parameter | Description |
 |-----------|-------------|
+| `ODT_HEADER_SIZE` | Size of the DTO identification field: 4 (relative ODT byte, fill byte, DAQ list word, `RELATIVE_WORD_ALIGNED`) or 2 (relative ODT byte, DAQ list byte, `RELATIVE_BYTE`, at most 256 DAQ lists). GET_DAQ_PROCESSOR_INFO, the A2L the server writes and the `xcp_proto` record state it (default: 4) |
 | `XCP_MAX_EVENT_COUNT` | Maximum number of DAQ events. Must be even. Optimizes DAQ list to event association lookup (default: 256) |
 | `XCP_DAQ_MEM_SIZE` | Static memory allocation for DAQ tables. Each ODT entry needs 5 bytes, each DAQ list 12 bytes, each ODT 8 bytes |
 | `XCP_ENABLE_DAQ_RESUME` | Enables DAQ resume mode functionality |
