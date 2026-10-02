@@ -102,8 +102,16 @@ pub(crate) fn get_location_attribute(
     match loc_attr {
         gimli::AttributeValue::Exprloc(expression) => evaluate_exprloc(debug_data_reader, expression, encoding, current_unit),
         gimli::AttributeValue::LocationListsRef(offset) => evaluate_location_list(debug_data_reader, offset, encoding, current_unit),
+        // DW_FORM_loclistx (DWARF 5): an index into the unit's offset table in .debug_loclists
+        gimli::AttributeValue::DebugLocListsIndex(index) => {
+            let (unit_header, _) = &debug_data_reader.units[current_unit];
+            let unit = debug_data_reader.dwarf.unit(*unit_header).ok()?;
+            let offset = debug_data_reader.dwarf.locations_offset(&unit, index).ok()?;
+            evaluate_location_list(debug_data_reader, offset, encoding, current_unit)
+        }
         _ => {
-            log::error!("get_location_attribute: Unexpected location attribute type: {loc_attr:#?}");
+            // A location form this reader does not know is not a user error: the variable is just not measurable
+            log::debug!("get_location_attribute: unsupported location attribute form: {loc_attr:?}");
             None
         }
     }
