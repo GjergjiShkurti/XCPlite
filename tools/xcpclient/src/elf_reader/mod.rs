@@ -2033,25 +2033,52 @@ impl ServerProtocol {
 /// Rewrite, in the A2L at `path`, what xcp_registry states about the server -- MAX_CTO and MAX_DTO
 /// in PROTOCOL_LAYER, and TIMESTAMP_SUPPORTED -- with what the server answers (issue 224).
 /// xcp_registry writes the same literals for every server: 252, 1468, and ticks of 1 us.
+///
+/// Both blocks are found among the A2L's tokens, outside quoted strings and comments, as the
+/// identifier passes find a measurement (issues 258, 294). Patterns over the whole text counted a
+/// measurement's description holding `/begin TIMESTAMP_SUPPORTED` as a second block, and the A2L
+/// was refused (issue 314).
 pub fn fix_protocol_layer(path: &std::path::Path, server: &ServerProtocol) -> Result<(), Box<dyn Error>> {
     let text = std::fs::read_to_string(path)?;
-    // PROTOCOL_LAYER's parameters: the version and the timeouts T1..T7, then MAX_CTO and MAX_DTO.
-    let layer = Regex::new(r"(/begin\s+PROTOCOL_LAYER\s+(?:\S+\s+){8})\S+(\s+)\S+")?;
-    let stamp = Regex::new(r"(?s)(/begin\s+TIMESTAMP_SUPPORTED\s+).*?(\s+/end\s+TIMESTAMP_SUPPORTED)")?;
-    let (layers, stamps) = (layer.find_iter(&text).count(), stamp.find_iter(&text).count());
-    if layers != 1 || stamps != 1 {
+    let tokens = a2l_tokens(&text);
+    // Where each `/begin <name>` block's body starts: the token after its name.
+    let bodies = |name: &str| -> Vec<usize> {
+        tokens
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| pair[0].text == "/begin" && pair[1].text == name)
+            .map(|(at, _)| at + 2)
+            .collect()
+    };
+    let (layers, stamps) = (bodies("PROTOCOL_LAYER"), bodies("TIMESTAMP_SUPPORTED"));
+    if layers.len() != 1 || stamps.len() != 1 {
         return Err(format!(
             "{} has {} PROTOCOL_LAYER and {} TIMESTAMP_SUPPORTED, not the one of each the server's MAX_CTO, MAX_DTO and timestamp go into",
             path.display(),
-            layers,
-            stamps
+            layers.len(),
+            stamps.len()
         )
         .into());
     }
+    // PROTOCOL_LAYER's parameters: the version and the timeouts T1..T7, then MAX_CTO and MAX_DTO.
+    let layer = &tokens[layers[0]..];
+    let (Some(cto), Some(dto)) = (layer.get(8).filter(|t| !t.quoted()), layer.get(9).filter(|t| !t.quoted())) else {
+        return Err(format!("{}'s PROTOCOL_LAYER has no MAX_CTO and MAX_DTO after its version and seven timeouts", path.display()).into());
+    };
+    // TIMESTAMP_SUPPORTED's body: every token before its `/end TIMESTAMP_SUPPORTED`.
+    let stamp = &tokens[stamps[0]..];
+    let end = stamp.windows(2).position(|pair| pair[0].text == "/end" && pair[1].text == "TIMESTAMP_SUPPORTED");
+    let Some(end) = end.filter(|&end| end > 0 && !stamp[..end].iter().any(|t| t.text == "/begin" || t.text == "/end")) else {
+        return Err(format!("{}'s TIMESTAMP_SUPPORTED is empty or not closed", path.display()).into());
+    };
     let timestamp = server.timestamp_supported()?;
-    let text = layer.replace(&text, |c: &regex::Captures| format!("{}{}{}{}", &c[1], server.max_cto, &c[2], server.max_dto));
-    let text = stamp.replace(&text, |c: &regex::Captures| format!("{}{}{}", &c[1], timestamp, &c[2]));
-    std::fs::write(path, text.as_bytes())?;
+    let mut edits = vec![
+        (cto.start..cto.end(), server.max_cto.to_string()),
+        (dto.start..dto.end(), server.max_dto.to_string()),
+        (stamp[0].start..stamp[end - 1].end(), timestamp.clone()),
+    ];
+    edits.sort_by_key(|(range, _)| range.start);
+    std::fs::write(path, a2l_splice(&text, &edits).as_bytes())?;
     info!(
         "PROTOCOL_LAYER and TIMESTAMP_SUPPORTED written as the server answers: MAX_CTO {}, MAX_DTO {}, timestamp {}",
         server.max_cto, server.max_dto, timestamp
@@ -2667,6 +2694,27 @@ mod a2l_token_tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(a2l_address_extension(blocks[0]), Some(XCP_ADDR_EXT_ID));
         assert!(blocks[0].iter().any(|t| t.text == "READ_WRITE"));
+    }
+
+    /// Added to upstream (issue 314): the server's values go into the real blocks, and a description
+    /// naming them is neither counted nor changed.
+    #[test]
+    fn the_protocol_layer_is_found_outside_strings() {
+        let named = r#""/begin PROTOCOL_LAYER 0x0104 1 2 3 4 5 6 7 8 9 /end PROTOCOL_LAYER, /begin TIMESTAMP_SUPPORTED 0x1 SIZE_DWORD UNIT_1US /end TIMESTAMP_SUPPORTED""#;
+        let text = format!(
+            "/begin MEASUREMENT m {named} ULONG /end MEASUREMENT /* /begin PROTOCOL_LAYER */\n\
+             /begin PROTOCOL_LAYER\n  0x0104 1000 2000 0 0 0 0 0 252 1468 BYTE_ORDER_MSB_LAST\n/end PROTOCOL_LAYER\n\
+             /begin TIMESTAMP_SUPPORTED\n  0x1 SIZE_DWORD UNIT_1US\n/end TIMESTAMP_SUPPORTED\n"
+        );
+        let path = std::env::temp_dir().join(format!("xcpclient_314_{}.a2l", std::process::id()));
+        std::fs::write(&path, &text).unwrap();
+        let server = ServerProtocol { max_cto: 248, max_dto: 1024, timestamp_mode: 0x04 | 0x08, timestamp_ticks: 1 };
+        let fixed = fix_protocol_layer(&path, &server).map(|_| std::fs::read_to_string(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+        let fixed = fixed.unwrap();
+        assert!(fixed.contains(named));
+        assert!(fixed.contains("0x0104 1000 2000 0 0 0 0 0 248 1024 BYTE_ORDER_MSB_LAST"));
+        assert!(fixed.contains("/begin TIMESTAMP_SUPPORTED\n  0x1 SIZE_DWORD UNIT_1NS TIMESTAMP_FIXED\n/end TIMESTAMP_SUPPORTED"));
     }
 
     #[test]
