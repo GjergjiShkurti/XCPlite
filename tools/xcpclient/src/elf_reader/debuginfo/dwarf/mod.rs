@@ -17,7 +17,7 @@ use gimli::{Abbreviations, DebuggingInformationEntry, Dwarf, UnitHeader};
 use gimli::{EndianSlice, RunTimeEndian};
 
 use crate::elf_reader::debuginfo::cfa::{CfaInfo, get_cfa_from_object};
-use crate::elf_reader::debuginfo::{DbgDataType, DebugData, TypeInfo, VarInfo};
+use crate::elf_reader::debuginfo::{DbgDataType, DebugData, LoadSegment, TypeInfo, VarInfo};
 
 mod attributes;
 use attributes::{get_abstract_origin_attribute, get_attr_value, get_location_attribute, get_name_attribute, get_specification_attribute, get_typeref_attribute};
@@ -47,6 +47,7 @@ struct DebugDataReader<'elffile> {
     rodata_data: Option<(u64, Vec<u8>)>,   // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers held in mci_meas
     xcp_proto_data: Option<Vec<u8>>,       // raw bytes of xcp_proto: what the linked xcplite answers to CONNECT and GET_DAQ_RESOLUTION_INFO
     is_little_endian: bool,
+    load_segments: Vec<LoadSegment>, // the PT_LOAD program headers
 }
 
 // load the debug info from an elf file
@@ -172,6 +173,10 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
 
     let is_little_endian = elffile.endianness() == Endianness::Little;
 
+    // the PT_LOAD program headers, so a reader can tell whether an address holds its contents in
+    // the image (run address == load address) or only after startup code has copied them there
+    let load_segments = get_load_segments(&elffile);
+
     // get CFA information for DebugDataReader
     let mut cfa_info = Vec::new();
     let res = get_cfa_from_object(&elffile, &mut cfa_info, verbose, unit_idx_limit);
@@ -209,6 +214,7 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         rodata_data,
         xcp_proto_data,
         is_little_endian,
+        load_segments,
     };
     log::debug!("Reading debug info entries");
     Ok(dbg_reader.read_debug_info_entries(unit_idx_limit))
@@ -277,6 +283,28 @@ fn get_elf_sections(elffile: &object::read::File) -> HashMap<String, (u64, u64)>
     map
 }
 
+// the PT_LOAD program headers of an ELF file; empty for any other object format
+fn get_load_segments(elffile: &object::read::File) -> Vec<LoadSegment> {
+    use object::read::elf::{FileHeader, ProgramHeader};
+    fn collect<Elf: FileHeader<Endian = Endianness>>(file: &object::read::elf::ElfFile<'_, Elf>) -> Vec<LoadSegment> {
+        let endian = file.endian();
+        file.elf_program_headers()
+            .iter()
+            .filter(|ph| ph.p_type(endian) == object::elf::PT_LOAD)
+            .map(|ph| LoadSegment {
+                vaddr: ph.p_vaddr(endian).into(),
+                paddr: ph.p_paddr(endian).into(),
+                filesz: ph.p_filesz(endian).into(),
+            })
+            .collect()
+    }
+    match elffile {
+        object::read::File::Elf32(file) => collect(file),
+        object::read::File::Elf64(file) => collect(file),
+        _ => Vec::new(),
+    }
+}
+
 // load the DWARF debug info from the .debug_<xyz> sections
 fn load_dwarf_sections<'data>(elffile: &object::read::File<'data>) -> Result<gimli::Dwarf<SliceType<'data>>, String> {
     log::debug!("load_dwarf_sections");
@@ -343,6 +371,7 @@ impl DebugDataReader<'_> {
             rodata_data: self.rodata_data,
             xcp_proto_data: self.xcp_proto_data,
             is_little_endian: self.is_little_endian,
+            load_segments: self.load_segments,
         }
     }
 

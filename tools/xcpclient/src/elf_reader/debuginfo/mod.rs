@@ -103,6 +103,18 @@ pub(crate) struct DebugData {
     pub(crate) rodata_data: Option<(u64, Vec<u8>)>,       // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers in mci_meas
     pub(crate) xcp_proto_data: Option<Vec<u8>>,           // raw bytes of the xcp_proto section: what the linked xcplite answers to CONNECT and GET_DAQ_RESOLUTION_INFO
     pub(crate) is_little_endian: bool,                    // ELF endianness
+    pub(crate) load_segments: Vec<LoadSegment>,           // the PT_LOAD program headers: where each loaded range runs and where it is stored
+}
+
+/// One PT_LOAD program header: the address the program uses its contents at (`vaddr`), the
+/// address they are stored at (`paddr`), and how many bytes of them the image holds (`filesz`;
+/// the rest of the segment, up to p_memsz, is zeroed memory such as .bss). vaddr and paddr
+/// differ for initialised data that startup code copies from flash to RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoadSegment {
+    pub(crate) vaddr: u64,
+    pub(crate) paddr: u64,
+    pub(crate) filesz: u64,
 }
 
 // load_dwarf - loads and parses the DWARF debug information from an ELF file

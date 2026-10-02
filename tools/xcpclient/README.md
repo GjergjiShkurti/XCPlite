@@ -37,6 +37,19 @@ For the full technical specification — ELF section layouts, the `trg__` anchor
 convention, and the `AddrExt` encoding — see
 [docs/TECHNICAL.md — Offline A2L Generation](../../docs/TECHNICAL.md#offline-a2l-generation--elfdwarf-internals).
 
+### ELFs that do not link XCPlite
+
+An ELF without an `XCPLITE__<signature>` variable is a target that is not XCPlite — for
+example a VX1000 application instrumented with mc-instrument's `mc_vx.hpp`. Some A2L facts
+then follow the target rather than XCPlite's server:
+
+- **`ADDR_EPK`** is the ELF address of the `xcp_epk` section. XCPlite serves its EPK from a
+  protocol address (`0x80000000` or `0xFFFFFF00`); a VX1000 reads target memory as it is.
+  xcpclient warns when the image does not hold the section at that address (it is not in the
+  file contents of a `PT_LOAD` segment with `p_vaddr == p_paddr`, for example data copied to
+  RAM at startup): keep the EPK `const`, so it stays in flash. An address past 32 bits, or no
+  `xcp_epk` section, gives an A2L without an EPK.
+
 
 
 

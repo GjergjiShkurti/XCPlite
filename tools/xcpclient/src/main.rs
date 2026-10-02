@@ -812,7 +812,7 @@ async fn xcp_client(
                 // The server's MAX_CTO, MAX_DTO and timestamp, which xcp_registry cannot know (issue 224, below).
                 // An xcplite without the record is one from before it existed, and its A2L keeps xcp_registry's.
                 server_protocol = elf_reader.server_protocol()?;
-                if server_protocol.is_none() && elf_reader.get_target_signature().is_some() {
+                if server_protocol.is_none() && elf_reader.is_xcplite_target() {
                     warn!("The ELF links an xcplite without the xcp_proto section: the A2L states xcp_registry's MAX_CTO, MAX_DTO and timestamp, which may not be the server's");
                 }
 

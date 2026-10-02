@@ -75,7 +75,7 @@ Possible future improvements:
 // Original code licensed under MIT/Apache-2.0
 // Copyright (c) DanielT
 mod debuginfo;
-use debuginfo::{DbgDataType, DebugData, TypeInfo, VarInfo};
+use debuginfo::{DbgDataType, DebugData, LoadSegment, TypeInfo, VarInfo};
 
 //use crate::xcp_client::xcp;
 
@@ -337,6 +337,14 @@ impl ElfReader {
         return None;
     }
 
+    /// True when the ELF links xcplite, which marks itself with an `XCPLITE__<signature>`
+    /// variable. Any other ELF -- a VX1000 application built with mc_vx, for one -- is a target
+    /// that is not xcplite, and the rules that describe xcplite's server do not apply to it.
+    /// This is the one test for that; nothing else in the reader asks which backend it reads.
+    pub fn is_xcplite_target(&self) -> bool {
+        self.get_target_signature().is_some()
+    }
+
     /// Register the EPK string and the address a master must read it from.
     ///
     /// The A2L's `ADDR_EPK` is a *protocol* address, not the ELF address of the string. A master
@@ -357,24 +365,50 @@ impl ElfReader {
     /// perfectly measurable and completely unusable.
     ///
     /// See `xcplite.c:626` and `xcp_cfg.h:238-266`.
+    ///
+    /// A target that is not xcplite (`is_xcplite_target`) has no such protocol address. A VX1000
+    /// reads target memory as it is, so the master must be sent to the string itself: ADDR_EPK is
+    /// the ELF address of the `xcp_epk` section. That address holds the string only if the section
+    /// stays where it is loaded -- mc_vx makes the EPK `const` for that reason -- so a section the
+    /// image does not hold at its own address (`runs_where_loaded`) is warned about, and still written.
     pub fn register_epk_addr_info(&self, reg: &mut Registry, segment_relative: bool, verbose: usize) {
         info!("===============================================================");
-        if self.debug_data.epk_addr > 0 {
-            let epk = self.debug_data.epk_string.clone().unwrap_or_else(|| "<unknown>".to_string());
-            // XCP_ADDR_EPK for the two addressing schemes this reader can be given. The EPK
-            // segment always has index 0 (`register_segments` forces it), so the offset is 0.
-            const XCP_ADDR_EPK_SEG: u32 = 0x8000_0000;
-            const XCP_ADDR_EPK_ABS: u32 = 0xFFFF_FF00;
-            let epk_addr = if segment_relative { XCP_ADDR_EPK_SEG } else { XCP_ADDR_EPK_ABS };
+        let xcplite = self.is_xcplite_target();
+        let elf_addr = self.debug_data.epk_addr;
+        if elf_addr == 0 {
+            if xcplite {
+                warn!("EPK segment memory section not found in ELF file");
+            } else {
+                info!("No xcp_epk section: the A2L has no EPK");
+            }
+            return;
+        }
+        let epk = self.debug_data.epk_string.clone().unwrap_or_else(|| "<unknown>".to_string());
+        let Some(epk_addr) = epk_a2l_address(xcplite, segment_relative, elf_addr) else {
+            warn!(
+                "The xcp_epk section is at 0x{:X}, which does not fit the A2L's 32-bit ADDR_EPK: the A2L has no EPK",
+                elf_addr
+            );
+            return;
+        };
+        if xcplite {
             info!("EPK string: '{}'", epk);
             info!(
                 "EPK section is at 0x{:08X} in the ELF; ADDR_EPK is the protocol address 0x{:08X}, which is where xcplite serves it",
-                self.debug_data.epk_addr, epk_addr
+                elf_addr, epk_addr
             );
-            reg.application.set_version(epk, epk_addr);
         } else {
-            warn!("EPK segment memory section not found in ELF file");
+            info!("EPK \"{}\" at 0x{:08X} (ELF address; the target is not xcplite)", epk, epk_addr);
+            if !runs_where_loaded(elf_addr, &self.debug_data.load_segments) {
+                warn!(
+                    "The image does not hold the xcp_epk section at 0x{:08X} (it is not in the file contents of a PT_LOAD with p_vaddr == p_paddr): \
+                     the device holds the EPK there only once startup code has put it there, if at all, so a master that reads ADDR_EPK may read something else. \
+                     Make the EPK const, so that it stays in flash",
+                    elf_addr
+                );
+            }
         }
+        reg.application.set_version(epk, epk_addr);
     }
 
     // Register segments from segment creation markers (calseg__name) found in the code
@@ -2016,6 +2050,29 @@ pub enum AppEndpoint {
     NoServer,
 }
 
+/// The A2L's ADDR_EPK for an `xcp_epk` section at `elf_addr` (see `register_epk_addr_info`).
+/// xcplite serves the EPK from a protocol address: segment 0 offset 0 (`0x80000000`) under segment
+/// relative addressing, else the reserved `0xFFFFFF00`. Any other target is sent to the ELF
+/// address, and None means that address does not fit ADDR_EPK's 32 bits.
+fn epk_a2l_address(xcplite: bool, segment_relative: bool, elf_addr: u64) -> Option<u32> {
+    // The EPK segment always has index 0 (`register_segments` forces it), so the offset is 0.
+    const XCP_ADDR_EPK_SEG: u32 = 0x8000_0000;
+    const XCP_ADDR_EPK_ABS: u32 = 0xFFFF_FF00;
+    if xcplite {
+        Some(if segment_relative { XCP_ADDR_EPK_SEG } else { XCP_ADDR_EPK_ABS })
+    } else {
+        u32::try_from(elf_addr).ok()
+    }
+}
+
+/// True when the image holds the contents of `addr` at that address from reset: it lies in the
+/// file-backed part of a PT_LOAD segment that runs where it is stored (`p_vaddr == p_paddr`).
+/// Not in RAM that startup code copies initialised data into, and not in zeroed memory (.bss,
+/// NOLOAD), where a segment runs where it is stored but the image holds nothing for it.
+fn runs_where_loaded(addr: u64, segments: &[LoadSegment]) -> bool {
+    segments.iter().any(|s| s.vaddr == s.paddr && addr >= s.vaddr && addr - s.vaddr < s.filesz)
+}
+
 /// What an xcplite server answers to CONNECT (MAX_CTO, MAX_DTO) and to GET_DAQ_RESOLUTION_INFO
 /// (TIMESTAMP_MODE, TIMESTAMP_TICKS), as the record in its xcp_proto section states it. xcplite.c
 /// builds the record from the definitions both commands answer with.
@@ -2755,5 +2812,64 @@ mod a2l_token_tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].last().map(|t| t.end()), Some(text.len()));
         assert_eq!(a2l_address_extension(blocks[0]), Some(XCP_ADDR_EXT_ID));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const XCPLITE_ELF: &str = "../../examples/no_a2l_demo/CANape/no_a2l_demo.elf";
+
+    #[test]
+    fn epk_address_is_the_protocol_address_on_xcplite() {
+        assert_eq!(epk_a2l_address(true, true, 0x0003_02F8), Some(0x8000_0000));
+        assert_eq!(epk_a2l_address(true, false, 0x0003_02F8), Some(0xFFFF_FF00));
+        // the ELF address does not matter to xcplite, not even one past 32 bits
+        assert_eq!(epk_a2l_address(true, false, 0x1_0000_0000), Some(0xFFFF_FF00));
+    }
+
+    #[test]
+    fn epk_address_is_the_elf_address_on_a_target_that_is_not_xcplite() {
+        assert_eq!(epk_a2l_address(false, false, 0x0801_B960), Some(0x0801_B960));
+        assert_eq!(epk_a2l_address(false, true, 0x0801_B960), Some(0x0801_B960));
+        assert_eq!(epk_a2l_address(false, false, 0xFFFF_FFFF), Some(0xFFFF_FFFF));
+        assert_eq!(epk_a2l_address(false, false, 0x1_0000_0000), None);
+    }
+
+    #[test]
+    fn only_a_segment_that_runs_where_it_is_stored_holds_the_epk_from_reset() {
+        let flash = LoadSegment {
+            vaddr: 0x0800_0000,
+            paddr: 0x0800_0000,
+            filesz: 0x2_0000,
+        };
+        let data = LoadSegment {
+            vaddr: 0x2000_0000,
+            paddr: 0x0802_0000,
+            filesz: 0x1000,
+        };
+        let bss = LoadSegment {
+            vaddr: 0x3003_C000,
+            paddr: 0x3003_C000,
+            filesz: 0,
+        };
+        let segments = [flash, data, bss];
+        assert!(runs_where_loaded(0x0801_B960, &segments));
+        assert!(runs_where_loaded(0x0800_0000, &segments));
+        assert!(!runs_where_loaded(0x0802_0000, &segments), "one past the end of flash");
+        assert!(!runs_where_loaded(0x2000_0010, &segments), "copied to RAM at startup");
+        assert!(!runs_where_loaded(0x3003_C000, &segments), "zeroed at startup, nothing in the image");
+        assert!(!runs_where_loaded(0x3000_0000, &segments), "in no loaded segment");
+        assert!(!runs_where_loaded(0x0801_B960, &[]));
+    }
+
+    #[test]
+    fn an_xcplite_elf_is_an_xcplite_target_and_its_epk_is_in_its_image() {
+        let elf = ElfReader::new(XCPLITE_ELF, 0, usize::MAX).expect("the xcplite example ELF loads");
+        assert!(elf.is_xcplite_target());
+        assert!(!elf.debug_data.load_segments.is_empty());
+        assert_ne!(elf.debug_data.epk_addr, 0);
+        assert!(runs_where_loaded(elf.debug_data.epk_addr, &elf.debug_data.load_segments));
     }
 }
