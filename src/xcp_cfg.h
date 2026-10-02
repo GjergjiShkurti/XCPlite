@@ -370,9 +370,12 @@ XCPlite multi application absolute addressing: XCP_ADDRESS_MODE_XCPLITE__CXSDD (
 //
 // The extension has branches of its own wherever xcplite dispatches on one: SET_MTA, the upload
 // and download paths (XcpSetMta, XcpReadMta, XcpWriteMta), WRITE_DAQ (XcpAddOdtEntry) and the DAQ
-// sampling loop (XcpTriggerDaqList_). A read is answered at once from the object's slot in the
-// table (XcpReadId); a write is refused, because a measurement has no reference page and no
-// consistent-write discipline (calibration goes through the segment mechanism, which has both).
+// sampling loop (XcpTriggerDaqList_). DAQ samples an identifier inside its own event, and that is
+// the one way it is read: the command path's branches refuse it. A polled read (SHORT_UPLOAD,
+// UPLOAD, BUILD_CHECKSUM) is not supported, because between triggers the only address is the one
+// the last trigger left (issue 261); a write is refused, because a measurement has no reference
+// page and no consistent-write discipline (calibration goes through the segment mechanism, which
+// has both).
 //
 // It used to travel on the application address extension, XCP_ADDR_EXT_APP, and so took on what
 // upstream assumes of that extension: its command path goes to the application's callbacks,

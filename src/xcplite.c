@@ -548,7 +548,8 @@ uint8_t XcpWriteMta(uint8_t size, const uint8_t *data) {
 #ifdef XCP_ENABLE_ID_ADDRESSING
     // EXT == XCP_ADDR_EXT_ID Identifier addressing: refused. An identifier names a measurement,
     // which has no reference page and no consistent-write discipline; calibration goes through
-    // the segment mechanism, which has both.
+    // the segment mechanism, which has both. XcpSetMta refuses the extension first; a refused
+    // SET_MTA still leaves it in the MTA, so the DOWNLOAD that follows one is refused here.
     if (XcpAddrIsId(local.mta_ext)) {
         return CRC_ACCESS_DENIED;
     }
@@ -614,11 +615,14 @@ uint8_t XcpReadMta(uint8_t size, uint8_t *data) {
 #endif
 
 #ifdef XCP_ENABLE_ID_ADDRESSING
-    // EXT == XCP_ADDR_EXT_ID Identifier addressing: answered at once from the object's slot
+    // EXT == XCP_ADDR_EXT_ID Identifier addressing: refused, as XcpSetMta refuses it. A refused
+    // SET_MTA still leaves the extension in the MTA, so the UPLOAD or BUILD_CHECKSUM that follows
+    // one is refused here. An identifier-addressed measurement is sampled by DAQ inside its own
+    // event, and only that: a read between triggers could only copy from the address the last
+    // trigger left in the slot, which for a stack object may be a frame that has returned, or
+    // returns during the copy (issue 261).
     if (XcpAddrIsId(local.mta_ext)) {
-        uint8_t res = XcpReadId(local.mta_addr, size, data);
-        local_mut.mta_addr += size;
-        return res;
+        return CRC_ACCESS_DENIED;
     }
 #endif
 
@@ -711,11 +715,15 @@ uint8_t XcpSetMta(uint8_t ext_, uint32_t addr_) {
 #endif
 
 #ifdef XCP_ENABLE_ID_ADDRESSING
-    // Identifier addressing mode. The identifier is checked by each access, against the table
-    // as it is then: a republication between SET_MTA and UPLOAD would make a check here stale.
+    // Identifier addressing: refused, so SET_MTA, SHORT_UPLOAD and SHORT_DOWNLOAD fail here. An
+    // identifier names a measurement, which DAQ samples inside its own event, and that is the one
+    // way it is read (issue 261); a write is refused for the reason XcpWriteMta gives.
+    // CRC_ACCESS_DENIED, as XcpWriteMta answers: the identifier may well be valid, it is the access
+    // that is not. The extension stays in the MTA, as every refusal here leaves it, and XcpReadMta
+    // and XcpWriteMta refuse it too, so an UPLOAD, DOWNLOAD or BUILD_CHECKSUM after this fails.
     if (XcpAddrIsId(local.mta_ext)) {
-        DBG_PRINTF6("XcpSetMta: XCP_ADDR_EXT_ID:%08X\n", local_mut.mta_addr);
-        return CRC_CMD_OK;
+        DBG_PRINTF6("XcpSetMta: XCP_ADDR_EXT_ID:%08X refused, identifiers are sampled by DAQ only\n", local_mut.mta_addr);
+        return CRC_ACCESS_DENIED;
     }
 #endif
 
@@ -1364,35 +1372,6 @@ static const uint8_t *XcpResolveId(const tXcpResolveView *view, const tXcpIdBase
         return NULL; // not currently available; adding an offset to NULL would be undefined
     }
     return base + offset;
-}
-
-// The command path's read on XCP_ADDR_EXT_ID: SHORT_UPLOAD, UPLOAD and BUILD_CHECKSUM, on the XCP
-// command thread, between the application's triggers. Answered at once from the object's slot, with
-// the same bounds as the sampling loop, and refused rather than answered with a guess: a single read
-// has no later samples to correct it, so a zero for an address not yet published, or bytes read
-// through a stack address whose frame may have returned, would pass for a measured value.
-uint8_t XcpReadId(uint32_t addr, uint8_t size, uint8_t *dst) {
-    const tXcpResolveView view = XcpLoadResolveView();
-    const uint32_t id = XcpAddrDecodeId(addr);
-    const uint32_t offset = XcpAddrDecodeIdOffset(addr);
-    if (view.table == NULL || id == 0 || id >= view.count) {
-        return CRC_OUT_OF_RANGE;
-    }
-    const tXcpResolveEntry *const e = &view.table[id];
-    // Written so neither term can overflow: both halves came off the wire.
-    if (offset > e->size || (uint32_t)size > e->size - offset) {
-        return CRC_OUT_OF_RANGE;
-    }
-    // The mark before the address: see tXcpResolveEntry.transient for why this order.
-    if (__atomic_load_n(&e->transient, __ATOMIC_ACQUIRE) != 0) {
-        return CRC_ACCESS_DENIED;
-    }
-    const uint8_t *const base = (const uint8_t *)e->ptr;
-    if (base == NULL) {
-        return CRC_ACCESS_DENIED; // no trigger has published an address for it
-    }
-    memcpy(dst, base + offset, size);
-    return 0;
 }
 
 // Whether every identifier-addressed ODT entry of a DAQ list may be sampled on the list's event.

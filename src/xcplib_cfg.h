@@ -161,8 +161,8 @@
 // then covers globals, stack locals and heap/pointer-reachable data without a
 // per-kind address extension, and there is no dynamic-base slot limit for
 // pointer-reachable objects. The identifier travels on an address extension of
-// its own, XCP_ADDR_EXT_ID: DAQ samples it, SHORT_UPLOAD / UPLOAD read it from
-// the table, and a write to it is refused. See xcp_cfg.h and
+// its own, XCP_ADDR_EXT_ID: DAQ samples it, and a polled read (SHORT_UPLOAD /
+// UPLOAD / BUILD_CHECKSUM) or a write to it is refused. See xcp_cfg.h and
 // XcpSetResolveTable() in xcplib.h.
 // NOT defined here on purpose. Identifier addressing is our fork's addition, and defining it
 // in the shared default configuration turned it on for every XCPLITE_CONFIGURATION=default
