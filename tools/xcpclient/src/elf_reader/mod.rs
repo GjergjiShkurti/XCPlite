@@ -2059,6 +2059,35 @@ pub fn fix_protocol_layer(path: &std::path::Path, server: &ServerProtocol) -> Re
     Ok(())
 }
 
+/// Added to upstream (issue 276): the XCP IF_DATA description every A2L xcp_registry writes
+/// includes by name, `/include "XCP_104.aml"` -- this crate's copy, xcplite's own, compiled in, so
+/// that a prebuilt xcpclient needs no file beside it.
+const XCP_104_AML: &str = include_str!("../../XCP_104.aml");
+
+/// Added to upstream (issue 276): put the XCP_104.aml the A2L at `a2l_path` includes beside it,
+/// before the A2L is written.
+///
+/// a2lfile resolves the include beside the A2L, and else in the working directory, and so does
+/// every other reader: xcp_registry's check of the A2L it has just written, CANape, the kernel. With
+/// nothing there the check failed on IncludeFileError, said so, and xcpclient went on with an A2L no
+/// reader could load where it lay. An XCP_104.aml already beside it is kept: it may be a tool's own,
+/// and the A2L reaches it either way. One that is not this one is said to differ.
+pub fn write_aml_beside(a2l_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let aml = a2l_path.with_file_name("XCP_104.aml");
+    match std::fs::read(&aml) {
+        Ok(found) if found == XCP_104_AML.as_bytes() => {}
+        Ok(_) => warn!(
+            "{} is kept as it is, and differs from the XCP_104.aml this xcpclient was built with, which the A2L's IF_DATA is written for",
+            aml.display()
+        ),
+        Err(_) => {
+            std::fs::write(&aml, XCP_104_AML).map_err(|e| format!("cannot write {}, which the A2L includes: {}", aml.display(), e))?;
+            info!("Wrote {}, which the A2L includes", aml.display());
+        }
+    }
+    Ok(())
+}
+
 /// How many low bits of the address field are a byte offset into the object the identifier names.
 /// Must equal XCP_ID_OFFSET_BITS in xcplite's inc/xcp_id_addr.h -- the server decodes what this
 /// encodes. That header is the single definition (xcp_cfg.h and xcplib.h both include it); this

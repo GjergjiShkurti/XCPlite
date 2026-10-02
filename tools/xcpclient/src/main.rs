@@ -888,6 +888,10 @@ async fn xcp_client(
                     ecu_name = "project_name".into();
                 }
                 let title_info = format!("Created by xcp_client with {} - {}", mode, chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
+                // Added to upstream (issue 276). The A2L includes XCP_104.aml by name, and write_a2l
+                // checks it by reading it back, which fails without the AML beside it -- as would
+                // every other reader. It goes there first.
+                elf_reader::write_aml_beside(&a2l_path)?;
                 reg.write_a2l(
                     &a2l_path,
                     title_info.as_str(),
