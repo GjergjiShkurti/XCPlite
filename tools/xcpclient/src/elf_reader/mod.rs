@@ -1497,10 +1497,10 @@ impl ElfReader {
             };
             let mut sd = McSupportData::new(McObjectType::Measurement).set_min(min).set_max(max);
             if !r.comment.is_empty() {
-                sd = sd.set_comment(r.comment.clone());
+                sd = sd.set_comment(a2l_text(&r.comment));
             }
             if !r.unit.is_empty() {
-                sd = sd.set_unit(r.unit.clone());
+                sd = sd.set_unit(a2l_text(&r.unit));
             }
             // Two addressing modes, chosen per record by whether the backend supplied an address.
             //
@@ -1948,6 +1948,27 @@ fn apply_instance_metadata(inst: &mut xcp_registry::McInstance, kind: &str, meta
 // declaring *type*; the segments that instantiate it are found here, from the calseg__<name> markers
 // register_segments already relies on.
 
+/// `text` as it has to stand between an A2L string's quotes: every `"` and `\` escaped, as `\"` and
+/// `\\` (issue 222).
+///
+/// xcp_registry's writer puts what it is given between quotes as it is (`"{comment}"`), so a `"` in
+/// a comment, a unit or a segment description ended the string early and a `\` began an escape: the
+/// A2L said something other than the source, and a reader misread the line. The text of an
+/// mc-instrument record is the user's, so it is escaped here, where it is handed to the registry --
+/// the writer itself is upstream's (issue 251). Nothing after this cuts a string short, so there is
+/// no room to count the escapes against: the record's own width capped the text before it was
+/// escaped.
+fn a2l_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Byte layout of one `mci::CalMeta`, fixed by mc-instrument's static_asserts (mc.hpp).
 const MCI_META_OWNER_LEN: usize = 64;
 const MCI_META_FIELD_LEN: usize = 64;
@@ -1976,10 +1997,10 @@ impl CalMetaRecord {
     fn support_data(&self) -> McSupportData {
         let mut sd = McSupportData::new(McObjectType::Characteristic);
         if !self.unit.is_empty() {
-            sd = sd.set_unit(self.unit.clone());
+            sd = sd.set_unit(a2l_text(&self.unit));
         }
         if !self.comment.is_empty() {
-            sd = sd.set_comment(self.comment.clone());
+            sd = sd.set_comment(a2l_text(&self.comment));
         }
         if !(self.min == 0.0 && self.max == 0.0) {
             sd = sd.set_min(Some(self.min)).set_max(Some(self.max));
@@ -2072,7 +2093,7 @@ impl ElfReader {
                         continue;
                     }
                     if let Some(inst) = reg.instance_list.get_instance_mut(segment, None) {
-                        inst.mc_support_data.update_comment(record.comment.clone());
+                        inst.mc_support_data.update_comment(a2l_text(&record.comment));
                         if verbose >= 1 {
                             info!("  Description applied to segment instance '{}': '{}'", segment, record.comment);
                         }
@@ -2123,10 +2144,10 @@ impl ElfReader {
         let flat = format!("{}.{}", segment, field_path);
         if let Some(inst) = reg.instance_list.get_instance_mut(&flat, None) {
             if !record.unit.is_empty() {
-                inst.mc_support_data.update_unit(record.unit.clone());
+                inst.mc_support_data.update_unit(a2l_text(&record.unit));
             }
             if !record.comment.is_empty() {
-                inst.mc_support_data.update_comment(record.comment.clone());
+                inst.mc_support_data.update_comment(a2l_text(&record.comment));
             }
             if !(record.min == 0.0 && record.max == 0.0) {
                 inst.mc_support_data.update_min(Some(record.min));
