@@ -1096,7 +1096,12 @@ impl ElfReader {
                     } else {
                         mem_addr_ext
                     };
-                    (McObjectType::Measurement, McAddress::new_a2l_with_event(xcp_event_id, mem_addr as u32, addr_ext))
+                    let mc_addr = if reg.event_list.find_event_id(xcp_event_id).is_some() {
+                        McAddress::new_a2l_with_event(xcp_event_id, mem_addr as u32, addr_ext)
+                    } else {
+                        McAddress::new_a2l(mem_addr as u32, addr_ext)
+                    };
+                    (McObjectType::Measurement, mc_addr)
                 };
 
                 // Register measurement variable if possible
