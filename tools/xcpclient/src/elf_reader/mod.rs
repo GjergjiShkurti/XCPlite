@@ -940,6 +940,8 @@ impl ElfReader {
             _ => std::collections::HashSet::new(),
         };
         let mut twins: Vec<&str> = Vec::new();
+        // Names this sweep has registered (a name it meets twice is registered once)
+        let mut sweep_names = SweepNames::default();
         // Globals left out for a type that has no A2L equivalent (enum, pointer, class, ...)
         let mut unsupported = 0usize;
 
@@ -1215,6 +1217,9 @@ impl ElfReader {
                         | DbgDataType::Double
                         | DbgDataType::Array { .. }
                         | DbgDataType::Struct { .. } => {
+                            if !sweep_names.first(&a2l_name, mc_addr.get_event_id()) {
+                                continue;
+                            }
                             info!(
                                 "Add {} for {}: addr = {}:0x{:08x}",
                                 if object_type == McObjectType::Characteristic { "characteristic" } else { "measurement" },
@@ -1249,11 +1254,16 @@ impl ElfReader {
                             unsupported += 1;
                         }
                     }
+                } else if var_function.is_empty() {
+                    // A swept global whose type DWARF does not give (a declaration the linked
+                    // unit never defines): there is nothing to state, and nothing the user can fix
+                    info!("TypeRef {} of variable '{}' not found in debug info", var_info.typeref, var_name);
                 } else {
                     warn!("TypeRef {} of variable '{}' not found in debug info", var_info.typeref, var_name);
                 }
             }
         } // var_infos
+        sweep_names.report();
         if !twins.is_empty() {
             twins.sort_unstable();
             info!("{} global(s) skipped: measured by MEASURE under <event>.<name>", twins.len());
@@ -1809,6 +1819,45 @@ fn a2l_splice(text: &str, edits: &[(std::ops::Range<usize>, String)]) -> String 
     }
     out.push_str(&text[at..]);
     out
+}
+
+/// The A2L names the sweep has registered, so that a name it meets twice is registered once.
+/// DWARF holds one variable per scope, and scopes that have no function name -- a lambda's
+/// `static const char formatted[]` repeated in every lambda of a logging macro -- all become the
+/// same A2L name. The first is kept and the rest are counted: the registry would refuse each
+/// one as a duplicate and log an error for it, and a name that the sweep itself repeats is not
+/// an error. A clash with an object another step registered (a segment, a MEASURE) is not
+/// handled here: that is still the registry's to refuse.
+#[derive(Default)]
+struct SweepNames {
+    seen: std::collections::HashSet<(String, Option<u16>)>,
+    repeated: Vec<String>,
+}
+
+impl SweepNames {
+    /// True the first time `name` is met for `event`; false (and counted) after that.
+    fn first(&mut self, name: &str, event: Option<u16>) -> bool {
+        if self.seen.insert((name.to_string(), event)) {
+            true
+        } else {
+            self.repeated.push(name.to_string());
+            false
+        }
+    }
+
+    /// One info line with the count, the names at debug.
+    fn report(&mut self) {
+        if self.repeated.is_empty() {
+            return;
+        }
+        info!(
+            "{} variable(s) skipped: the sweep meets their name more than once (statics of the same name in different scopes); the first is kept",
+            self.repeated.len()
+        );
+        self.repeated.sort_unstable();
+        self.repeated.dedup();
+        debug!("Skipped as repeated names: {}", self.repeated.join(", "));
+    }
 }
 
 /// One record of the mci_meas section: an object a MEASURE (or MC outside one) describes.
@@ -3301,6 +3350,36 @@ mod tests {
         let mut twins: Vec<String> = instrumented_names(&recs, dwarf.iter()).into_iter().collect();
         twins.sort();
         assert_eq!(twins, ["level1", "speed"]);
+    }
+
+    #[test]
+    fn a_name_the_sweep_meets_twice_is_registered_once_and_counted() {
+        // two lambda-local statics of one name, no function to tell them apart
+        let mut names = SweepNames::default();
+        assert!(names.first("formatted", None));
+        assert!(!names.first("formatted", None));
+        assert!(!names.first("formatted", None));
+        assert_eq!(names.repeated, ["formatted", "formatted"]);
+        // another name, and the same name on another event, are not repeats
+        assert!(names.first("other", None));
+        assert!(names.first("formatted", Some(1)));
+        assert_eq!(names.repeated.len(), 2);
+    }
+
+    #[test]
+    fn the_sweep_hands_the_registry_no_duplicate_to_refuse() {
+        let mut reg = Registry::new();
+        let mut names = SweepNames::default();
+        for addr in [0x2000_0000u32, 0x2000_0040] {
+            if !names.first("formatted", None) {
+                continue;
+            }
+            let dim = McDimType::new(McValueType::Ubyte, 1, 1);
+            let a = McAddress::new_a2l(addr, 0);
+            reg.instance_list.add_instance("formatted", dim, McSupportData::new(McObjectType::Measurement), a).unwrap();
+        }
+        assert_eq!(reg.instance_list.len(), 1);
+        assert_eq!(names.repeated.len(), 1);
     }
 
     #[test]
