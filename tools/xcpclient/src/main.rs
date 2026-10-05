@@ -761,6 +761,8 @@ async fn xcp_client(
 
             // What the linked xcplite server answers to CONNECT and GET_DAQ_RESOLUTION_INFO (issue 224, below)
             let mut server_protocol = None;
+            // Added to upstream (issue 186): the A2L's PROJECT description, MC_APP's .desc, which was always "".
+            let mut project_description = String::new();
 
             // Read ELF/DWARF information for events, segments and (unless --create-a2l-template) variables
             // Events and calibration segments found in the ELF file, must match the XCP server information if present
@@ -860,6 +862,7 @@ async fn xcp_client(
                 {
                     ecu_name = name.to_string();
                 }
+                project_description = elf_reader.project_description()?;
 
                 // Added to upstream (issue 225). Offline, the transport block is where the
                 // application's own XCP server listens -- MC_APP's .bind, .port and .tcp, which the
@@ -896,7 +899,7 @@ async fn xcp_client(
                     &a2l_path,
                     title_info.as_str(),
                     &ecu_name,
-                    "",
+                    &project_description,
                     &ecu_name,
                     if segment_relative { "XCPLITE__CASDD" } else { "XCPLITE__ACSDD" },
                     true,

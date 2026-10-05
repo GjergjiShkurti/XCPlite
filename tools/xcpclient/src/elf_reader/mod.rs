@@ -94,18 +94,20 @@ impl ElfReader {
         self.debug_data.mci_app_name.as_deref()
     }
 
-    /// Where the application's XCP server listens, as its MC_APP states it in the mci_app record
-    /// (AppMeta in mc_meas_abi.hpp: name[64], bind[16], port u16 in the target's byte order, tcp u8,
-    /// endpoint u8). None when the ELF has no mci_app section -- no MC_APP, so no server of
-    /// mc-instrument's to describe.
-    ///
-    /// The offline A2L's transport block used to come from the command line alone, and the build
-    /// rule passed 127.0.0.1, its own port and TCP for every application (issues 158, 225). An unset
-    /// `.bind` and "0.0.0.0" are every interface, which 127.0.0.1 reaches; anything else is the one
-    /// address the server listens on. A record that predates the endpoint -- the name alone, 64
-    /// bytes -- is an error rather than a reason to fall back on the command line: that fallback is
-    /// the guess this replaces.
-    pub fn app_endpoint(&self) -> Result<Option<AppEndpoint>, Box<dyn Error>> {
+    /// Added to upstream (VsCANape issue 186). The A2L's PROJECT description: MC_APP's `.desc`,
+    /// escaped as every text of an mc-instrument record is (`a2l_text`). "" when the ELF has no
+    /// mci_app section; an error for a record from before it held one, as for the endpoint.
+    pub fn project_description(&self) -> Result<String, Box<dyn Error>> {
+        let Some(data) = self.mci_app_record()? else {
+            return Ok(String::new());
+        };
+        let desc = &data[MCI_APP_ENDPOINT_END..MCI_APP_RECORD_LEN];
+        let end = desc.iter().position(|&b| b == 0).unwrap_or(desc.len());
+        Ok(a2l_text(&String::from_utf8_lossy(&desc[..end])))
+    }
+
+    /// The mci_app record, checked to be one of today's: None when the ELF has none.
+    fn mci_app_record(&self) -> Result<Option<&[u8]>, Box<dyn Error>> {
         let Some(data) = self.debug_data.mci_app_data.as_ref() else {
             return Ok(None);
         };
@@ -117,6 +119,13 @@ impl ElfReader {
             )
             .into());
         }
+        if data.len() == MCI_APP_ENDPOINT_END {
+            return Err(format!(
+                "the ELF's mci_app record has no description: '{}' was built before MC_APP recorded .desc there. Rebuild it, so that its offline A2L carries its description",
+                self.app_name().unwrap_or("")
+            )
+            .into());
+        }
         if data.len() != MCI_APP_RECORD_LEN {
             return Err(format!(
                 "the mci_app section holds {} bytes, which is not one application record of {MCI_APP_RECORD_LEN}: an application has one MC_APP",
@@ -124,6 +133,24 @@ impl ElfReader {
             )
             .into());
         }
+        Ok(Some(data))
+    }
+
+    /// Where the application's XCP server listens, as its MC_APP states it in the mci_app record
+    /// (AppMeta in mc_meas_abi.hpp: name[64], bind[16], port u16 in the target's byte order, tcp u8,
+    /// endpoint u8, desc[128]). None when the ELF has no mci_app section -- no MC_APP, so no server
+    /// of mc-instrument's to describe.
+    ///
+    /// The offline A2L's transport block used to come from the command line alone, and the build
+    /// rule passed 127.0.0.1, its own port and TCP for every application (issues 158, 225). An unset
+    /// `.bind` and "0.0.0.0" are every interface, which 127.0.0.1 reaches; anything else is the one
+    /// address the server listens on. A record that predates the endpoint -- the name alone, 64
+    /// bytes -- is an error rather than a reason to fall back on the command line: that fallback is
+    /// the guess this replaces.
+    pub fn app_endpoint(&self) -> Result<Option<AppEndpoint>, Box<dyn Error>> {
+        let Some(data) = self.mci_app_record()? else {
+            return Ok(None);
+        };
         let bind_bytes = &data[MCI_APP_NAME_LEN..MCI_APP_NAME_LEN + MCI_APP_BIND_LEN];
         let bind_end = bind_bytes.iter().position(|&b| b == 0).unwrap_or(bind_bytes.len());
         let bind = String::from_utf8_lossy(&bind_bytes[..bind_end]).to_string();
@@ -1968,10 +1995,13 @@ pub fn fix_identifier_read_write(path: &std::path::Path) -> Result<(), Box<dyn E
     Ok(())
 }
 
-/// The size of the mci_app record before it held the endpoint -- the name alone -- and since.
+/// The size of the mci_app record before it held the endpoint -- the name alone -- before it held
+/// the description (issue 186), and since.
 const MCI_APP_NAME_LEN: usize = 64;
 const MCI_APP_BIND_LEN: usize = 16;
-const MCI_APP_RECORD_LEN: usize = MCI_APP_NAME_LEN + MCI_APP_BIND_LEN + 4;
+const MCI_APP_ENDPOINT_END: usize = MCI_APP_NAME_LEN + MCI_APP_BIND_LEN + 4;
+const MCI_APP_DESC_LEN: usize = 128;
+const MCI_APP_RECORD_LEN: usize = MCI_APP_ENDPOINT_END + MCI_APP_DESC_LEN;
 /// AppMeta::endpoint: the application runs no XCP server (the VX1000 backend), or it runs one.
 const MCI_APP_NO_SERVER: u8 = 0;
 const MCI_APP_SERVER: u8 = 1;

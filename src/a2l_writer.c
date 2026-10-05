@@ -36,9 +36,14 @@
 static FILE *gA2lFile = NULL;
 static bool gA2lSymbolPrefix = false; // Prepend project name as prefix to all symbol names (measurements, parameters, typedefs, components)
 
+// Added to upstream (VsCANape issue 186): the PROJECT's description, which was always "".
+static const char *gA2lProjectDescription = "";
+
+void A2lSetProjectDescription(const char *description) { gA2lProjectDescription = description != NULL ? description : ""; }
+
 //----------------------------------------------------------------------------------
 static const char *gA2lHeader1 = "ASAP2_VERSION 1 71\n"
-                                 "/begin PROJECT %s \"\"\n\n" // project name
+                                 "/begin PROJECT %s \"%s\"\n\n" // project name, project description (VsCANape issue 186)
                                  "/begin HEADER \"\" VERSION \"1.0\" PROJECT_NO " XCP_ADDRESS_MODE " /end HEADER\n\n"
                                  "/begin MODULE %s \"\"\n\n"; // module name
 
@@ -473,7 +478,7 @@ bool A2lWriter(const char *a2l_filename, uint8_t a2l_mode, const char *project_n
     }
 
     // Create header
-    fprintf(gA2lFile, gA2lHeader1, project_name /* project name */, project_name /* module name */);
+    fprintf(gA2lFile, gA2lHeader1, project_name /* project name */, gA2lProjectDescription /* project description */, project_name /* module name */);
     if (a2l_mode & A2L_MODE_EMBED_AML_FILE) {
         assert(0 && "Not implemented yet: embedding AML file content into A2L file is not implemented yet");
     } else {

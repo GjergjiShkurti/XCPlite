@@ -591,6 +591,12 @@ void A2lCreateMeasurementGroupFromList(const char *name, char *names[], uint32_t
 /// @return true on success, false on failure
 bool A2lInit(const uint8_t *addr, uint16_t port, bool useTCP, uint8_t mode);
 
+// Added to upstream (VsCANape issue 186).
+/// Set the description of the A2L's PROJECT, "" until set
+/// It is written between quotes as it is, when the A2L is finalized: escape what an A2L string cannot hold before passing it,
+/// and keep the string valid until then
+void A2lSetProjectDescription(const char *description);
+
 /// Finish A2L generation
 /// Finalize the A2L file, write the binary persistence file
 bool A2lFinalize(void);
