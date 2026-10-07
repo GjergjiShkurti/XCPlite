@@ -57,6 +57,14 @@ a warning if it has not exactly one DAQ block to write it into. Any other ELF wi
 `RELATIVE_BYTE`. A value from the record that has no single place in the A2L deletes the A2L and
 fails the run.
 
+### Units and comments
+
+A unit or a comment the application states -- in an `xcp_meta` object (`XCP_UNIT`,
+`XCP_COMMENT`) or in an mc-instrument record -- is the text of a quoted A2L string. xcpclient
+escapes it: `"`, `\`, a newline, a carriage return and a tab are written as `\"`, `\\`, `\n`,
+`\r` and `\t`, so the A2L states the text as the source does and a reader does not end the
+string or the line early.
+
 ### ELFs that do not link XCPlite
 
 An ELF without an `XCPLITE__<signature>` variable is a target that is not XCPlite — for

@@ -2658,6 +2658,8 @@ fn apply_field_metadata(
                 warn!("Failed to read string for metadata variable '{}'", var_name);
                 return false;
             };
+            // Added to upstream (issue 376): the text is the user's, escaped for the A2L string
+            let value = a2l_text(&value);
             let sd = McSupportData::new(McObjectType::Unspecified);
             if kind == "unit" { sd.set_unit(value) } else { sd.set_comment(value) }
         }
@@ -2696,7 +2698,8 @@ fn apply_field_metadata(
 fn apply_instance_metadata(inst: &mut xcp_registry::McInstance, kind: &str, meta_data: &[u8], offset: usize, is_le: bool) {
     match kind {
         "unit" | "comment" => {
-            if let Some(value) = read_cstr_at(meta_data, offset) {
+            // Added to upstream (issue 376): the text is the user's, escaped for the A2L string
+            if let Some(value) = read_cstr_at(meta_data, offset).map(|v| a2l_text(&v)) {
                 if kind == "unit" {
                     inst.mc_support_data.update_unit(value);
                 } else {
@@ -2739,11 +2742,11 @@ fn apply_instance_metadata(inst: &mut xcp_registry::McInstance, kind: &str, meta
 /// xcp_registry's writer puts what it is given between quotes as it is (`"{comment}"`), so a `"` in
 /// a comment, a unit or a segment description ended the string early and a `\` began an escape, and
 /// a newline split the object's line, which the generator then refused to read: the A2L said
-/// something other than the source. The text of an mc-instrument record is the user's, written as
-/// they mean it, so it is escaped here, where it is handed to the registry -- the writer itself is
-/// upstream's (issue 251). Any other control character is written as it is: an A2L string has no
-/// escape for one, a2lfile's own writer writes it as it is too, and neither a2lfile nor the generator
-/// ends a string or a line at it. Nothing after this cuts a string short, so there is no room to
+/// something other than the source. The text of an mc-instrument record, and a unit or a comment of
+/// an `xcp_meta` object (issue 376), is the user's, written as they mean it, so it is escaped here,
+/// where it is handed to the registry -- the writer itself is upstream's (issue 251). Any other
+/// control character is written as it is: an A2L string has no escape for one, a2lfile's own writer
+/// writes it as it is too, and neither a2lfile nor the generator ends a string or a line at it. Nothing after this cuts a string short, so there is no room to
 /// count the escapes against: the record's own width capped the text before it was escaped.
 fn a2l_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -3380,6 +3383,36 @@ mod tests {
         }
         assert_eq!(reg.instance_list.len(), 1);
         assert_eq!(names.repeated.len(), 1);
+    }
+
+    /// Added to upstream (issue 376): a unit and a comment from xcp_meta reach the A2L escaped, on
+    /// both paths -- a field of a typedef instance, and an instance of its own.
+    #[test]
+    fn a_unit_and_a_comment_from_xcp_meta_are_escaped() {
+        let raw = "a \"b\" c\\d\ne\tf";
+        let escaped = r#"a \"b\" c\\d\ne\tf"#;
+        let mut meta = raw.as_bytes().to_vec();
+        meta.push(0);
+        let mut reg = Registry::new();
+        reg.add_typedef("T", 4).unwrap();
+        reg.add_typedef_field("T", "f", McDimType::new(McValueType::Ulong, 1, 1), McSupportData::new(McObjectType::Measurement), 0)
+            .unwrap();
+        let typedef = McDimType::new(McValueType::new_typedef("T"), 1, 1);
+        let s = McSupportData::new(McObjectType::Measurement);
+        reg.instance_list.add_instance("s", typedef, s, McAddress::new_a2l(0x2000_0000, 0)).unwrap();
+        let m = McSupportData::new(McObjectType::Measurement);
+        reg.instance_list
+            .add_instance("m", McDimType::new(McValueType::Ubyte, 1, 1), m, McAddress::new_a2l(0x2000_0010, 0))
+            .unwrap();
+        for kind in ["unit", "comment"] {
+            assert!(apply_field_metadata(&mut reg, "xcp_meta__k__s__f", kind, "s", "f", &meta, 0, true, 0));
+            let inst = reg.instance_list.get_instance_mut("m", None).unwrap();
+            apply_instance_metadata(inst, kind, &meta, 0, true);
+        }
+        let field = reg.typedef_list.find_typedef("T").unwrap().find_field("f").unwrap().get_mc_support_data();
+        assert_eq!((field.get_unit(), field.get_comment()), (escaped, escaped));
+        let inst = reg.instance_list.get_instance_mut("m", None).unwrap();
+        assert_eq!((inst.unit(), inst.comment()), (escaped, escaped));
     }
 
     #[test]
