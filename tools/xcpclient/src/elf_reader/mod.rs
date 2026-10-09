@@ -390,7 +390,7 @@ impl ElfReader {
 
     /// The EPK text and the ADDR_EPK the A2L of this ELF states, as `register_epk_addr_info` writes
     /// them; the address is None when it does not fit 32 bits. None when there is no `xcp_epk`
-    /// section or no text in it. The EPK check (`--check-epk`, issue 371) compares the device with this.
+    /// section or no text in it. The EPK check (`--check-epk`, issue 375) compares the device with this.
     pub fn epk(&self) -> Option<(String, Option<u32>)> {
         let elf_addr = self.debug_data.epk_addr;
         if elf_addr == 0 {
@@ -2333,7 +2333,7 @@ pub struct IdentField {
     pub stated: bool,
 }
 
-/// The identification field type an A2L created from the ELF states (issue 364): what the
+/// The identification field type an A2L created from the ELF states (issue 369): what the
 /// xcp_proto record states; else, for an xcplite, RELATIVE_WORD_ALIGNED -- every xcplite whose
 /// record does not state it sends the 4 byte header, its ODT_HEADER_SIZE was fixed at 4; else
 /// None, nothing is known, and the A2L keeps what xcp_registry writes (RELATIVE_BYTE).
@@ -2354,23 +2354,23 @@ pub fn ident_field_for(server: Option<&ServerProtocol>, xcplite_target: bool) ->
 /// version. Append a name with the change that adds it; a name is never reused for different
 /// behaviour.
 pub const FEATURES: &[&str] = &[
-    // ADDR_EPK is the ELF address of xcp_epk on a target that is not xcplite (issue 358)
+    // ADDR_EPK is the ELF address of xcp_epk on a target that is not xcplite (issue 363)
     "a2l-epk-elf-address",
-    // DW_FORM_loclistx locations resolve (issue 362)
+    // DW_FORM_loclistx locations resolve (issue 367)
     "a2l-loclistx",
-    // an ELF with absolute mci records keeps the plain-global sweep in one run (issue 361)
+    // an ELF with absolute mci records keeps the plain-global sweep in one run (issue 366)
     "a2l-sweep-absolute",
-    // EVENT cycle comes from the xcp_evts record (issue 360)
+    // EVENT cycle comes from the xcp_evts record (issue 365)
     "a2l-event-cycle",
-    // IDENTIFICATION_FIELD_TYPE comes from the xcp_proto record (issue 364)
+    // IDENTIFICATION_FIELD_TYPE comes from the xcp_proto record (issue 369)
     "a2l-ident-field",
-    // an absolute VX ELF without xcp_proto fails unless --allow-registry-protocol (issue 366)
+    // an absolute VX ELF without xcp_proto fails unless --allow-registry-protocol (issue 370)
     "a2l-require-proto",
-    // --check-epk compares the device's EPK with the ELF's or the A2L's (issue 371)
+    // --check-epk compares the device's EPK with the ELF's or the A2L's (issue 375)
     "check-epk",
 ];
 
-/// True when the A2L cannot state what the server sends and must not be written (issue 366): a
+/// True when the A2L cannot state what the server sends and must not be written (issue 370): a
 /// target that is not xcplite, whose mci records all carry absolute addresses (a VX1000 built
 /// with mc_vx.hpp), and an ELF with no xcp_proto record. xcp_registry then writes MAX_CTO 252,
 /// MAX_DTO 1468, timestamps fixed and a one byte DTO header, which such a target does not do, and
@@ -2421,7 +2421,7 @@ impl ServerProtocol {
 
 /// Rewrite, in the A2L at `path`, what xcp_registry states about the server with what the server
 /// does: MAX_CTO and MAX_DTO in PROTOCOL_LAYER and TIMESTAMP_SUPPORTED (issue 224) when `server` is
-/// given, and the IDENTIFICATION_FIELD_TYPE in the DAQ block (issue 364) when `ident` is given.
+/// given, and the IDENTIFICATION_FIELD_TYPE in the DAQ block (issue 369) when `ident` is given.
 /// xcp_registry writes the same literals for every server: 252, 1468, ticks of 1 us and RELATIVE_BYTE.
 ///
 /// Every block and keyword is found among the A2L's tokens, outside quoted strings and comments, as
@@ -2658,7 +2658,7 @@ fn apply_field_metadata(
                 warn!("Failed to read string for metadata variable '{}'", var_name);
                 return false;
             };
-            // Added to upstream (issue 376): the text is the user's, escaped for the A2L string
+            // Added to upstream (issue 380): the text is the user's, escaped for the A2L string
             let value = a2l_text(&value);
             let sd = McSupportData::new(McObjectType::Unspecified);
             if kind == "unit" { sd.set_unit(value) } else { sd.set_comment(value) }
@@ -2698,7 +2698,7 @@ fn apply_field_metadata(
 fn apply_instance_metadata(inst: &mut xcp_registry::McInstance, kind: &str, meta_data: &[u8], offset: usize, is_le: bool) {
     match kind {
         "unit" | "comment" => {
-            // Added to upstream (issue 376): the text is the user's, escaped for the A2L string
+            // Added to upstream (issue 380): the text is the user's, escaped for the A2L string
             if let Some(value) = read_cstr_at(meta_data, offset).map(|v| a2l_text(&v)) {
                 if kind == "unit" {
                     inst.mc_support_data.update_unit(value);
@@ -2743,7 +2743,7 @@ fn apply_instance_metadata(inst: &mut xcp_registry::McInstance, kind: &str, meta
 /// a comment, a unit or a segment description ended the string early and a `\` began an escape, and
 /// a newline split the object's line, which the generator then refused to read: the A2L said
 /// something other than the source. The text of an mc-instrument record, and a unit or a comment of
-/// an `xcp_meta` object (issue 376), is the user's, written as they mean it, so it is escaped here,
+/// an `xcp_meta` object (issue 380), is the user's, written as they mean it, so it is escaped here,
 /// where it is handed to the registry -- the writer itself is upstream's (issue 251). Any other
 /// control character is written as it is: an A2L string has no escape for one, a2lfile's own writer
 /// writes it as it is too, and neither a2lfile nor the generator ends a string or a line at it. Nothing after this cuts a string short, so there is no room to
@@ -3385,7 +3385,7 @@ mod tests {
         assert_eq!(names.repeated.len(), 1);
     }
 
-    /// Added to upstream (issue 376): a unit and a comment from xcp_meta reach the A2L escaped, on
+    /// Added to upstream (issue 380): a unit and a comment from xcp_meta reach the A2L escaped, on
     /// both paths -- a field of a typedef instance, and an instance of its own.
     #[test]
     fn a_unit_and_a_comment_from_xcp_meta_are_escaped() {

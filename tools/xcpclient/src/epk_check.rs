@@ -1,7 +1,7 @@
 //-----------------------------------------------------------------------------
 // epk_check.rs -- `--check-epk`: is the device running the build the ELF or the A2L describes?
 //
-// Added to upstream (issue 371). The EPK is the text a build puts in its image and its A2L states
+// Added to upstream (issue 375). The EPK is the text a build puts in its image and its A2L states
 // (MOD_PAR EPK, ADDR_EPK). A master that reads the device at ADDR_EPK and finds another text knows
 // that the A2L's addresses belong to another build. The CANape Kernel does not make this check, so
 // a device flashed with an older build measures plausible values from the wrong addresses. This

@@ -340,7 +340,7 @@ impl XcpClient {
     /// `connect` also asks for the DAQ processor, the timestamp resolution and time correlation,
     /// and stops at a server that answers them differently than XCPlite does (a VX1000 has no fixed
     /// timestamps). Reading memory, the EPK check (`--check-epk`), needs none of that. Added to
-    /// upstream (issue 371).
+    /// upstream (issue 375).
     pub async fn connect_memory_access<D, T>(&mut self, connect_mode: u8, daq_decoder: Arc<Mutex<D>>, text_decoder: T) -> Result<(), Box<dyn Error>>
     where
         T: XcpTextDecoder + Send + 'static,

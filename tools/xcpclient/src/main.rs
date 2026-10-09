@@ -789,7 +789,7 @@ async fn xcp_client(
             // Added to upstream (issue 186): the A2L's PROJECT description, MC_APP's .desc, which was always "".
             let mut project_description = String::new();
 
-            // The DTO identification field the server sends, where it is known (issue 364, below)
+            // The DTO identification field the server sends, where it is known (issue 369, below)
             let mut ident_field: Option<IdentField> = None;
 
             // Read ELF/DWARF information for events, segments and (unless --create-a2l-template) variables
@@ -844,11 +844,11 @@ async fn xcp_client(
                     warn!("The ELF links an xcplite without the xcp_proto section: the A2L states xcp_registry's MAX_CTO, MAX_DTO and timestamp, which may not be the server's");
                 }
 
-                // The mci_meas records, read once: the check below and the sweep use them (issue 361)
+                // The mci_meas records, read once: the check below and the sweep use them (issue 366)
                 let mci = elf_reader.mci_records()?;
                 let addressing = MciAddressing::of(mci.as_deref());
 
-                // A VX1000 application without the record (issue 366): xcp_registry's text is wrong for it
+                // A VX1000 application without the record (issue 370): xcp_registry's text is wrong for it
                 if elf_reader::lacks_required_protocol(elf_reader.is_xcplite_target(), addressing, server_protocol.as_ref()) {
                     let why = "The ELF has absolute mci records (a VX1000) but no xcp_proto record: the A2L would state xcp_registry's MAX_CTO 252, MAX_DTO 1468, fixed timestamps and RELATIVE_BYTE, which a VX1000 does not do, and a master would lose samples without an error. Rebuild the application with the mc_vx.hpp of a CANsole that writes the record, or pass --allow-registry-protocol to create the A2L anyway";
                     if !allow_registry_protocol {
@@ -857,7 +857,7 @@ async fn xcp_client(
                     warn!("{}", why);
                 }
 
-                // The identification field type the server sends (issue 364, below), where it is known
+                // The identification field type the server sends (issue 369, below), where it is known
                 ident_field = elf_reader::ident_field_for(server_protocol.as_ref(), elf_reader.is_xcplite_target());
 
                 // Get the EPK string and address from debug_data and set it in the registry application version information, if available
@@ -878,7 +878,7 @@ async fn xcp_client(
                     // mc-instrument's measurement records (mci_meas). Identifier-addressed ones
                     // (xcplite) are the measurements, and the DWARF sweep adds only calibration
                     // characteristics. Absolute ones (VX1000) leave the sweep its plain globals,
-                    // minus the twins of what a MEASURE measures (issue 361). The records are
+                    // minus the twins of what a MEASURE measures (issue 366). The records are
                     // emitted by register_mci_measurements below.
                     if addressing != MciAddressing::None {
                         info!("mci_meas records: {:?} addressing", addressing);
@@ -973,7 +973,7 @@ async fn xcp_client(
                 // what it is built with -- 248, 1024 and 1 ns by default -- and the runtime route
                 // writes that. The ELF's xcp_proto record carries the answers, so the offline A2L
                 // states them too. One that cannot be corrected is not left behind to misstate them.
-                // Added to upstream (issue 364). xcp_registry also states IDENTIFICATION_FIELD_TYPE_
+                // Added to upstream (issue 369). xcp_registry also states IDENTIFICATION_FIELD_TYPE_
                 // RELATIVE_BYTE for every server, where xcplite sends a 4 byte header
                 // (RELATIVE_WORD_ALIGNED) by default. The same rewrite states the server's.
                 if server_protocol.is_some() || ident_field.is_some() {
@@ -1383,7 +1383,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // The EPK check (issue 371) reads the device and does nothing else
+    // The EPK check (issue 375) reads the device and does nothing else
     if args.check_epk {
         if args.offline {
             error!("--check-epk reads the device and cannot run with --offline");
