@@ -13,7 +13,7 @@ use std::net::Ipv4Addr;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
-use xcp_registry::{McAddress, McDimType, McEvent, McInstance, McObjectType, McSupportData, McValueType, Registry, RegistryError};
+use xcp_registry::{McAddress, McDimType, McEvent, McInstance, McObjectType, McSupportData, McTypeDefField, McValueType, Registry, RegistryError};
 
 /*
 Which information can be detected from ELF/DWARF:
@@ -292,10 +292,17 @@ impl ElfReader {
         members: &IndexMap<String, (TypeInfo, u64)>,
     ) -> Result<(), Box<dyn Error>> {
         let typedef = reg.add_typedef(type_name.clone(), size)?;
+        // The fields go straight into the typedef just added. add_typedef_field found it
+        // by walking the typedef list once per field, and checked each field against the ones before
+        // it: fields x typedefs, 80 of the 137 s an A2L of 2.3 million fields took. The typedef is the
+        // last in the list and stays at that position while a member's own type registers after it;
+        // it is new, and `members` is keyed by name, so neither of those checks could fail here.
+        let index = reg.typedef_list.len() - 1;
         for (field_name, (type_info, field_offset)) in members {
             let field_dim_type = self.get_dim_type(reg, type_info, object_type);
             let field_mc_support_data = McSupportData::new(object_type);
-            reg.add_typedef_field(&type_name, field_name.clone(), field_dim_type, field_mc_support_data, (*field_offset).try_into().unwrap())?;
+            let field = McTypeDefField::new(field_name.clone(), field_dim_type, field_mc_support_data, (*field_offset).try_into().unwrap());
+            reg.typedef_list.get_mut(index).fields.push(field);
         }
         Ok(())
     }
@@ -2797,18 +2804,22 @@ struct CalMetaRecord {
     max: f64,
 }
 
-/// Registry::set_instance_field_support_data for many fields (issue 404): the same lookups -- the
-/// instance's typedef, a field of each typedef along the path, then the field itself -- and the
-/// same merge, with the typedef list indexed by name and the typedef each path ends in kept. That
-/// function walks the instance list and the typedef list from the start on every call, and
-/// register_cal_metadata calls it once per field: 129,024 fields took seconds, 2.3 million most of
-/// an hour. It reads the registry as xcp_registry lays it out; a test holds the two to the same
-/// result.
+/// Registry::set_instance_field_support_data for many fields: the same lookups -- the instance's
+/// typedef, a field of each typedef along the path, then the field itself -- and the same merge,
+/// with the typedef list indexed by name, the typedef each path ends in kept and each typedef's
+/// fields indexed by name. That function walks the instance list and the typedef list from the
+/// start on every call, and register_cal_metadata calls it once per field: 129,024 fields took
+/// seconds, 2.3 million most of an hour. Its walk of a typedef's fields for every field would be
+/// quadratic in a wide type. It reads the registry as xcp_registry lays it out; a test holds the
+/// two to the same result.
 struct TypedefFieldIndex {
     /// typedef name -> its position in the typedef list; the first of that name, as find_typedef finds
     position: std::collections::HashMap<&'static str, usize>,
     /// instance -> field path up to and including its last `.` -> the typedef that path ends in
     owner_at: std::collections::HashMap<String, std::collections::HashMap<String, Option<usize>>>,
+    /// typedef position -> field name -> its position in the typedef's fields; the first of that
+    /// name, as find_field_mut finds. Filled as typedefs are reached: fields are not added meanwhile.
+    field_at: std::collections::HashMap<usize, std::collections::HashMap<&'static str, usize>>,
 }
 
 impl TypedefFieldIndex {
@@ -2823,6 +2834,7 @@ impl TypedefFieldIndex {
         TypedefFieldIndex {
             position,
             owner_at: std::collections::HashMap::new(),
+            field_at: std::collections::HashMap::new(),
         }
     }
 
@@ -2839,7 +2851,10 @@ impl TypedefFieldIndex {
             }
         };
         let field = owner
-            .and_then(|index| reg.typedef_list.get_mut(index).find_field_mut(target_field_name))
+            .and_then(|index| {
+                let at = *self.field_at.entry(index).or_insert_with(|| Self::fields_by_name(reg, index)).get(target_field_name)?;
+                reg.typedef_list.get_mut(index).fields.iter_mut().nth(at)
+            })
             .ok_or_else(|| RegistryError::NotFound(field_path.to_string()))?;
 
         // The merge, as set_instance_field_support_data does it.
@@ -2852,6 +2867,16 @@ impl TypedefFieldIndex {
         }
         field.mc_support_data = support_data;
         Ok(())
+    }
+
+    fn fields_by_name(reg: &Registry, index: usize) -> std::collections::HashMap<&'static str, usize> {
+        let mut at = std::collections::HashMap::new();
+        if let Some(typedef) = reg.typedef_list.get(index) {
+            for (position, field) in (&typedef.fields).into_iter().enumerate() {
+                at.entry(field.name.as_str()).or_insert(position);
+            }
+        }
+        at
     }
 
     /// The typedef that the instance's type and then the fields named by `components` lead to.
