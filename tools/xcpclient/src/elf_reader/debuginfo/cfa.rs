@@ -124,6 +124,7 @@ fn extract_function_info(
     // Each source file typically corresponds to one compilation unit
     let mut iter = dwarf.units();
     let mut cu_index = 0;
+    let mut cfi_tables = CfiTables::default();
 
     while let Some(header) = iter.next()? {
         if cu_index > unit_idx_limit {
@@ -150,7 +151,7 @@ fn extract_function_info(
         while let Some((_depth, entry)) = entries.next_dfs()? {
             // We're looking for subprogram DIEs (functions)
             if entry.tag() == gimli::DW_TAG_subprogram {
-                if let Some(func_info) = extract_function_from_die(dwarf, object_file, &unit, &entry, cu_index, verbose)? {
+                if let Some(func_info) = extract_function_from_die(dwarf, object_file, &mut cfi_tables, &unit, &entry, cu_index, verbose)? {
                     log::trace!("  Found function: {} at 0x{:08x}-0x{:08x}", func_info.function, func_info.low_pc, func_info.high_pc);
                     functions.push(func_info);
                 }
@@ -173,6 +174,7 @@ fn extract_function_info(
 fn extract_function_from_die(
     dwarf: &Dwarf<EndianSlice<LittleEndian>>,
     object_file: &object::File,
+    cfi_tables: &mut CfiTables,
     unit: &Unit<EndianSlice<LittleEndian>>,
     entry: &gimli::DebuggingInformationEntry<EndianSlice<LittleEndian>>,
     cu_index: usize,
@@ -218,7 +220,7 @@ fn extract_function_from_die(
     let frame_base_offset = extract_frame_base_offset(entry)?;
 
     // Try to determine CFA offset from CFI (Call Frame Information)
-    let cfa_offset = extract_cfa_from_cfi(object_file, low_pc)?;
+    let cfa_offset = extract_cfa_from_cfi(object_file, cfi_tables, low_pc)?;
 
     // Use CFA offset from CFI, fallback to frame base offset
     let final_cfa_offset = cfa_offset.or(frame_base_offset);
@@ -283,7 +285,7 @@ fn extract_frame_base_offset(entry: &gimli::DebuggingInformationEntry<EndianSlic
 ///
 /// This function parses .eh_frame or .debug_frame sections using gimli
 /// to find the CFA (Canonical Frame Address) calculation rule for a function.
-fn extract_cfa_from_cfi(file: &object::File, function_address: u64) -> Result<Option<i64>> {
+fn extract_cfa_from_cfi(file: &object::File, cfi_tables: &mut CfiTables, function_address: u64) -> Result<Option<i64>> {
     // if verbose {
     //     println!(
     //         "    Searching for CFA rules at address 0x{:08x}",
@@ -292,13 +294,13 @@ fn extract_cfa_from_cfi(file: &object::File, function_address: u64) -> Result<Op
     // }
 
     // Try .eh_frame first (more common)
-    if let Some(cfa_offset) = parse_eh_frame(file, function_address)? {
+    if let Some(cfa_offset) = parse_eh_frame(file, &mut cfi_tables.eh_frame, function_address)? {
         // println!("    Found CFA offset in .eh_frame: {}", cfa_offset);
         return Ok(Some(cfa_offset));
     }
 
     // Fallback to .debug_frame
-    if let Some(cfa_offset) = parse_debug_frame(file, function_address)? {
+    if let Some(cfa_offset) = parse_debug_frame(file, &mut cfi_tables.debug_frame, function_address)? {
         // println!("    Found CFA offset in .debug_frame: {}", cfa_offset);
         return Ok(Some(cfa_offset));
     }
@@ -306,8 +308,94 @@ fn extract_cfa_from_cfi(file: &object::File, function_address: u64) -> Result<Op
     Ok(None)
 }
 
+/// The FDEs of the two CFI sections, each read once, on its first
+/// lookup, into a table sorted by address. A function's FDE used to be found by walking its section
+/// from the first entry, once per function, so the CFA pass took time in proportion to functions x
+/// FDEs: an application with 16,000 MC entries and 130,000 calibration fields spent 200 s in it.
+#[derive(Default)]
+struct CfiTables {
+    eh_frame: Option<CfiTable>,
+    debug_frame: Option<CfiTable>,
+}
+
+/// The FDEs of one CFI section, sorted by initial address. A lookup answers what the walk from the
+/// section's first entry answered: the FDE first in section order among those covering the address,
+/// or, when none comes before it, the error the walk stopped at.
+struct CfiTable {
+    /// (initial address, end address, offset of the FDE in its section), sorted by initial address
+    fdes: Vec<(u64, u64, usize)>,
+    /// max_end[i] is the highest end address of fdes[0..=i], which bounds the search backwards
+    max_end: Vec<u64>,
+    /// The error the walk stopped at, if any. `fdes` holds the FDEs before it.
+    error: Option<gimli::Error>,
+}
+
+impl CfiTable {
+    fn read<R: gimli::Reader<Offset = usize>>(section: &impl UnwindSection<R>, bases: &BaseAddresses) -> CfiTable {
+        let mut fdes = Vec::new();
+        let mut error = None;
+        let mut entries = section.entries(bases);
+        loop {
+            let entry = match entries.next() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            };
+            match entry {
+                CieOrFde::Cie(_) => {
+                    // Common Information Entry - skip for now
+                    continue;
+                }
+                CieOrFde::Fde(partial_fde) => {
+                    // Frame Description Entry - this contains the function-specific info
+                    match partial_fde.parse(|_, bases, offset| section.cie_from_offset(bases, offset)) {
+                        Ok(fde) => {
+                            let fde_start = fde.initial_address();
+                            let fde_end = fde_start + fde.len();
+                            fdes.push((fde_start, fde_end, fde.offset()));
+                        }
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Stable: FDEs with the same initial address keep their section order.
+        fdes.sort_by_key(|&(start, _, _)| start);
+        let mut highest = 0;
+        let max_end = fdes
+            .iter()
+            .map(|&(_, end, _)| {
+                highest = highest.max(end);
+                highest
+            })
+            .collect();
+        CfiTable { fdes, max_end, error }
+    }
+
+    /// The section offset of the first FDE, in section order, that covers `address`.
+    fn find(&self, address: u64) -> Option<usize> {
+        let mut found: Option<usize> = None;
+        let mut i = self.fdes.partition_point(|&(start, _, _)| start <= address);
+        while i > 0 && self.max_end[i - 1] > address {
+            i -= 1;
+            let (_, end, offset) = self.fdes[i];
+            // Check if this FDE covers our function
+            if address < end && found.is_none_or(|f| offset < f) {
+                found = Some(offset);
+            }
+        }
+        found
+    }
+}
+
 /// Parse .eh_frame section to find CFA offset for a function
-fn parse_eh_frame(file: &object::File, function_address: u64) -> Result<Option<i64>> {
+fn parse_eh_frame(file: &object::File, table: &mut Option<CfiTable>, function_address: u64) -> Result<Option<i64>> {
     let eh_frame_section = match file.section_by_name(".eh_frame") {
         Some(section) => section,
         None => {
@@ -328,11 +416,11 @@ fn parse_eh_frame(file: &object::File, function_address: u64) -> Result<Option<i
     // }
 
     let eh_frame = EhFrame::new(eh_frame_data, LittleEndian);
-    parse_cfi_section(&eh_frame, eh_frame_address, function_address, ".eh_frame")
+    parse_cfi_section(&eh_frame, eh_frame_address, function_address, ".eh_frame", table)
 }
 
 /// Parse .debug_frame section to find CFA offset for a function  
-fn parse_debug_frame(file: &object::File, function_address: u64) -> Result<Option<i64>> {
+fn parse_debug_frame(file: &object::File, table: &mut Option<CfiTable>, function_address: u64) -> Result<Option<i64>> {
     let debug_frame_section = match file.section_by_name(".debug_frame") {
         Some(section) => section,
         None => {
@@ -347,11 +435,17 @@ fn parse_debug_frame(file: &object::File, function_address: u64) -> Result<Optio
     log::debug!("    Found .debug_frame section with {} bytes at 0x{:08x}", debug_frame_data.len(), debug_frame_address);
 
     let debug_frame = DebugFrame::new(debug_frame_data, LittleEndian);
-    parse_cfi_section(&debug_frame, debug_frame_address, function_address, ".debug_frame")
+    parse_cfi_section(&debug_frame, debug_frame_address, function_address, ".debug_frame", table)
 }
 
 /// Parse a CFI section (either .eh_frame or .debug_frame) using gimli
-fn parse_cfi_section<R: gimli::Reader>(section: &impl UnwindSection<R>, section_address: u64, function_address: u64, section_name: &str) -> Result<Option<i64>> {
+fn parse_cfi_section<R: gimli::Reader<Offset = usize>, Section: UnwindSection<R>>(
+    section: &Section,
+    section_address: u64,
+    function_address: u64,
+    section_name: &str,
+    table: &mut Option<CfiTable>,
+) -> Result<Option<i64>> {
     // Set up proper base addresses for CFI parsing
     let mut bases = BaseAddresses::default();
 
@@ -360,45 +454,35 @@ fn parse_cfi_section<R: gimli::Reader>(section: &impl UnwindSection<R>, section_
         bases = bases.set_eh_frame(section_address);
     }
 
-    let mut entries = section.entries(&bases);
+    let table = table.get_or_insert_with(|| CfiTable::read(section, &bases));
+    match table.find(function_address) {
+        Some(offset) => {
+            let fde = section.fde_from_offset(&bases, Section::Offset::from(offset), |section, bases, offset| section.cie_from_offset(bases, offset))?;
 
-    while let Some(entry) = entries.next()? {
-        match entry {
-            CieOrFde::Cie(_) => {
-                // Common Information Entry - skip for now
-                continue;
-            }
-            CieOrFde::Fde(partial_fde) => {
-                // Frame Description Entry - this contains the function-specific info
-                let fde = partial_fde.parse(|_, bases, offset| section.cie_from_offset(bases, offset))?;
+            // if verbose {
+            //     println!(
+            //         "    Found FDE in {} covering 0x{:08x}-0x{:08x}",
+            //         section_name, fde_start, fde_end
+            //     );
+            // }
 
-                let fde_start = fde.initial_address();
-                let fde_end = fde_start + fde.len();
-
-                // Check if this FDE covers our function
-                if function_address >= fde_start && function_address < fde_end {
-                    // if verbose {
-                    //     println!(
-                    //         "    Found FDE in {} covering 0x{:08x}-0x{:08x}",
-                    //         section_name, fde_start, fde_end
-                    //     );
-                    // }
-
-                    // Parse the unwind instructions to get CFA rules
-                    return parse_fde_for_cfa(&fde, section, &bases);
-                }
-            }
+            // Parse the unwind instructions to get CFA rules
+            parse_fde_for_cfa(&fde, section, &bases)
         }
+        None => match table.error {
+            Some(error) => Err(error.into()),
+            None => {
+                // if verbose {
+                //     println!(
+                //         "    No FDE found in {} for address 0x{:08x}",
+                //         section_name, function_address
+                //     );
+                // }
+
+                Ok(None)
+            }
+        },
     }
-
-    // if verbose {
-    //     println!(
-    //         "    No FDE found in {} for address 0x{:08x}",
-    //         section_name, function_address
-    //     );
-    // }
-
-    Ok(None)
 }
 
 /// Parse Frame Description Entry to extract CFA offset
