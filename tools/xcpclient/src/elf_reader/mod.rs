@@ -2785,6 +2785,73 @@ struct CalMetaRecord {
     max: f64,
 }
 
+/// Registry::set_instance_field_support_data for many fields (issue 404): the same lookups -- the
+/// instance's typedef, a field of each typedef along the path, then the field itself -- and the
+/// same merge, with the typedef list indexed by name and the typedef each path ends in kept. That
+/// function walks the instance list and the typedef list from the start on every call, and
+/// register_cal_metadata calls it once per field: 129,024 fields took seconds, 2.3 million most of
+/// an hour. It reads the registry as xcp_registry lays it out; a test holds the two to the same
+/// result.
+struct TypedefFieldIndex {
+    /// typedef name -> its position in the typedef list; the first of that name, as find_typedef finds
+    position: std::collections::HashMap<&'static str, usize>,
+    /// instance -> field path up to and including its last `.` -> the typedef that path ends in
+    owner_at: std::collections::HashMap<String, std::collections::HashMap<String, Option<usize>>>,
+}
+
+impl TypedefFieldIndex {
+    /// The typedef list does not change while metadata is applied, so it is indexed once.
+    fn new(reg: &Registry) -> TypedefFieldIndex {
+        let mut position = std::collections::HashMap::new();
+        for index in 0..reg.typedef_list.len() {
+            if let Some(typedef) = reg.typedef_list.get(index) {
+                position.entry(typedef.get_name()).or_insert(index);
+            }
+        }
+        TypedefFieldIndex {
+            position,
+            owner_at: std::collections::HashMap::new(),
+        }
+    }
+
+    fn set_field_support_data(&mut self, reg: &mut Registry, instance_name: &str, field_path: &str, mut support_data: McSupportData) -> Result<(), RegistryError> {
+        let parts: Vec<&str> = field_path.split('.').collect();
+        let target_field_name = parts[parts.len() - 1];
+        let path = &field_path[..field_path.len() - target_field_name.len()];
+        let owner = match self.owner_at.get(instance_name).and_then(|paths| paths.get(path)) {
+            Some(owner) => *owner,
+            None => {
+                let owner = self.typedef_at(reg, instance_name, &parts[..parts.len() - 1]);
+                self.owner_at.entry(instance_name.to_string()).or_default().insert(path.to_string(), owner);
+                owner
+            }
+        };
+        let field = owner
+            .and_then(|index| reg.typedef_list.get_mut(index).find_field_mut(target_field_name))
+            .ok_or_else(|| RegistryError::NotFound(field_path.to_string()))?;
+
+        // The merge, as set_instance_field_support_data does it.
+        if field.mc_support_data.has_metadata() {
+            field.mc_support_data.merge_metadata(support_data);
+            return Ok(());
+        }
+        if support_data.object_type == McObjectType::Unspecified {
+            support_data.object_type = field.mc_support_data.object_type;
+        }
+        field.mc_support_data = support_data;
+        Ok(())
+    }
+
+    /// The typedef that the instance's type and then the fields named by `components` lead to.
+    fn typedef_at(&self, reg: &Registry, instance_name: &str, components: &[&str]) -> Option<usize> {
+        let mut current = reg.instance_list.get_instance(instance_name, McObjectType::Unspecified, None)?.get_typedef_name()?;
+        for component in components {
+            current = reg.typedef_list.get(*self.position.get(current)?)?.find_field(component)?.get_typedef_name()?;
+        }
+        self.position.get(current).copied()
+    }
+}
+
 impl CalMetaRecord {
     /// Nothing stated is the common case -- a field with no metadata still gets a record, because
     /// the macro cannot see which initialisers were given. Both limits zero is mc-instrument's (and
@@ -2858,12 +2925,27 @@ impl ElfReader {
             return Ok(());
         }
 
-        // Where inside a segment a struct of a given type sits depends on the segment and the type
-        // alone, and every field of that type asks the same question: each segment's tree is
-        // walked once per declaring type, not once per record.
-        let mut prefixes_of: std::collections::HashMap<(usize, String), Vec<String>> = std::collections::HashMap::new();
-
         let is_le = self.debug_data.is_little_endian;
+
+        // Where inside a segment a struct of a given type sits depends on the segment and the type
+        // alone, and every field of that type asks the same question. Each segment's tree is walked
+        // once for all the types the records name, and each type maps to the segments that hold
+        // it, so a record visits those rather than every segment (issue 404): a walk per type and
+        // segment, and a visit to every segment per record, made this phase quadratic.
+        let owners: std::collections::HashSet<String> = meta_data
+            .chunks(MCI_META_RECORD_LEN)
+            .filter_map(|chunk| parse_cal_meta_record(chunk, is_le))
+            .filter(|record| !record.is_empty() && !record.field.is_empty())
+            .map(|record| record.owner)
+            .collect();
+        let mut holders_of: std::collections::HashMap<String, Vec<(usize, Vec<String>)>> = std::collections::HashMap::new();
+        for (index, (_, root)) in segments.iter().enumerate() {
+            for (owner, prefixes) in self.paths_to_types(root, &owners) {
+                holders_of.entry(owner).or_default().push((index, prefixes));
+            }
+        }
+        let mut fields = TypedefFieldIndex::new(reg);
+
         for chunk in meta_data.chunks(MCI_META_RECORD_LEN) {
             let Some(record) = parse_cal_meta_record(chunk, is_le) else {
                 // Two different failures share this None. A short chunk is the end of the
@@ -2902,13 +2984,13 @@ impl ElfReader {
                 continue;
             }
             let mut applied = 0;
-            for (index, (segment, root)) in segments.iter().enumerate() {
-                // Where inside this segment a struct of the declaring type sits. Usually nowhere
-                // or at the root; a nested MC_STRUCT puts it one or more members down, and the
-                // field's A2L path then carries that prefix.
-                let prefixes = prefixes_of.entry((index, record.owner.clone())).or_insert_with(|| self.paths_to_type(root, &record.owner));
-                for prefix in prefixes.iter() {
-                    self.apply_cal_metadata(reg, segment, &format!("{}{}", prefix, record.field), &record, verbose);
+            for (index, prefixes) in holders_of.get(&record.owner).map_or(&[][..], Vec::as_slice) {
+                // Where inside this segment a struct of the declaring type sits. Usually at the
+                // root; a nested MC_STRUCT puts it one or more members down, and the field's A2L
+                // path then carries that prefix.
+                let segment = &segments[*index].0;
+                for prefix in prefixes {
+                    self.apply_cal_metadata(reg, &mut fields, segment, &format!("{}{}", prefix, record.field), &record, verbose);
                     applied += 1;
                 }
             }
@@ -2926,8 +3008,8 @@ impl ElfReader {
     /// A segment written as a real typedef is an INSTANCE of a TYPEDEF_STRUCTURE, so the field is a
     /// component of that typedef; a flattened one is a set of instances named `<segment>.<field>`.
     /// The default is flattened, but the mode is the application's, not ours, so both are tried.
-    fn apply_cal_metadata(&self, reg: &mut Registry, segment: &str, field_path: &str, record: &CalMetaRecord, verbose: usize) {
-        match reg.set_instance_field_support_data(segment, field_path, record.support_data()) {
+    fn apply_cal_metadata(&self, reg: &mut Registry, fields: &mut TypedefFieldIndex, segment: &str, field_path: &str, record: &CalMetaRecord, verbose: usize) {
+        match fields.set_field_support_data(reg, segment, field_path, record.support_data()) {
             Ok(()) => {
                 if verbose >= 1 {
                     info!("  Metadata applied to typedef field '{}.{}'", segment, field_path);
@@ -2999,29 +3081,31 @@ impl ElfReader {
 const MCI_MAX_NESTING: usize = 8;
 
 impl ElfReader {
-    /// The dotted member paths inside `root` at which a struct named `owner` sits, each ending in
-    /// a `.` so a field name appends directly. The empty string when `root` is that type itself.
+    /// For each of `owners` that sits inside `root`, the dotted member paths at which a struct of
+    /// that name sits, each ending in a `.` so a field name appends directly, and the empty string
+    /// when `root` is that type itself. Each type's paths are in the order the tree is walked. One
+    /// walk answers for all the types (issue 404); one per type took types x tree size.
     ///
     /// Read out of DWARF rather than out of mci_meta: the section says which *type* declares a
     /// field, and the struct tree is what turns that into the path a tool knows the field by. A
     /// field of a nested MC_STRUCT is `<segment>.<outer>.<inner>` in the A2L, and nothing in the
     /// record itself could know the `<outer>` -- one nested type may sit inside several others,
     /// as PidGains sits in both `speed` and `torque`.
-    fn paths_to_type(&self, root: &TypeInfo, owner: &str) -> Vec<String> {
-        let mut found = Vec::new();
-        self.walk_for_type(root, owner, String::new(), &mut found, 0);
+    fn paths_to_types(&self, root: &TypeInfo, owners: &std::collections::HashSet<String>) -> std::collections::HashMap<String, Vec<String>> {
+        let mut found = std::collections::HashMap::new();
+        self.walk_for_types(root, owners, String::new(), &mut found, 0);
         found
     }
 
-    fn walk_for_type(&self, node: &TypeInfo, owner: &str, prefix: String, found: &mut Vec<String>, depth: usize) {
+    fn walk_for_types(&self, node: &TypeInfo, owners: &std::collections::HashSet<String>, prefix: String, found: &mut std::collections::HashMap<String, Vec<String>>, depth: usize) {
         // Only the first level of a struct is expanded in place; below that a member is a
         // TypeRef into the type map, so the name and the members are both on the other side of
         // it. Walking without resolving finds a nested type one level down and never deeper.
         let Some(node) = self.resolve_type(node) else {
             return;
         };
-        if node.name.as_deref() == Some(owner) {
-            found.push(prefix.clone());
+        if let Some(name) = node.name.as_deref().filter(|name| owners.contains(*name)) {
+            found.entry(name.to_string()).or_default().push(prefix.clone());
             // No early return: a struct may hold another of the same type further down, and both
             // are real places the field exists.
         }
@@ -3033,7 +3117,7 @@ impl ElfReader {
             _ => return,
         };
         for (name, (member, _offset)) in members {
-            self.walk_for_type(member, owner, format!("{}{}.", prefix, name), found, depth + 1);
+            self.walk_for_types(member, owners, format!("{}{}.", prefix, name), found, depth + 1);
         }
     }
 
@@ -3413,6 +3497,59 @@ mod tests {
         assert_eq!((field.get_unit(), field.get_comment()), (escaped, escaped));
         let inst = reg.instance_list.get_instance_mut("m", None).unwrap();
         assert_eq!((inst.unit(), inst.comment()), (escaped, escaped));
+    }
+
+    /// Issue 404: TypedefFieldIndex does what Registry::set_instance_field_support_data does -- the
+    /// same calls succeed, the same fail, and every field ends with the same metadata -- for a field
+    /// at the root and one through a nested type, the replace and the merge, and paths that lead
+    /// nowhere.
+    #[test]
+    fn the_typedef_field_index_sets_what_the_registry_sets() {
+        let registry = || {
+            let mut reg = Registry::new();
+            reg.add_typedef("Leaf", 8).unwrap();
+            let ch = || McSupportData::new(McObjectType::Characteristic);
+            reg.add_typedef_field("Leaf", "a", McDimType::new(McValueType::Float32Ieee, 1, 1), ch(), 0).unwrap();
+            reg.add_typedef_field("Leaf", "b", McDimType::new(McValueType::Uword, 1, 1), ch(), 4).unwrap();
+            reg.add_typedef("Seg", 24).unwrap();
+            reg.add_typedef_field("Seg", "leaf", McDimType::new(McValueType::new_typedef("Leaf"), 1, 1), ch(), 0).unwrap();
+            reg.add_typedef_field("Seg", "c", McDimType::new(McValueType::Float64Ieee, 1, 1), ch(), 8).unwrap();
+            reg.add_typedef_field("Seg", "d", McDimType::new(McValueType::Ulong, 1, 1), ch().set_unit("rpm"), 16).unwrap();
+            let seg = McDimType::new(McValueType::new_typedef("Seg"), 1, 1);
+            reg.instance_list.add_instance("seg", seg, ch(), McAddress::new_a2l(0x2000_0000, 0)).unwrap();
+            let m = McSupportData::new(McObjectType::Measurement);
+            reg.instance_list.add_instance("m", McDimType::new(McValueType::Ubyte, 1, 1), m, McAddress::new_a2l(0x2000_0100, 0)).unwrap();
+            reg
+        };
+        let sd = |unit: &'static str, comment: &'static str, limits: Option<(f64, f64)>| {
+            let mut sd = McSupportData::new(McObjectType::Characteristic).set_unit(unit).set_comment(comment);
+            if let Some((min, max)) = limits {
+                sd = sd.set_min(Some(min)).set_max(Some(max));
+            }
+            sd
+        };
+        let calls = [
+            ("seg", "leaf.a", sd("V", "nested", Some((-5.0, 5.0)))),
+            ("seg", "c", sd("", "root", None)),
+            ("seg", "d", sd("", "", Some((0.0, 9000.0)))),
+            ("seg", "leaf.a", sd("mV", "", None)),
+            ("seg", "leaf.zz", sd("V", "", None)),
+            ("seg", "nope.a", sd("V", "", None)),
+            ("seg", ".a", sd("V", "", None)),
+            ("m", "x", sd("V", "", None)),
+            ("missing", "a", sd("V", "", None)),
+        ];
+        let (mut by_registry, mut by_index) = (registry(), registry());
+        let mut index = TypedefFieldIndex::new(&by_index);
+        for (instance, path, support_data) in calls {
+            let expected = by_registry.set_instance_field_support_data(instance, path, support_data.clone());
+            let got = index.set_field_support_data(&mut by_index, instance, path, support_data);
+            assert_eq!(got.is_ok(), expected.is_ok(), "{instance}.{path}");
+        }
+        for (typedef, field) in [("Leaf", "a"), ("Leaf", "b"), ("Seg", "leaf"), ("Seg", "c"), ("Seg", "d")] {
+            let of = |reg: &Registry| format!("{:?}", reg.typedef_list.find_typedef(typedef).unwrap().find_field(field).unwrap().get_mc_support_data());
+            assert_eq!(of(&by_index), of(&by_registry), "{typedef}.{field}");
+        }
     }
 
     #[test]
