@@ -13,7 +13,7 @@ use std::net::Ipv4Addr;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
-use xcp_registry::{McAddress, McDimType, McEvent, McObjectType, McSupportData, McValueType, Registry, RegistryError};
+use xcp_registry::{McAddress, McDimType, McEvent, McInstance, McObjectType, McSupportData, McValueType, Registry, RegistryError};
 
 /*
 Which information can be detected from ELF/DWARF:
@@ -1461,6 +1461,12 @@ impl ElfReader {
             .into());
         }
 
+        // The instances already registered, by name and event, which is what add_instance refuses a
+        // duplicate of. Its own check walks the whole list for every measurement, quadratic in the
+        // measurements (issue 405: 64,000 took 16 s), so a measurement this set says is new is
+        // pushed directly; a duplicate still goes through add_instance, which refuses it as before.
+        let mut registered: std::collections::HashSet<(String, Option<u16>)> =
+            reg.instance_list.into_iter().map(|i| (i.get_name().to_string(), i.event_id())).collect();
         let mut count = 0usize;
         for (r, name) in recs.iter().zip(qualified.iter()) {
             let id = id_of(name);
@@ -1534,7 +1540,13 @@ impl ElfReader {
                 // on unrelated objects. Mirrors XcpAddrEncodeId in xcplite's inc/xcp_id_addr.h.
                 None => McAddress::new_a2l_with_event(event_id, id << XCP_ID_OFFSET_BITS, XCP_ADDR_EXT_ID),
             };
-            match reg.instance_list.add_instance(name.clone(), dim_type, sd, addr) {
+            let added = if registered.insert((name.clone(), addr.get_event_id())) {
+                reg.instance_list.push(McInstance::new(name.clone(), dim_type, sd, addr));
+                Ok(())
+            } else {
+                reg.instance_list.add_instance(name.clone(), dim_type, sd, addr)
+            };
+            match added {
                 Ok(_) => {
                     count += 1;
                     if verbose >= 1 {
