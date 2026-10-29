@@ -296,10 +296,18 @@ impl ElfReader {
         // by walking the typedef list once per field, and checked each field against the ones before
         // it: fields x typedefs, 80 of the 137 s an A2L of 2.3 million fields took. The typedef is the
         // last in the list and stays at that position while a member's own type registers after it;
-        // it is new, and `members` is keyed by name, so neither of those checks could fail here.
+        // it is new, and `members` is keyed by name, so the field check could not fail here.
+        // The lookup could: it took `type_name` as given, and add_typedef stores the name made an
+        // identifier -- `atomic<bool>` as `atomic_bool_` -- so for such a name it failed at the first
+        // member, once that member's own type was registered, and left the typedef without fields.
+        // That is kept as it was.
+        let found = typedef.get_name() == type_name;
         let index = reg.typedef_list.len() - 1;
         for (field_name, (type_info, field_offset)) in members {
             let field_dim_type = self.get_dim_type(reg, type_info, object_type);
+            if !found {
+                return Err(RegistryError::NotFound(type_name).into());
+            }
             let field_mc_support_data = McSupportData::new(object_type);
             let field = McTypeDefField::new(field_name.clone(), field_dim_type, field_mc_support_data, (*field_offset).try_into().unwrap());
             reg.typedef_list.get_mut(index).fields.push(field);
