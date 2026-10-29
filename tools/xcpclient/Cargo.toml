@@ -48,6 +48,15 @@ xcp_registry = { git = "https://github.com/vectorgrp/xcp-lite", features = ["a2l
 #xcp_registry = { path = "../../../xcp-lite-RainerZ/xcp_registry", features = ["a2l_reader"] } 
 
 
+# Added to upstream (issue 402). a2lfile, which xcp_registry's a2l_reader uses to load and check A2L
+# files, from a fork: 3.5.1 plus a check() that finds the users of each TYPEDEF_CHARACTERISTIC once
+# instead of once per typedef, which made checking an A2L quadratic in its structure fields
+# (129,035 typedef characteristics: 142 s, now 0.1 s). Replaces the crates.io release everywhere in
+# the build, xcp_registry included.
+[patch.crates-io]
+a2lfile = { git = "https://github.com/GjergjiShkurti/a2lfile", rev = "36ba0a4dbd62a4946404bea4ec06cc6a029f9c33" }
+
+
 [lints.rust]
 dead_code = "allow"
 unused_variables = "allow"
