@@ -47,6 +47,7 @@ struct DebugDataReader<'elffile> {
     rodata_data: Option<(u64, Vec<u8>)>,   // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers held in mci_meas
     xcp_proto_data: Option<Vec<u8>>,       // raw bytes of xcp_proto: what the linked xcplite answers to CONNECT and GET_DAQ_RESOLUTION_INFO
     xcp_evts_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of xcp_evts: the event descriptor records
+    mci_insts_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of mci_insts: mc-instrument's calibration segment records
     ptr_size: u8,                          // size of a pointer on the target, from the ELF class
     is_little_endian: bool,
     load_segments: Vec<LoadSegment>, // the PT_LOAD program headers
@@ -180,6 +181,13 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         let addr = s.address();
         s.data().ok().map(|data| (addr, data.to_vec()))
     });
+    // read the mci_insts section: one record per calibration segment an mc-instrument application
+    // creates, with pointers to its name and to its calseg__<name> marker. The application numbers its
+    // segments from these records, so the reader can tell which of them the debug info describes.
+    let mci_insts_data: Option<(u64, Vec<u8>)> = elffile.section_by_name("mci_insts").and_then(|s| {
+        let addr = s.address();
+        s.data().ok().map(|data| (addr, data.to_vec()))
+    });
     let ptr_size: u8 = if elffile.is_64() { 8 } else { 4 };
 
     let is_little_endian = elffile.endianness() == Endianness::Little;
@@ -225,6 +233,7 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         rodata_data,
         xcp_proto_data,
         xcp_evts_data,
+        mci_insts_data,
         ptr_size,
         is_little_endian,
         load_segments,
@@ -384,6 +393,7 @@ impl DebugDataReader<'_> {
             rodata_data: self.rodata_data,
             xcp_proto_data: self.xcp_proto_data,
             xcp_evts_data: self.xcp_evts_data,
+            mci_insts_data: self.mci_insts_data,
             ptr_size: self.ptr_size,
             is_little_endian: self.is_little_endian,
             load_segments: self.load_segments,

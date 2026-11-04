@@ -103,6 +103,7 @@ pub(crate) struct DebugData {
     pub(crate) rodata_data: Option<(u64, Vec<u8>)>,       // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers in mci_meas
     pub(crate) xcp_proto_data: Option<Vec<u8>>,           // raw bytes of the xcp_proto section: what the linked xcplite answers to CONNECT and GET_DAQ_RESOLUTION_INFO
     pub(crate) xcp_evts_data: Option<(u64, Vec<u8>)>,     // (section_base_addr, raw_bytes) of the xcp_evts section: the event descriptor records, with the cycle times
+    pub(crate) mci_insts_data: Option<(u64, Vec<u8>)>,    // (section_base_addr, raw_bytes) of the mci_insts section: mc-instrument's calibration segment records
     pub(crate) ptr_size: u8,                              // size of a pointer on the target, 4 or 8, from the ELF class
     pub(crate) is_little_endian: bool,                    // ELF endianness
     pub(crate) load_segments: Vec<LoadSegment>,           // the PT_LOAD program headers: where each loaded range runs and where it is stored

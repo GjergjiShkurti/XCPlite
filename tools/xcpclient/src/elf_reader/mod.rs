@@ -483,6 +483,41 @@ impl ElfReader {
             }
         }
         seg_definitions.sort_by_key(|x| x.2);
+
+        // An mc-instrument application creates one segment per record of its mci_insts section,
+        // numbered in calseg__ marker order, and the numbers below come from the markers the debug
+        // info holds. A segment declared in a translation unit compiled without -g -- or with -g1 or
+        // -gsplit-dwarf, whose variables this reader does not find -- has a record and no marker
+        // there: it was missing from the A2L, and every segment after it was described one number too
+        // low, so a tool calibrating one wrote another. Without that debug information its fields
+        // cannot be described either, so no A2L is written.
+        if let Some((_, data)) = &self.debug_data.mci_insts_data {
+            let records = parse_instance_records(data, self.debug_data.ptr_size, self.debug_data.is_little_endian)?;
+            let undescribed: Vec<String> = records
+                .iter()
+                .filter_map(|r| {
+                    let name = self.read_rodata_cstr(r.name_ptr);
+                    let found = seg_definitions.iter().any(|(seg, _, addr, _)| *addr == r.marker || name.as_deref() == Some(seg.as_str()));
+                    (!found).then(|| name.map_or_else(|| format!("the one whose marker is at 0x{:08X}", r.marker), |name| format!("'{name}'")))
+                })
+                .collect();
+            if !undescribed.is_empty() {
+                let (what, is, file) = if undescribed.len() == 1 {
+                    ("calibration segment", "is", "the file that declares it was")
+                } else {
+                    ("calibration segments", "are", "the files that declare them were")
+                };
+                return Err(format!(
+                    "{what} {} {is} not in the ELF's debug information: {file} compiled without -g, or with -g1 or -gsplit-dwarf, \
+                     whose variables this reader does not find. The application creates every segment, so an A2L leaving one out \
+                     would describe the segments after it under the wrong numbers, and a segment's fields cannot be described \
+                     without its debug information. Compile with -g; no A2L is written",
+                    undescribed.join(", ")
+                )
+                .into());
+            }
+        }
+
         // Calculate the segment numbers for calseg, calblk doues not have a number
         let mut seg_number: u8 = 0;
         for i in 0..seg_definitions.len() {
@@ -753,48 +788,86 @@ impl ElfReader {
         }
     }
 
-    // Register events from event creation markers (evt__name) in the code
-    pub fn register_events(&self, reg: &mut Registry, verbose: usize) -> Result<(), Box<dyn Error>> {
-        info!("===============================================================");
+    /// Register one event per record of the xcp_evts section. XcpInit creates the server's events
+    /// from these records, in section order, so an event's number is its record's position, and the
+    /// record holds the event's name and cycle time. The evt__<name> variable in the debug info only
+    /// says where an event was declared, and a translation unit compiled without -g has none: an
+    /// event looked up there was missing from the A2L, and the measurements naming it were bound to
+    /// event 0, while the application created it all the same.
+    fn register_section_events(&self, reg: &mut Registry, base: u64, data: &[u8]) -> Result<(), Box<dyn Error>> {
+        let records = parse_event_records(data, base, self.debug_data.ptr_size, self.debug_data.is_little_endian)?;
 
-        info!("Registering event information:");
-
-        // Get the address of the XCP event descriptor memory section
-        let xcp_event_section_addr = self.debug_data.get_event_section_addr();
-
-        // An event name belongs to one MEASURE. Each site defines its own evt__<name> record in
-        // xcp_evts, so a name defined at two addresses there is two sites -- one event with one DAQ
-        // list, triggered from two places, which the running application also refuses. Counted by
-        // address, not by DWARF definition: an inline function's MEASURE is one site however many
-        // units include it (the linker keeps one COMDAT copy, and the other units' definitions point
-        // at it or, for a discarded copy, at no address in the section).
-        let evt_section = self.debug_data.sections.get("xcp_evts").copied();
-        let mut duplicate_events: Vec<String> = Vec::new();
+        // Where each record was declared, from the debug info, by the record's address: an inline
+        // function's MEASURE is one record however many units include it (the linker keeps one COMDAT
+        // copy), and every unit's definition points at that one.
+        let mut declared: std::collections::HashMap<u64, (&str, &VarInfo)> = std::collections::HashMap::new();
         for (var_name, var_infos) in &self.debug_data.variables {
-            let Some(evt_name) = var_name.strip_prefix("evt__") else {
-                continue;
-            };
-            let Some((start, end)) = evt_section else {
-                break;
-            };
-            // One place per distinct record address: the first definition found at it.
-            let mut sites: std::collections::BTreeMap<u64, &VarInfo> = std::collections::BTreeMap::new();
-            for v in var_infos.iter().filter(|v| v.address.1 >= start && v.address.1 < end) {
-                sites.entry(v.address.1).or_insert(v);
-            }
-            if sites.len() > 1 {
-                let places: Vec<String> = sites
-                    .values()
-                    .map(|v| {
-                        let unit = self.debug_data.make_simple_unit_name(v.unit_idx).unwrap_or_else(|| format!("{}", v.unit_idx));
-                        format!("{}:{}", unit, v.function.as_deref().unwrap_or("?"))
-                    })
-                    .collect();
-                duplicate_events.push(format!("'{}' ({} sites: {})", evt_name, sites.len(), places.join(", ")));
+            if let Some(evt_name) = var_name.strip_prefix("evt__") {
+                for v in var_infos {
+                    declared.entry(v.address.1).or_insert((evt_name, v));
+                }
             }
         }
+        // A descriptor the debug info has outside the section is one the compiler took out of it -- a
+        // MEASURE in a template, whose section attribute gcc drops -- so the application does not
+        // create its event at startup, and the A2L does not describe it.
+        let end = base + data.len() as u64;
+        for (var_name, var_infos) in &self.debug_data.variables {
+            let Some(name) = var_name.strip_prefix("evt__") else {
+                continue;
+            };
+            for v in var_infos.iter().filter(|v| v.address.0 == 0 && v.address.1 != 0 && (v.address.1 < base || v.address.1 >= end)) {
+                let unit = self.debug_data.make_simple_unit_name(v.unit_idx).unwrap_or_else(|| format!("{}", v.unit_idx));
+                warn!(
+                    "Event '{}' in {}:{} has its descriptor at {:#x}, outside the xcp_evts section, so it is not in the A2L: \
+                     a MEASURE in a template, whose section attribute the compiler drops",
+                    name,
+                    unit,
+                    v.function.as_deref().unwrap_or("?"),
+                    v.address.1
+                );
+            }
+        }
+        let place = |addr: u64| match declared.get(&addr) {
+            Some((_, v)) => {
+                let unit = self.debug_data.make_simple_unit_name(v.unit_idx).unwrap_or_else(|| format!("{}", v.unit_idx));
+                format!("{}:{}", unit, v.function.as_deref().unwrap_or("?"))
+            }
+            None => "a unit without debug information".to_string(),
+        };
+
+        // Each record's name: the string its name pointer holds, or, where that cannot be read, the
+        // evt__<name> variable at the record's address.
+        let mut names: Vec<String> = Vec::with_capacity(records.len());
+        for r in &records {
+            let name = self.read_rodata_cstr(r.name_ptr).or_else(|| declared.get(&r.addr).map(|(name, _)| name.to_string()));
+            let Some(name) = name else {
+                return Err(format!(
+                    "the xcp_evts record at 0x{:08X} points at its event's name at 0x{:08X}, outside .rodata, and the debug info has no \
+                     evt__ variable there: its event cannot be named, so no A2L is written",
+                    r.addr, r.name_ptr
+                )
+                .into());
+            };
+            names.push(name);
+        }
+
+        // An event name belongs to one MEASURE. Each site has its own record, so a name with two
+        // records is two sites -- one event with one DAQ list, triggered from two places, which the
+        // running application also refuses.
+        let mut sites: std::collections::BTreeMap<&str, Vec<u64>> = std::collections::BTreeMap::new();
+        for (name, r) in names.iter().zip(&records) {
+            sites.entry(name.as_str()).or_default().push(r.addr);
+        }
+        let duplicate_events: Vec<String> = sites
+            .iter()
+            .filter(|(_, addrs)| addrs.len() > 1)
+            .map(|(name, addrs)| {
+                let places: Vec<String> = addrs.iter().map(|a| place(*a)).collect();
+                format!("'{}' ({} sites: {})", name, addrs.len(), places.join(", "))
+            })
+            .collect();
         if !duplicate_events.is_empty() {
-            duplicate_events.sort();
             return Err(format!(
                 "event name used by more than one MEASURE: {}. An event belongs to one call site -- two would share one \
                  DAQ list and trigger it from two places. Give each MEASURE an event name of its own. A MEASURE in a \
@@ -803,6 +876,55 @@ impl ElfReader {
             )
             .into());
         }
+
+        // The A2L lists events in the order they are registered. Those with an evt__ variable come in
+        // the order of the debug info, which is the order the search below has always given them;
+        // those without follow, in section order.
+        let mut order: Vec<usize> = Vec::with_capacity(records.len());
+        let mut placed = vec![false; records.len()];
+        for var_name in self.debug_data.variables.keys() {
+            if let Some(evt_name) = var_name.strip_prefix("evt__")
+                && let Some(i) = names.iter().position(|name| name == evt_name)
+                && !placed[i]
+            {
+                placed[i] = true;
+                order.push(i);
+            }
+        }
+        order.extend((0..records.len()).filter(|&i| !placed[i]));
+
+        for i in order {
+            let (name, r) = (&names[i], &records[i]);
+            if reg.event_list.find_event(name, 0).is_some() {
+                continue; // already known, from the server this client is connected to
+            }
+            if declared.contains_key(&r.addr) {
+                info!("Event definition for event '{}' found in {}, addr = {:#x}", name, place(r.addr), r.addr);
+            } else {
+                info!("Event '{}' has no debug information: its record at {:#x} names it", name, r.addr);
+            }
+            let event_id = u16::try_from(i).map_err(|_| format!("event '{name}' is record {i} of the xcp_evts section, past the 16 bit event numbers"))?;
+            reg.event_list.add_event(McEvent::new(name.clone(), 0, event_id, r.cycle_time_ns))?;
+            info!("New event '{}' found: event id = {}, cycle time = {} ns", name, event_id, r.cycle_time_ns);
+        }
+        Ok(())
+    }
+
+    // Register events from event creation markers (evt__name) in the code
+    pub fn register_events(&self, reg: &mut Registry, verbose: usize) -> Result<(), Box<dyn Error>> {
+        info!("===============================================================");
+
+        info!("Registering event information:");
+
+        // The records of the xcp_evts section, where the ELF has one, are what the server creates its
+        // events from: see register_section_events. The search below finds events by their evt__<name>
+        // variables in the debug info, so it serves an ELF without the section.
+        if let Some((base, data)) = &self.debug_data.xcp_evts_data {
+            return self.register_section_events(reg, *base, data);
+        }
+
+        // Get the address of the XCP event descriptor memory section
+        let xcp_event_section_addr = self.debug_data.get_event_section_addr();
 
         // Iterate over variables
         for (var_name, var_infos) in &self.debug_data.variables {
@@ -1523,20 +1645,21 @@ impl ElfReader {
             // trigger that does not carry their addresses.
             let event_id = match reg.event_list.find_event(&r.event, 0) {
                 Some(e) => e.id,
-                None => {
-                    // Event 0 either way, but said out loud either way too. The warning used to be
-                    // conditional on the name being non-empty, which silenced the case that needs
-                    // it most: a descriptor with no event at all is bound to whichever event
-                    // happens to be 0, whose trigger does not carry its address.
-                    if r.event.is_empty() {
-                        warn!("measurement '{}' names no event; binding it to event 0", r.name);
-                    } else {
-                        warn!(
-                            "measurement '{}' names event '{}', which is not in the ELF's event section; binding it to event 0",
-                            r.name, r.event
-                        );
-                    }
+                // A descriptor built outside any MEASURE names no event, and is bound to whichever
+                // event happens to be 0, whose trigger does not carry its address: said out loud.
+                None if r.event.is_empty() => {
+                    warn!("measurement '{}' names no event; binding it to event 0", r.name);
                     0
+                }
+                // Events come from the xcp_evts records, one per MEASURE, so a measurement whose
+                // event has none would be measured on another event's trigger: an A2L that cannot
+                // be measured, refused rather than written.
+                None => {
+                    return Err(format!(
+                        "measurement '{}' names event '{}', which has no record in the ELF's xcp_evts section, so no A2L is written",
+                        r.name, r.event
+                    )
+                    .into());
                 }
             };
             // Absolute addresses carry the target's absolute extension, which is not always 0:
@@ -3215,6 +3338,87 @@ impl ElfReader {
     }
 }
 
+/// A pointer of the target at `at` in `bytes`: `ptr_size` bytes in the target's byte order.
+fn read_target_ptr(bytes: &[u8], at: usize, ptr_size: u8, little_endian: bool) -> Option<u64> {
+    let raw = bytes.get(at..at.checked_add(ptr_size as usize)?)?;
+    Some(match (ptr_size, little_endian) {
+        (8, true) => u64::from_le_bytes(raw.try_into().ok()?),
+        (8, false) => u64::from_be_bytes(raw.try_into().ok()?),
+        (4, true) => u32::from_le_bytes(raw.try_into().ok()?) as u64,
+        (4, false) => u32::from_be_bytes(raw.try_into().ok()?) as u64,
+        _ => return None,
+    })
+}
+
+/// One record of the xcp_evts section, at `addr`: where its event's name is, and its cycle time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EventRecord {
+    addr: u64,
+    name_ptr: u64,
+    cycle_time_ns: u32,
+}
+
+/// The size of a `tXcpEventDescriptor`, which xcplib.h pads to 16 bytes on every target.
+const XCP_EVENT_RECORD_SIZE: usize = 16;
+
+/// The records of the xcp_evts section, in section order, which is the order XcpInit creates their
+/// events in. `base` is the section's address.
+fn parse_event_records(section: &[u8], base: u64, ptr_size: u8, little_endian: bool) -> Result<Vec<EventRecord>, String> {
+    if section.len() % XCP_EVENT_RECORD_SIZE != 0 {
+        return Err(format!(
+            "the xcp_evts section holds {} bytes, which is not a whole number of {XCP_EVENT_RECORD_SIZE}-byte event records",
+            section.len()
+        ));
+    }
+    let mut records = Vec::with_capacity(section.len() / XCP_EVENT_RECORD_SIZE);
+    for (i, record) in section.chunks_exact(XCP_EVENT_RECORD_SIZE).enumerate() {
+        let name_ptr = read_target_ptr(record, 0, ptr_size, little_endian).ok_or_else(|| format!("a {ptr_size}-byte pointer is no target pointer"))?;
+        let cycle = record
+            .get(ptr_size as usize..ptr_size as usize + 4)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .ok_or_else(|| format!("a {ptr_size}-byte pointer leaves no room for the cycle time in a {XCP_EVENT_RECORD_SIZE}-byte event record"))?;
+        records.push(EventRecord {
+            addr: base + (i * XCP_EVENT_RECORD_SIZE) as u64,
+            name_ptr,
+            cycle_time_ns: if little_endian { u32::from_le_bytes(cycle) } else { u32::from_be_bytes(cycle) },
+        });
+    }
+    Ok(records)
+}
+
+/// One record of mc-instrument's mci_insts section (`mci::InstanceMeta`): where the segment's name
+/// is, and the address of its calseg__<name> marker, which the application numbers its segments by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstanceRecord {
+    name_ptr: u64,
+    marker: u64,
+}
+
+/// The pointers of an `mci::InstanceMeta`: name, label, type, page, index and marker.
+const MCI_INSTANCE_POINTERS: usize = 6;
+
+/// The records of the mci_insts section.
+fn parse_instance_records(section: &[u8], ptr_size: u8, little_endian: bool) -> Result<Vec<InstanceRecord>, String> {
+    let size = MCI_INSTANCE_POINTERS * ptr_size as usize;
+    if size == 0 || section.len() % size != 0 {
+        return Err(format!(
+            "the mci_insts section holds {} bytes, which is not a whole number of {size}-byte segment records",
+            section.len()
+        ));
+    }
+    section
+        .chunks_exact(size)
+        .map(|record| {
+            let name_ptr = read_target_ptr(record, 0, ptr_size, little_endian);
+            let marker = read_target_ptr(record, (MCI_INSTANCE_POINTERS - 1) * ptr_size as usize, ptr_size, little_endian);
+            match (name_ptr, marker) {
+                (Some(name_ptr), Some(marker)) => Ok(InstanceRecord { name_ptr, marker }),
+                _ => Err(format!("a {ptr_size}-byte pointer is no target pointer")),
+            }
+        })
+        .collect()
+}
+
 /// The cycle time of an event descriptor record: a `uint32_t` right behind the name pointer,
 /// `ptr_size` bytes into the 16-byte record (`tXcpEventDescriptor`, xcplite.h), in the target's
 /// byte order. `base` is the address of the first record in `section`. `None` when the record is
@@ -3351,6 +3555,65 @@ mod tests {
         assert_eq!(read_event_cycle_ns(&[], 0x4000, 0x4000, 4, true), None);
         // no overflow on a wild address
         assert_eq!(read_event_cycle_ns(&data, 0, u64::MAX, 8, true), None);
+    }
+
+    // one tXcpEventDescriptor: name pointer, cycle time, priority, padded to 16 bytes
+    fn event_record(name_ptr: u64, cycle_ns: u32, ptr_size: usize, little_endian: bool) -> Vec<u8> {
+        let mut record = vec![0u8; XCP_EVENT_RECORD_SIZE];
+        let ptr = if little_endian { name_ptr.to_le_bytes() } else { name_ptr.to_be_bytes() };
+        let ptr = if little_endian { &ptr[..ptr_size] } else { &ptr[8 - ptr_size..] };
+        record[..ptr_size].copy_from_slice(ptr);
+        let cycle = if little_endian { cycle_ns.to_le_bytes() } else { cycle_ns.to_be_bytes() };
+        record[ptr_size..ptr_size + 4].copy_from_slice(&cycle);
+        record
+    }
+
+    #[test]
+    fn event_records_are_numbered_by_position() {
+        for (ptr_size, little_endian) in [(8, true), (4, true), (4, false), (8, false)] {
+            let mut section = event_record(0x3212D, 0, ptr_size, little_endian);
+            section.extend(event_record(0x321C8, 20_000_000, ptr_size, little_endian));
+            let records = parse_event_records(&section, 0x4A230, ptr_size as u8, little_endian).unwrap();
+            assert_eq!(
+                records,
+                vec![
+                    EventRecord { addr: 0x4A230, name_ptr: 0x3212D, cycle_time_ns: 0 },
+                    EventRecord { addr: 0x4A240, name_ptr: 0x321C8, cycle_time_ns: 20_000_000 },
+                ],
+                "{ptr_size}-byte pointers, little endian {little_endian}"
+            );
+        }
+        assert_eq!(parse_event_records(&[], 0x4000, 8, true), Ok(vec![]));
+    }
+
+    #[test]
+    fn an_event_section_of_partial_records_is_refused() {
+        let section = event_record(0x1000, 0, 8, true);
+        assert!(parse_event_records(&section[..12], 0x4000, 8, true).is_err());
+        assert!(parse_event_records(&[0u8; 24], 0x4000, 8, true).is_err());
+    }
+
+    // one mci::InstanceMeta: six pointers, the name first and the marker last
+    fn instance_record(name_ptr: u64, marker: u64, ptr_size: usize) -> Vec<u8> {
+        let mut record = Vec::new();
+        for p in [name_ptr, 0x5F21, 0x526A, 0x525E, 0x4A062, marker] {
+            record.extend_from_slice(&p.to_le_bytes()[..ptr_size]);
+        }
+        record
+    }
+
+    #[test]
+    fn instance_records_give_the_name_and_the_marker() {
+        for ptr_size in [8usize, 4] {
+            let mut section = instance_record(0x3217A, 0x3AFB0, ptr_size);
+            section.extend(instance_record(0x32212, 0x3AFC0, ptr_size));
+            assert_eq!(
+                parse_instance_records(&section, ptr_size as u8, true).unwrap(),
+                vec![InstanceRecord { name_ptr: 0x3217A, marker: 0x3AFB0 }, InstanceRecord { name_ptr: 0x32212, marker: 0x3AFC0 }],
+                "{ptr_size}-byte pointers"
+            );
+        }
+        assert!(parse_instance_records(&instance_record(1, 2, 8)[..40], 8, true).is_err());
     }
 
     #[test]
