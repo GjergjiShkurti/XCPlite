@@ -40,6 +40,7 @@ struct DebugDataReader<'elffile> {
     epk_addr: u64,
     xcp_meta_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes)
     mci_meta_data: Option<Vec<u8>>,        // raw bytes of the mci_meta section (mc-instrument calibration metadata)
+    mci_tbls_data: Option<Vec<u8>>,        // raw bytes of the mci_tbls section: the shape and shared axes of each curve, map and axis
     mci_app_name: Option<String>,          // the application's own name, from the mci_app section
     mci_app_data: Option<Vec<u8>>,         // raw bytes of mci_app: the application record, its name and, since issue 225, its endpoint
     mci_meas_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of mci_meas (mc-instrument measurement descriptors)
@@ -115,6 +116,14 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         log::info!("mc-instrument calibration metadata section (mci_meta) found, {} bytes", data.len());
     } else {
         log::debug!("mc-instrument calibration metadata section (mci_meta) not found in ELF file");
+    }
+    // read the mci_tbls section raw bytes: one record per curve, map and axis, saying which of the
+    // three it is and which axes it shares -- what DWARF, which sees an array, cannot say
+    let mci_tbls_data: Option<Vec<u8>> = elffile.section_by_name("mci_tbls").and_then(|s| s.data().ok()).map(|data| data.to_vec());
+    if let Some(ref data) = mci_tbls_data {
+        log::info!("mc-instrument calibration table section (mci_tbls) found, {} bytes", data.len());
+    } else {
+        log::debug!("mc-instrument calibration table section (mci_tbls) not found in ELF file");
     }
     // read the mci_app section: the application record (AppMeta in mc_meas_abi.hpp) -- the name as
     // characters, then, since issue 225, the endpoint its XCP server listens on. The runtime A2L
@@ -226,6 +235,7 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         epk_addr,
         xcp_meta_data,
         mci_meta_data,
+        mci_tbls_data,
         mci_app_name,
         mci_app_data,
         mci_meas_data,
@@ -386,6 +396,7 @@ impl DebugDataReader<'_> {
             epk_addr: self.epk_addr,
             xcp_meta_data: self.xcp_meta_data,
             mci_meta_data: self.mci_meta_data,
+            mci_tbls_data: self.mci_tbls_data,
             mci_app_name: self.mci_app_name,
             mci_app_data: self.mci_app_data,
             mci_meas_data: self.mci_meas_data,

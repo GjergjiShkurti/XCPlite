@@ -889,6 +889,9 @@ async fn xcp_client(
                     elf_reader.register_metadata(&mut reg, verbose)?;
                     // Apply mc-instrument's calibration field metadata from the mci_meta ELF section
                     elf_reader.register_cal_metadata(&mut reg, verbose)?;
+                    // ... and its calibration tables', from the mci_tbls ELF section, with each curve, map
+                    // and axis described as one, where DWARF alone sees an array
+                    elf_reader.register_cal_tables(&mut reg, verbose)?;
                     // Register the measurements the mci_meas descriptor section describes, by identifier
                     // or, where the backend supplied one (VX1000), by absolute address
                     if let Some(records) = mci.as_deref() {

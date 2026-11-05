@@ -108,6 +108,9 @@ needs one asks for the list. A build from before the option exits with a usage e
 the same as a name that is missing. `--version` names the commit the build is from (issue 214),
 not what it does; `--print-features` does.
 
+A build that describes mc-instrument's curves, maps and axes as such, from their `mci_tbls`
+records, where the debug information alone sees arrays, also lists `a2l-cal-tables`.
+
 Pointer members of a structure type are `ULONG` or `ULONGLONG` by the target's address size. They
 were typed from the wrong field of the debug information, so a 32-bit target got `ULONGLONG`.
 

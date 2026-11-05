@@ -2518,6 +2518,8 @@ pub const FEATURES: &[&str] = &[
     "a2l-require-proto",
     // --check-epk compares the device's EPK with the ELF's or the A2L's (issue 375)
     "check-epk",
+    // a curve, a map and an axis are described as one, from the mci_tbls record, not as an array
+    "a2l-cal-tables",
 ];
 
 /// True when the A2L cannot state what the server sends and must not be written (issue 370): a
@@ -2970,23 +2972,7 @@ impl TypedefFieldIndex {
     }
 
     fn set_field_support_data(&mut self, reg: &mut Registry, instance_name: &str, field_path: &str, mut support_data: McSupportData) -> Result<(), RegistryError> {
-        let parts: Vec<&str> = field_path.split('.').collect();
-        let target_field_name = parts[parts.len() - 1];
-        let path = &field_path[..field_path.len() - target_field_name.len()];
-        let owner = match self.owner_at.get(instance_name).and_then(|paths| paths.get(path)) {
-            Some(owner) => *owner,
-            None => {
-                let owner = self.typedef_at(reg, instance_name, &parts[..parts.len() - 1]);
-                self.owner_at.entry(instance_name.to_string()).or_default().insert(path.to_string(), owner);
-                owner
-            }
-        };
-        let field = owner
-            .and_then(|index| {
-                let at = *self.field_at.entry(index).or_insert_with(|| Self::fields_by_name(reg, index)).get(target_field_name)?;
-                reg.typedef_list.get_mut(index).fields.iter_mut().nth(at)
-            })
-            .ok_or_else(|| RegistryError::NotFound(field_path.to_string()))?;
+        let field = self.field_mut(reg, instance_name, field_path).ok_or_else(|| RegistryError::NotFound(field_path.to_string()))?;
 
         // The merge, as set_instance_field_support_data does it.
         if field.mc_support_data.has_metadata() {
@@ -2998,6 +2984,25 @@ impl TypedefFieldIndex {
         }
         field.mc_support_data = support_data;
         Ok(())
+    }
+
+    /// The typedef field `field_path` names inside the instance, as set_instance_field_support_data
+    /// finds it, or nothing when the instance is not a typedef's or the typedef has no such field.
+    fn field_mut<'r>(&mut self, reg: &'r mut Registry, instance_name: &str, field_path: &str) -> Option<&'r mut McTypeDefField> {
+        let parts: Vec<&str> = field_path.split('.').collect();
+        let target_field_name = parts[parts.len() - 1];
+        let path = &field_path[..field_path.len() - target_field_name.len()];
+        let owner = match self.owner_at.get(instance_name).and_then(|paths| paths.get(path)) {
+            Some(owner) => *owner,
+            None => {
+                let owner = self.typedef_at(reg, instance_name, &parts[..parts.len() - 1]);
+                self.owner_at.entry(instance_name.to_string()).or_default().insert(path.to_string(), owner);
+                owner
+            }
+        };
+        let index = owner?;
+        let at = *self.field_at.entry(index).or_insert_with(|| Self::fields_by_name(reg, index)).get(target_field_name)?;
+        reg.typedef_list.get_mut(index).fields.iter_mut().nth(at)
     }
 
     fn fields_by_name(reg: &Registry, index: usize) -> std::collections::HashMap<&'static str, usize> {
@@ -3241,6 +3246,214 @@ impl ElfReader {
             }
         }
         roots
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// mc-instrument calibration tables (mci_tbls section)
+//
+// DWARF describes a curve, a map and an axis as the arrays they are declared as, so on its own the
+// offline A2L made each a VAL_BLK. mc-instrument writes one record per table field into a section of
+// its own, in place of the field's mci_meta record: the same unit, comment and limits, then which of
+// the three the field is and which sibling fields it uses as axes. This applies the metadata as
+// register_cal_metadata applies a parameter's, and makes the field what mc-instrument's runtime route
+// makes it: a TYPEDEF_AXIS, or a TYPEDEF_CHARACTERISTIC CURVE or MAP with its AXIS_DESCR, a shared
+// axis as COM_AXIS ... AXIS_PTS_REF THIS.<axis>, a fixed one as FIX_AXIS ... FIX_AXIS_PAR_DIST 0 1 <n>.
+
+/// Byte layout of one `mci::TableMeta`, fixed by mc-instrument's static_asserts (mc.hpp): a whole
+/// `mci::CalMeta`, the two axes as names of the field width, then x and y as 16-bit counts and four
+/// reserved bytes.
+const MCI_TBL_NAME_LEN: usize = MCI_META_FIELD_LEN;
+const MCI_TBL_RECORD_LEN: usize = MCI_META_RECORD_LEN + 2 * MCI_TBL_NAME_LEN + 8;
+
+/// What a table record makes of its field: decided by the shape, in the encoding both the record and
+/// the runtime route's FieldLayout use, by the rule the runtime route's A2L writer applies -- (n, 0)
+/// with n > 1 an axis, (n, m) with m > 1 a map, (n, 1) with n > 1 a curve, (1, 1) a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalTableKind {
+    Axis,
+    Curve,
+    Map,
+    Value,
+}
+
+struct CalTableRecord {
+    /// The unit, comment and limits, and the declaring type and the field, as in an mci_meta record
+    meta: CalMetaRecord,
+    /// The sibling field this table shares as its x axis, "" for a fixed axis
+    x_axis: String,
+    y_axis: String,
+    x_dim: u16,
+    y_dim: u16,
+}
+
+impl CalTableRecord {
+    fn kind(&self) -> Result<CalTableKind, String> {
+        match (self.x_dim, self.y_dim) {
+            (x, 0) if x > 1 => Ok(CalTableKind::Axis),
+            (x, y) if x >= 1 && y > 1 => Ok(CalTableKind::Map),
+            (x, 1) if x > 1 => Ok(CalTableKind::Curve),
+            (1, 1) => Ok(CalTableKind::Value),
+            (x, y) => Err(format!(
+                "the mci_tbls record of '{}.{}' gives it the shape ({x}, {y}), which is no axis, curve or map, so the record cannot be what mc-instrument writes",
+                self.meta.owner, self.meta.field
+            )),
+        }
+    }
+}
+
+/// Every record of the section, or the reason it cannot be read: a section that is not a whole number
+/// of records, or a text that is not UTF-8, is not one mc-instrument writes, and reading it anyway
+/// would describe the tables after the first bad byte wrongly.
+fn parse_cal_table_records(data: &[u8], is_le: bool) -> Result<Vec<CalTableRecord>, String> {
+    if data.len() % MCI_TBL_RECORD_LEN != 0 {
+        return Err(format!(
+            "the mci_tbls section is {} bytes, not a whole number of {MCI_TBL_RECORD_LEN}-byte records: mc-instrument and this reader disagree on its layout, so no A2L is written",
+            data.len()
+        ));
+    }
+    data.chunks(MCI_TBL_RECORD_LEN)
+        .enumerate()
+        .map(|(index, record)| {
+            let not_utf8 = || format!("record {index} of the mci_tbls section holds a text that is not UTF-8, so no A2L is written");
+            let meta = parse_cal_meta_record(&record[..MCI_META_RECORD_LEN], is_le).ok_or_else(not_utf8)?;
+            let axis = |n: usize| read_cstr_bounded(record, MCI_META_RECORD_LEN + n * MCI_TBL_NAME_LEN, MCI_TBL_NAME_LEN).ok_or_else(not_utf8);
+            let count = |offset: usize| {
+                let raw = [record[offset], record[offset + 1]];
+                if is_le { u16::from_le_bytes(raw) } else { u16::from_be_bytes(raw) }
+            };
+            let shape = MCI_META_RECORD_LEN + 2 * MCI_TBL_NAME_LEN;
+            Ok(CalTableRecord {
+                meta,
+                x_axis: axis(0)?,
+                y_axis: axis(1)?,
+                x_dim: count(shape),
+                y_dim: count(shape + 2),
+            })
+        })
+        .collect()
+}
+
+/// The range an unset limit stands for, by value type: the one the runtime route resolves a table's
+/// to (mc_meas_abi.hpp's type_min / type_max, xcplite's A2lGetTypeMin / A2lGetTypeMax). Without it the
+/// registry's own default for a float, +-1e32, would stand where the runtime route writes +-1e12.
+fn value_type_range(value_type: McValueType) -> Option<(f64, f64)> {
+    let a2l_type: i8 = match value_type {
+        McValueType::Bool | McValueType::Ubyte => 1,
+        McValueType::Uword => 2,
+        McValueType::Ulong => 4,
+        McValueType::Ulonglong => 8,
+        McValueType::Sbyte => -1,
+        McValueType::Sword => -2,
+        McValueType::Slong => -4,
+        McValueType::Slonglong => -8,
+        McValueType::Float32Ieee => -9,
+        McValueType::Float64Ieee => -10,
+        _ => return None,
+    };
+    Some((a2l_type_min(a2l_type), a2l_type_max(a2l_type)))
+}
+
+/// Make the typedef field the table the record describes, after its metadata is applied. The field
+/// came from DWARF, so its element count has to be the record's: one that is not means the two
+/// describe different declarations, and the table is refused rather than given a shape its memory
+/// does not have.
+fn apply_cal_table(field: &mut McTypeDefField, record: &CalTableRecord, kind: CalTableKind) -> Result<(), String> {
+    let [d0, d1] = field.dim_type.get_dim();
+    let (x_dim, y_dim) = (record.x_dim, record.y_dim.max(1));
+    if u32::from(d0) * u32::from(d1) != u32::from(x_dim) * u32::from(y_dim) {
+        return Err(format!(
+            "'{}.{}' is a table of {x_dim} x {y_dim} values by its mci_tbls record and an array of {d0} x {d1} by its debug information, so no A2L is written",
+            record.meta.owner, record.meta.field
+        ));
+    }
+    // x first, as the record and the A2L count them: DWARF lists a map's [y][x] the other way round.
+    field.dim_type = McDimType::new(field.dim_type.value_type, x_dim, y_dim);
+    let support_data = &mut field.mc_support_data;
+    support_data.object_type = if kind == CalTableKind::Axis { McObjectType::Axis } else { McObjectType::Characteristic };
+    // An axis of a curve or a map: a sibling's, referenced from inside the typedef, or a fixed one,
+    // which xcp_registry writes as a FIX_AXIS when the axis has a conversion and no reference.
+    let axis = |name: &str| -> (Option<xcp_registry::McIdentifier>, Option<xcp_registry::McIdentifier>) {
+        if name.is_empty() { (None, Some("NO_COMPU_METHOD".into())) } else { (Some(format!("THIS.{name}").into()), None) }
+    };
+    if kind != CalTableKind::Axis {
+        (support_data.x_axis_ref, support_data.x_axis_conv) = axis(&record.x_axis);
+    }
+    if kind == CalTableKind::Map {
+        (support_data.y_axis_ref, support_data.y_axis_conv) = axis(&record.y_axis);
+    }
+    if support_data.min.is_none() && support_data.max.is_none() {
+        if let Some((min, max)) = value_type_range(field.dim_type.value_type) {
+            support_data.min = Some(min);
+            support_data.max = Some(max);
+        }
+    }
+    Ok(())
+}
+
+impl ElfReader {
+    /// Read mc-instrument's calibration table records from the `mci_tbls` section, apply each one's
+    /// metadata as `register_cal_metadata` applies a parameter's, and make each table's typedef field
+    /// the axis, curve or map it is. Called after `register_segments` and `register_variables`.
+    pub fn register_cal_tables(&self, reg: &mut Registry, verbose: usize) -> Result<(), Box<dyn Error>> {
+        let Some(data) = self.debug_data.mci_tbls_data.as_ref() else {
+            return Ok(());
+        };
+        if data.is_empty() {
+            return Ok(());
+        }
+        let records = parse_cal_table_records(data, self.debug_data.is_little_endian)?;
+        info!("===============================================================");
+        info!("Registering mc-instrument calibration tables from mci_tbls section: {} records", records.len());
+
+        let segments = self.calseg_roots();
+        if segments.is_empty() {
+            warn!("mci_tbls section present but no calibration segment markers were found; tables not described");
+            return Ok(());
+        }
+        // Where each declaring type sits in each segment, as register_cal_metadata finds it.
+        let owners: std::collections::HashSet<String> = records.iter().map(|record| record.meta.owner.clone()).collect();
+        let mut holders_of: std::collections::HashMap<String, Vec<(usize, Vec<String>)>> = std::collections::HashMap::new();
+        for (index, (_, root)) in segments.iter().enumerate() {
+            for (owner, prefixes) in self.paths_to_types(root, &owners) {
+                holders_of.entry(owner).or_default().push((index, prefixes));
+            }
+        }
+        let mut fields = TypedefFieldIndex::new(reg);
+
+        for record in &records {
+            let kind = record.kind()?;
+            let mut applied = 0;
+            for (index, prefixes) in holders_of.get(&record.meta.owner).map_or(&[][..], Vec::as_slice) {
+                let segment = &segments[*index].0;
+                for prefix in prefixes {
+                    let path = format!("{}{}", prefix, record.meta.field);
+                    if !record.meta.is_empty() {
+                        self.apply_cal_metadata(reg, &mut fields, segment, &path, &record.meta, verbose);
+                    }
+                    applied += 1;
+                    if kind == CalTableKind::Value {
+                        continue; // a table of one value is a VALUE, which is what DWARF already made it
+                    }
+                    match fields.field_mut(reg, segment, &path) {
+                        Some(field) => {
+                            apply_cal_table(field, record, kind)?;
+                            if verbose >= 1 {
+                                info!("  Table {:?} applied to typedef field '{}.{}'", kind, segment, path);
+                            }
+                        }
+                        // As for a metadata record naming a field the segment does not have: always a
+                        // defect, and the table would be a VAL_BLK without a word.
+                        None => warn!("Calibration table '{}.{}': no typedef field of that name, so it is described as a plain array", segment, path),
+                    }
+                }
+            }
+            // Not an error, as for register_cal_metadata: a type can be declared and never instantiated.
+            if applied == 0 {
+                debug!("Calibration table '{}.{}': no segment holds that type", record.meta.owner, record.meta.field);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -4080,11 +4293,116 @@ mod tests {
                 "a2l-ident-field",
                 "a2l-require-proto",
                 "check-epk",
+                "a2l-cal-tables",
             ]
         );
         let mut names = FEATURES.to_vec();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), FEATURES.len());
+    }
+
+    /// One mci::TableMeta as mc.hpp lays it out: a CalMeta (owner, field, unit, comment, min, max), the
+    /// two axes as names of the field width, x and y, four reserved bytes.
+    fn table_record(names: [&str; 4], axes: [&str; 2], limits: (f64, f64), x_dim: u16, y_dim: u16, little_endian: bool) -> Vec<u8> {
+        let mut record = vec![0u8; MCI_TBL_RECORD_LEN];
+        let widths = [MCI_META_OWNER_LEN, MCI_META_FIELD_LEN, MCI_META_UNIT_LEN, MCI_META_COMMENT_LEN];
+        let mut at = 0;
+        for (text, width) in names.iter().zip(widths) {
+            record[at..at + text.len()].copy_from_slice(text.as_bytes());
+            at += width;
+        }
+        let f64_bytes = |v: f64| if little_endian { v.to_le_bytes() } else { v.to_be_bytes() };
+        record[at..at + 8].copy_from_slice(&f64_bytes(limits.0));
+        record[at + 8..at + 16].copy_from_slice(&f64_bytes(limits.1));
+        for (n, axis) in axes.iter().enumerate() {
+            let at = MCI_META_RECORD_LEN + n * MCI_TBL_NAME_LEN;
+            record[at..at + axis.len()].copy_from_slice(axis.as_bytes());
+        }
+        let shape = MCI_META_RECORD_LEN + 2 * MCI_TBL_NAME_LEN;
+        let (x, y) = if little_endian { (x_dim.to_le_bytes(), y_dim.to_le_bytes()) } else { (x_dim.to_be_bytes(), y_dim.to_be_bytes()) };
+        record[shape..shape + 2].copy_from_slice(&x);
+        record[shape + 2..shape + 4].copy_from_slice(&y);
+        record
+    }
+
+    #[test]
+    fn cal_table_records_are_read_by_offset_in_either_byte_order() {
+        assert_eq!(MCI_TBL_RECORD_LEN, 440); // sizeof(mci::TableMeta), which mc.hpp asserts
+        for little_endian in [true, false] {
+            let mut data = table_record(["EngineType", "torque", "Nm", "Torque over speed"], ["rpm", ""], (0.0, 400.0), 8, 1, little_endian);
+            data.extend(table_record(["EngineType", "eff", "%", ""], ["rpm", "load"], (0.0, 0.0), 16, 12, little_endian));
+            let records = parse_cal_table_records(&data, little_endian).unwrap();
+            assert_eq!(records.len(), 2);
+            let (first, second) = (&records[0], &records[1]);
+            assert_eq!((first.meta.owner.as_str(), first.meta.field.as_str(), first.meta.unit.as_str(), first.meta.comment.as_str()), ("EngineType", "torque", "Nm", "Torque over speed"));
+            assert_eq!((first.meta.min, first.meta.max), (0.0, 400.0));
+            assert_eq!((first.x_axis.as_str(), first.y_axis.as_str(), first.x_dim, first.y_dim), ("rpm", "", 8, 1));
+            assert_eq!((second.meta.field.as_str(), second.x_axis.as_str(), second.y_axis.as_str(), second.x_dim, second.y_dim), ("eff", "rpm", "load", 16, 12));
+        }
+    }
+
+    #[test]
+    fn a_cal_table_section_that_is_not_mc_instruments_is_refused() {
+        let record = table_record(["T", "f", "", ""], ["", ""], (0.0, 0.0), 4, 1, true);
+        // not a whole number of records: the layouts disagree
+        let mut data = record.clone();
+        data.extend([0u8; 8]);
+        assert!(parse_cal_table_records(&data, true).err().unwrap().contains("not a whole number"));
+        // a text that is not UTF-8, in the CalMeta part and in an axis
+        for at in [MCI_META_OWNER_LEN, MCI_META_RECORD_LEN + MCI_TBL_NAME_LEN] {
+            let mut data = record.clone();
+            data[at] = 0xFF;
+            assert!(parse_cal_table_records(&data, true).err().unwrap().contains("not UTF-8"));
+        }
+        // a shape that is no table
+        let shaped = |x_dim, y_dim| {
+            let mut records = parse_cal_table_records(&table_record(["T", "f", "", ""], ["", ""], (0.0, 0.0), x_dim, y_dim, true), true).unwrap();
+            records.remove(0).kind()
+        };
+        assert!(shaped(1, 0).is_err());
+        assert!(shaped(0, 3).is_err());
+        assert_eq!(shaped(4, 0), Ok(CalTableKind::Axis));
+        assert_eq!(shaped(4, 1), Ok(CalTableKind::Curve));
+        assert_eq!(shaped(4, 3), Ok(CalTableKind::Map));
+        assert_eq!(shaped(1, 1), Ok(CalTableKind::Value));
+    }
+
+    #[test]
+    fn a_cal_table_becomes_what_the_runtime_route_writes() {
+        let field = |dim: McDimType| McTypeDefField::new("f", dim, McSupportData::new(McObjectType::Characteristic), 0);
+        let record = |axes: [&str; 2], x_dim, y_dim| parse_cal_table_records(&table_record(["T", "f", "", ""], axes, (0.0, 0.0), x_dim, y_dim, true), true).unwrap().remove(0);
+        let apply = |field: &mut McTypeDefField, record: &CalTableRecord| apply_cal_table(field, record, record.kind().unwrap());
+
+        // An axis, no limits stated: the type's range, as the runtime route resolves a table's.
+        let mut axis = field(McDimType::new(McValueType::Float64Ieee, 4, 1));
+        apply(&mut axis, &record(["", ""], 4, 0)).unwrap();
+        assert_eq!(axis.mc_support_data.object_type, McObjectType::Axis);
+        assert_eq!(axis.dim_type.get_dim(), [4, 1]);
+        assert_eq!((axis.mc_support_data.min, axis.mc_support_data.max), (Some(-1e12), Some(1e12)));
+
+        // A curve on a shared axis, its stated limits kept.
+        let mut curve = field(McDimType::new(McValueType::Float32Ieee, 5, 1));
+        (curve.mc_support_data.min, curve.mc_support_data.max) = (Some(0.0), Some(3.0));
+        apply(&mut curve, &record(["speed", ""], 5, 1)).unwrap();
+        assert_eq!(curve.mc_support_data.object_type, McObjectType::Characteristic);
+        assert_eq!(curve.mc_support_data.x_axis_ref.as_ref().map(|r| r.as_str()), Some("THIS.speed"));
+        assert!(curve.mc_support_data.x_axis_conv.is_none());
+        assert_eq!((curve.mc_support_data.min, curve.mc_support_data.max), (Some(0.0), Some(3.0)));
+
+        // A map declared [2][3]: DWARF counts 2 then 3, the record x = 3 then y = 2. A fixed x axis, a shared y.
+        let mut map = field(McDimType::new(McValueType::Uword, 2, 3));
+        apply(&mut map, &record(["", "temp"], 3, 2)).unwrap();
+        assert_eq!(map.dim_type.get_dim(), [3, 2]);
+        assert!(map.mc_support_data.x_axis_ref.is_none());
+        assert_eq!(map.mc_support_data.x_axis_conv.as_ref().map(|c| c.as_str()), Some("NO_COMPU_METHOD"));
+        assert_eq!(map.mc_support_data.y_axis_ref.as_ref().map(|r| r.as_str()), Some("THIS.temp"));
+        assert_eq!((map.mc_support_data.min, map.mc_support_data.max), (Some(0.0), Some(65535.0)));
+
+        // A record whose element count is not the debug information's is refused, and the field left alone.
+        let mut wrong = field(McDimType::new(McValueType::Float64Ieee, 4, 1));
+        assert!(apply(&mut wrong, &record(["", ""], 5, 1)).unwrap_err().contains("5 x 1"));
+        assert_eq!(wrong.mc_support_data.object_type, McObjectType::Characteristic);
+        assert!(wrong.mc_support_data.x_axis_conv.is_none());
     }
 }
