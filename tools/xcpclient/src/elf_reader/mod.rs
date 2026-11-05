@@ -77,6 +77,10 @@ Possible future improvements:
 mod debuginfo;
 use debuginfo::{DbgDataType, DebugData, LoadSegment, TypeInfo, VarInfo};
 
+// The xcp_ and mci_ sections printed as tables (--dump-sections), decoded with this module's record parsers
+mod section_dump;
+pub use section_dump::dump_sections;
+
 //use crate::xcp_client::xcp;
 
 //------------------------------------------------------------------------

@@ -142,6 +142,36 @@ the expected one is not seen. The CANape Kernel does not check the EPK, and a de
 another build then measures plausible values from the wrong addresses. Run the check before a
 measurement.
 
+### `--dump-sections`: what is in the xcp_ and mci_ sections?
+
+```
+xcpclient --elf app.elf --dump-sections
+xcpclient --elf libapp.so --dump-sections --verbose 1
+```
+
+Prints every `xcp_` and `mci_` section of an executable or a shared library as a table, then
+exits: the records xcplite and mc-instrument put into the binary for the offline A2L generator.
+The records are decoded by the generator's own parsers wherever it has one, so the dump shows what
+the generator reads, and a warning a parser gives appears next to its section.
+
+```
+xcp_evts  0x4D6F0  48 bytes
+  3 event descriptors (tXcpEventDescriptor, 16 bytes each), in section order: the order XcpInit creates the events in
+  #  name             cycle         priority  descriptor
+  -  ---------------  ------------  --------  --------------------------
+  0  KernelDemoEvent  0 (sporadic)  0         main::evt__KernelDemoEvent
+  1  KernelDemoArray  0 (sporadic)  0         main::evt__KernelDemoArray
+  2  KernelDemoSlow   1 s           0         main::evt__KernelDemoSlow
+```
+
+It reads no debug information, so a binary built without `-g` dumps too. Pointers are read as the
+loaded image holds them, with the dynamic relocations applied: in a shared library a pointer to a
+function the library exports is 0 in the file, and the dump says how many pointers of a section
+differ from the file. Functions and objects are named from the symbol table; `xcp_meta` needs it,
+because only an object's name says what it is, and in a stripped binary it is shown as bytes, as is
+any section without a decoder. `--verbose 1` adds every section's bytes. A relocatable object is
+refused: its sections hold no addresses until it is linked.
+
 
 
 
@@ -264,6 +294,9 @@ Options:
 
       --allow-registry-protocol
           Create the A2L of a VX1000 ELF that has no xcp_proto record anyway
+
+      --dump-sections
+          Print the xcp_ and mci_ sections of the ELF file (--elf) as tables, then exit
 
   -h, --help
           Print help (see a summary with '-h')

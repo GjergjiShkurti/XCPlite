@@ -240,6 +240,12 @@ struct Args {
     /// RELATIVE_BYTE, which a VX1000 does not do. Without this option the run fails.
     #[arg(long, default_value_t = false)]
     allow_registry_protocol: bool,
+
+    // --dump-sections
+    /// Print the xcp_ and mci_ sections of the ELF file (--elf) as tables, then exit.
+    /// Reads no debug information, so a binary built without it dumps too. --verbose 1 adds each section's bytes.
+    #[arg(long, default_value_t = false)]
+    dump_sections: bool,
 }
 
 //----------------------------------------------------------------------------------------------
@@ -1334,6 +1340,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .format_module_path(false)
         .format_target(false)
         .init();
+
+    // The section dump reads the ELF and nothing else: no banner, no connection. It shows what the record parsers warn about,
+    // next to the section concerned, and not their progress, unless --log-level asks for that.
+    if args.dump_sections {
+        if !from_command_line("log_level") {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+        if args.elf.is_empty() {
+            eprintln!("--dump-sections needs the ELF file to read: --elf <file>");
+            std::process::exit(1);
+        }
+        if let Err(e) = elf_reader::dump_sections(&args.elf, args.verbose) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     info!(
         "xcp_client - version {}.{}.{}",
