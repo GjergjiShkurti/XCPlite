@@ -1613,17 +1613,8 @@ impl ElfReader {
             let id = id_of(name);
             let value_type = a2l_type_to_value_type(r.ty);
             let dim_type = McDimType::new(value_type, r.x_dim.max(1), 1);
-            // Match sig_min/sig_max in mc_meas_abi.hpp: the descriptor stores (0.0, 0.0) when
-            // neither bound was given, and that resolves to the type's own range. The range must be
-            // xcplite's (A2lGetTypeMin/Max, mirrored by type_min/type_max in mc_meas_abi.hpp: +-1e12
-            // for float/double/int64), NOT the registry's own get_min/get_max (+-1e32), so the
-            // offline limits equal the runtime ones.
-            let (min, max) = if r.min == 0.0 && r.max == 0.0 {
-                (Some(a2l_type_min(r.ty)), Some(a2l_type_max(r.ty)))
-            } else {
-                (Some(r.min), Some(r.max))
-            };
-            let mut sd = McSupportData::new(McObjectType::Measurement).set_min(min).set_max(max);
+            let (min, max) = mci_limits(r);
+            let mut sd = McSupportData::new(McObjectType::Measurement).set_min(Some(min)).set_max(Some(max));
             if !r.comment.is_empty() {
                 sd = sd.set_comment(a2l_text(&r.comment));
             }
@@ -2770,6 +2761,23 @@ fn a2l_type_max(t: i8) -> f64 {
         4 => 4294967295.0,
         _ => 1e12,
     }
+}
+
+/// The limits of a measurement record, as the A2L states them.
+///
+/// The C++ header resolves them at compile time (sig_min/sig_max in mc_meas_abi.hpp): neither bound
+/// given is (0.0, 0.0), which resolves here to the type's own range, and one bound given has the
+/// type's limit for the other. The range must be xcplite's (A2lGetTypeMin/Max, mirrored by
+/// type_min/type_max in mc_meas_abi.hpp: +-1e12 for float/double/int64), NOT the registry's own
+/// get_min/get_max (+-1e32), so the offline limits equal the runtime ones.
+///
+/// The C header (mc_vx.h) cannot tell an option left out from one given as 0 -- both are 0 in a C
+/// initializer -- so it writes NaN for a bound left out, and a NaN bound is the type's limit. Neither
+/// given is then (NaN, NaN), the type's range, as (0.0, 0.0) is.
+fn mci_limits(r: &MciRecord) -> (f64, f64) {
+    let min = if r.min.is_nan() { a2l_type_min(r.ty) } else { r.min };
+    let max = if r.max.is_nan() { a2l_type_max(r.ty) } else { r.max };
+    if min == 0.0 && max == 0.0 { (a2l_type_min(r.ty), a2l_type_max(r.ty)) } else { (min, max) }
 }
 
 // Read a null-terminated UTF-8 string from a byte slice at a given offset
@@ -3962,6 +3970,27 @@ mod tests {
         let mut twins: Vec<String> = instrumented_names(&recs, dwarf.iter()).into_iter().collect();
         twins.sort();
         assert_eq!(twins, ["level1", "speed"]);
+    }
+
+    fn limits_of(ty: i8, min: f64, max: f64) -> (f64, f64) {
+        let r = MciRecord { name: "x".into(), ty, x_dim: 1, comment: String::new(), unit: String::new(), min, max, addr: None, event: String::new() };
+        mci_limits(&r)
+    }
+
+    #[test]
+    fn a_nan_bound_is_the_types_limit_and_neither_bound_is_the_types_range() {
+        let nan = f64::NAN;
+        // neither bound given: (0, 0) from the C++ header, (NaN, NaN) from the C header
+        assert_eq!(limits_of(-2, 0.0, 0.0), (-32768.0, 32767.0));
+        assert_eq!(limits_of(-2, nan, nan), (-32768.0, 32767.0));
+        assert_eq!(limits_of(-9, nan, nan), (-1e12, 1e12));
+        // one bound given: the type's limit for the other, which the C++ header writes itself
+        assert_eq!(limits_of(-2, 5.0, nan), (5.0, 32767.0));
+        assert_eq!(limits_of(-2, nan, 100.0), (-32768.0, 100.0));
+        assert_eq!(limits_of(4, 0.0, nan), (0.0, 4294967295.0));
+        // both given
+        assert_eq!(limits_of(4, 1.0, 2.0), (1.0, 2.0));
+        assert_eq!(limits_of(-4, -5.0, 0.0), (-5.0, 0.0));
     }
 
     #[test]
