@@ -45,6 +45,7 @@ struct DebugDataReader<'elffile> {
     mci_app_data: Option<Vec<u8>>,         // raw bytes of mci_app: the application record, its name and, since issue 225, its endpoint
     mci_meas_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of mci_meas (mc-instrument measurement descriptors)
     mci_layout_data: Option<Vec<u8>>,      // raw bytes of mci_layout: how to parse an mci_meas record on this ABI
+    mci_cal_data: Option<(u64, Vec<u8>)>,  // (section_base_addr, raw_bytes) of mci_cal: calibration object records, of the mci_meas layout
     rodata_data: Option<(u64, Vec<u8>)>,   // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers held in mci_meas
     xcp_proto_data: Option<Vec<u8>>,       // raw bytes of xcp_proto: what the linked xcplite answers to CONNECT and GET_DAQ_RESOLUTION_INFO
     xcp_evts_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of xcp_evts: the event descriptor records
@@ -167,6 +168,16 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
     } else {
         log::debug!("mc-instrument layout section (mci_layout) not found; assuming the historical 64-bit MeasMeta layout");
     }
+    // read the mci_cal section: the calibration objects a firmware without an XCP server of its own
+    // declares (mc-instrument's MC_CAL on the VX1000 backend): records of the mci_meas layout, each
+    // with the object's absolute address and no event.
+    let mci_cal_data: Option<(u64, Vec<u8>)> = elffile.section_by_name("mci_cal").and_then(|s| {
+        let addr = s.address();
+        s.data().ok().map(|data| (addr, data.to_vec()))
+    });
+    if let Some((addr, ref data)) = mci_cal_data {
+        log::info!("mc-instrument calibration object section (mci_cal) found at address 0x{:08X}, {} bytes", addr, data.len());
+    }
     // .rodata backs the string literals the mci_meas descriptors point at; captured here so those
     // name/comment/unit/event pointers can be dereferenced offline without applying relocations
     let rodata_data: Option<(u64, Vec<u8>)> = elffile.section_by_name(".rodata").and_then(|s| {
@@ -240,6 +251,7 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         mci_app_data,
         mci_meas_data,
         mci_layout_data,
+        mci_cal_data,
         rodata_data,
         xcp_proto_data,
         xcp_evts_data,
@@ -401,6 +413,7 @@ impl DebugDataReader<'_> {
             mci_app_data: self.mci_app_data,
             mci_meas_data: self.mci_meas_data,
             mci_layout_data: self.mci_layout_data,
+            mci_cal_data: self.mci_cal_data,
             rodata_data: self.rodata_data,
             xcp_proto_data: self.xcp_proto_data,
             xcp_evts_data: self.xcp_evts_data,

@@ -852,7 +852,9 @@ async fn xcp_client(
 
                 // The mci_meas records, read once: the check below and the sweep use them (issue 366)
                 let mci = elf_reader.mci_records()?;
-                let addressing = MciAddressing::of(mci.as_deref());
+                // The calibration objects of a firmware without an XCP server of its own (mci_cal)
+                let mci_cal = elf_reader.mci_cal_records()?;
+                let addressing = MciAddressing::of(mci.as_deref(), &mci_cal);
 
                 // A VX1000 application without the record (issue 370): xcp_registry's text is wrong for it
                 if elf_reader::lacks_required_protocol(elf_reader.is_xcplite_target(), addressing, server_protocol.as_ref()) {
@@ -890,7 +892,7 @@ async fn xcp_client(
                         info!("mci_meas records: {:?} addressing", addressing);
                     }
                     id_addressed = addressing == MciAddressing::Identifier;
-                    elf_reader.register_variables(&mut reg, segment_relative, verbose, elf_idx_unit_limit, &elf_var_filter, &elf_unit_filter, mci.as_deref())?;
+                    elf_reader.register_variables(&mut reg, segment_relative, verbose, elf_idx_unit_limit, &elf_var_filter, &elf_unit_filter, mci.as_deref(), &mci_cal)?;
                     // Apply metadata (XCP_UNIT / XCP_LIMITS / XCP_COMMENT) from the xcp_meta ELF section
                     elf_reader.register_metadata(&mut reg, verbose)?;
                     // Apply mc-instrument's calibration field metadata from the mci_meta ELF section
@@ -903,6 +905,8 @@ async fn xcp_client(
                     if let Some(records) = mci.as_deref() {
                         elf_reader.register_mci_measurements(&mut reg, records, segment_relative, verbose)?;
                     }
+                    // ... and the calibration objects the mci_cal section describes, each at its absolute address
+                    elf_reader.register_mci_calibration(&mut reg, &mci_cal, verbose)?;
                     // Added to upstream (issue 223): a measurement named like a calibration object,
                     // an instance's component path included, is refused, and no A2L is written.
                     elf_reader::check_measurement_names(&reg)?;

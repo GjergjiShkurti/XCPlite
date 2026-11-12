@@ -897,6 +897,12 @@ impl ElfReader {
         }
         order.extend((0..records.len()).filter(|&i| !placed[i]));
 
+        // Each event's channel: its record's position, or the channel the firmware fixed. A fixed
+        // channel is read only where the records are a firmware's own: an xcplite server creates its
+        // events by position, whatever the reserved bytes of its records hold.
+        let fixed_allowed = !self.is_xcplite_target();
+        let channels = event_channels(&names.iter().cloned().zip(records.iter().map(|r| r.fixed_channel.filter(|_| fixed_allowed))).collect::<Vec<_>>())?;
+
         for i in order {
             let (name, r) = (&names[i], &records[i]);
             if reg.event_list.find_event(name, 0).is_some() {
@@ -907,9 +913,15 @@ impl ElfReader {
             } else {
                 info!("Event '{}' has no debug information: its record at {:#x} names it", name, r.addr);
             }
-            let event_id = u16::try_from(i).map_err(|_| format!("event '{name}' is record {i} of the xcp_evts section, past the 16 bit event numbers"))?;
+            let event_id = channels[i];
             reg.event_list.add_event(McEvent::new(name.clone(), 0, event_id, r.cycle_time_ns))?;
-            info!("New event '{}' found: event id = {}, cycle time = {} ns", name, event_id, r.cycle_time_ns);
+            info!(
+                "New event '{}' found: event id = {}{}, cycle time = {} ns",
+                name,
+                event_id,
+                if r.fixed_channel.is_some() && fixed_allowed { " (fixed by the firmware)" } else { "" },
+                r.cycle_time_ns
+            );
         }
         Ok(())
     }
@@ -1061,6 +1073,7 @@ impl ElfReader {
         name_filter: &str,
         unit_filter: &str,
         mci: Option<&[MciRecord]>,
+        cal: &[MciRecord],
     ) -> Result<(), Box<dyn Error>> {
         // Load debug information from the ELF file
         info!("===============================================================");
@@ -1073,11 +1086,19 @@ impl ElfReader {
         // MEASURE's shadow), so it is left out. And on a target that is not xcplite a swept
         // measurement is bound to no event: there is no event 0 to sample it on, and an A2L
         // without IF_DATA lets the master choose one.
-        let addressing = MciAddressing::of(mci);
+        let addressing = MciAddressing::of(mci, cal);
         let id_addressing = addressing == MciAddressing::Identifier;
         let without_event = addressing == MciAddressing::Absolute && !self.is_xcplite_target();
         let instrumented = match (addressing, mci) {
             (MciAddressing::Absolute, Some(records)) => instrumented_names(records, self.debug_data.variables.keys()),
+            _ => std::collections::HashSet::new(),
+        };
+        // The objects a record describes where they are: a calibration object of mci_cal, and a
+        // variable measured in place, whose record holds the variable's own address and not a
+        // shadow's. The plain global at such an address is that object under its C name, so it is
+        // left out as a twin too -- by its address, since the record's name is free.
+        let described_in_place: std::collections::HashSet<u64> = match addressing {
+            MciAddressing::Absolute => mci.unwrap_or(&[]).iter().chain(cal).filter_map(|r| r.addr.map(u64::from)).collect(),
             _ => std::collections::HashSet::new(),
         };
         let mut twins: Vec<&str> = Vec::new();
@@ -1217,6 +1238,12 @@ impl ElfReader {
                     if !re.is_match(&cu_name) {
                         continue;
                     }
+                }
+
+                // A twin of an object a record describes at this very address (see above)
+                if var_info.address.0 == 0 && described_in_place.contains(&var_info.address.1) && !calseg_pages.contains(var_name) {
+                    twins.push(var_name);
+                    continue;
                 }
 
                 // Identifier addressing (issue 51). Every measurement comes from the mci_meas
@@ -1407,8 +1434,9 @@ impl ElfReader {
         sweep_names.report();
         if !twins.is_empty() {
             twins.sort_unstable();
-            info!("{} global(s) skipped: measured by MEASURE under <event>.<name>", twins.len());
-            debug!("Skipped as measured by MEASURE: {}", twins.join(", "));
+            twins.dedup();
+            info!("{} global(s) skipped: described by an mc-instrument record, as <event>.<name> or as a calibration object", twins.len());
+            debug!("Skipped as described by a record: {}", twins.join(", "));
         }
         if unsupported > 0 {
             info!(
@@ -1509,6 +1537,63 @@ impl ElfReader {
         parse_mci_records(data, self.debug_data.mci_layout_data.as_deref(), self.debug_data.is_little_endian, &cstr).map(Some)
     }
 
+    /// The calibration objects of the ELF's mci_cal section: records of the mci_meas layout, each the
+    /// absolute address of a global a tool may write (mc-instrument's MC_CAL on the VX1000 backend,
+    /// whose device writes any RAM address but has no way to describe one). Empty when the ELF has no
+    /// such section. A record without an address is an error: there is nothing else it could mean.
+    pub fn mci_cal_records(&self) -> Result<Vec<MciRecord>, Box<dyn Error>> {
+        let Some((_base, data)) = self.debug_data.mci_cal_data.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let cstr = |p: u64| self.read_rodata_cstr(p);
+        let records = parse_mci_records(data, self.debug_data.mci_layout_data.as_deref(), self.debug_data.is_little_endian, &cstr)?;
+        if records.is_empty() && !data.is_empty() {
+            return Err("the mci_cal section holds calibration object records this reader cannot parse (the mci_layout record is missing or does not fit); no A2L is written".into());
+        }
+        if let Some(r) = records.iter().find(|r| r.addr.is_none()) {
+            return Err(format!("calibration object '{}' in the mci_cal section has no address; no A2L is written", r.name).into());
+        }
+        Ok(records)
+    }
+
+    /// Register the calibration objects of the mci_cal section: each a CHARACTERISTIC at its absolute
+    /// address, extension 0, with no event and no memory segment -- plain RAM a tool writes in place.
+    /// The record's name is the A2L's as it stands, and its limits, unit and comment are the record's,
+    /// by the rules of a measurement record (`mci_limits`, `mci_unit`).
+    pub fn register_mci_calibration(&self, reg: &mut Registry, recs: &[MciRecord], verbose: usize) -> Result<(), Box<dyn Error>> {
+        if recs.is_empty() {
+            return Ok(());
+        }
+        info!("===============================================================");
+        info!("Registering calibration objects from the mci_cal section:");
+        let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for r in recs {
+            check_record_name(&r.name, "calibration object")?;
+            if !names.insert(r.name.as_str()) {
+                return Err(format!("two calibration objects are named '{}': give one a .name of its own; no A2L is written", r.name).into());
+            }
+            let value_type = a2l_type_to_value_type(r.ty);
+            let dim_type = McDimType::new(value_type, r.x_dim.max(1), 1);
+            let (min, max) = mci_limits(r);
+            let mut sd = McSupportData::new(McObjectType::Characteristic).set_min(Some(min)).set_max(Some(max));
+            if !r.comment.is_empty() {
+                sd = sd.set_comment(a2l_text(&r.comment));
+            }
+            if !r.unit.is_empty() {
+                sd = sd.set_unit(mci_unit(r, "calibration object")?);
+            }
+            let addr = r.addr.expect("mci_cal_records refuses a record without an address");
+            reg.instance_list
+                .add_instance(r.name.clone(), dim_type, sd, McAddress::new_a2l(addr, 0))
+                .map_err(|e| format!("calibration object '{}' could not be registered: {e}; no A2L is written", r.name))?;
+            if verbose >= 1 {
+                info!("  calibration object '{}' type={:?} addr=0x{:08X}", r.name, value_type, addr);
+            }
+        }
+        info!("Registered {} calibration object(s) from mci_cal, each at its absolute address", recs.len());
+        Ok(())
+    }
+
     /// Register the measurements the mci_meas ELF section describes: identifier-addressed, or at
     /// an absolute address where the backend supplied one (layout version 2).
     ///
@@ -1536,6 +1621,11 @@ impl ElfReader {
         // which object it is: two functions each measuring a local `speed`, or one global measured by
         // two events, used to become one A2L object, so one of the objects went unmeasured. With the
         // event in the name every entry is its own signal on its own event.
+        // A record's name is the source's: a `.name` option or the variable's token. The C++ headers
+        // refuse one that is no A2L symbol at compile time; C has no way to, so it is refused here.
+        for r in recs {
+            check_record_name(&r.name, "measurement")?;
+        }
         let qualified: Vec<String> = recs
             .iter()
             .map(|r| if r.event.is_empty() { r.name.clone() } else { format!("{}.{}", r.event, r.name) })
@@ -1619,7 +1709,7 @@ impl ElfReader {
                 sd = sd.set_comment(a2l_text(&r.comment));
             }
             if !r.unit.is_empty() {
-                sd = sd.set_unit(a2l_text(&r.unit));
+                sd = sd.set_unit(mci_unit(r, "measurement")?);
             }
             // Two addressing modes, chosen per record by whether the backend supplied an address.
             //
@@ -2046,9 +2136,14 @@ pub(crate) enum MciAddressing {
 
 impl MciAddressing {
     /// `records` is what ElfReader::mci_records gave: None when the ELF has no mci_meas section.
-    pub(crate) fn of(records: Option<&[MciRecord]>) -> MciAddressing {
+    /// `cal` is what ElfReader::mci_cal_records gave: calibration objects at absolute addresses, which
+    /// only a firmware without identifier addressing declares, so an ELF that has them and no
+    /// measurement record is absolute too.
+    pub(crate) fn of(records: Option<&[MciRecord]>, cal: &[MciRecord]) -> MciAddressing {
         match records {
-            None => MciAddressing::None,
+            None if cal.is_empty() => MciAddressing::None,
+            None => MciAddressing::Absolute,
+            Some(r) if r.is_empty() && !cal.is_empty() => MciAddressing::Absolute,
             Some(r) if !r.is_empty() && r.iter().all(|r| r.addr.is_some()) => MciAddressing::Absolute,
             Some(_) => MciAddressing::Identifier,
         }
@@ -2515,6 +2610,12 @@ pub const FEATURES: &[&str] = &[
     "check-epk",
     // a curve, a map and an axis are described as one, from the mci_tbls record, not as an array
     "a2l-cal-tables",
+    // an event has the channel its xcp_evts record fixes, in an ELF that links no xcplite
+    "a2l-event-channel",
+    // a record of the mci_cal section is a CHARACTERISTIC at its absolute address
+    "a2l-cal-objects",
+    // a unit in the enum format is a verbal table, not the text of a PHYS_UNIT
+    "a2l-value-tables",
 ];
 
 /// True when the A2L cannot state what the server sends and must not be written (issue 370): a
@@ -2778,6 +2879,77 @@ fn mci_limits(r: &MciRecord) -> (f64, f64) {
     let min = if r.min.is_nan() { a2l_type_min(r.ty) } else { r.min };
     let max = if r.max.is_nan() { a2l_type_max(r.ty) } else { r.max };
     if min == 0.0 && max == 0.0 { (a2l_type_min(r.ty), a2l_type_max(r.ty)) } else { (min, max) }
+}
+
+/// Whether `name` can be an A2L symbol: identifier parts -- a letter or `_`, then letters, digits and
+/// `_` -- joined by single dots. The rule of mc-instrument's `is_a2l_name` (mc_meas_abi.hpp), which its
+/// C++ headers apply at compile time.
+fn is_a2l_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|part| {
+            let mut chars = part.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+/// Refuse a record whose name is no A2L symbol: it would reach the A2L as an object no tool can
+/// reference, or break the line it is written on.
+fn check_record_name(name: &str, what: &str) -> Result<(), String> {
+    if is_a2l_name(name) {
+        return Ok(());
+    }
+    Err(format!(
+        "{what} name '{}' is not a legal A2L symbol: letters, digits and _, with a dot only between two parts. Give the entry another .name; no A2L is written",
+        name.escape_default()
+    ))
+}
+
+/// The pairs of a unit in the enum format, value and label, or None when the unit is not one.
+///
+/// The format is xcp_registry's (`enum_pair_count`, a2l_writer.rs), which writes such a unit as a
+/// verbal table, COMPU_VTAB and COMPU_METHOD TAB_VERB, in place of a physical unit: one or more
+/// pairs of an integer and a quoted label, separated by white space, and nothing else.
+fn enum_unit_pairs(unit: &str) -> Option<Vec<(i64, &str)>> {
+    let mut rest = unit.trim();
+    let mut pairs = Vec::new();
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace)?;
+        let value = rest[..end].parse::<i64>().ok()?;
+        rest = rest[end..].trim_start().strip_prefix('"')?;
+        let close = rest.find('"')?;
+        pairs.push((value, &rest[..close]));
+        rest = rest[close + 1..].trim_start();
+    }
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// The unit of an mc-instrument record, as it is handed to the registry.
+///
+/// A plain unit is the user's text and is escaped for the A2L string it becomes (`a2l_text`). A unit
+/// in the enum format (`enum_unit_pairs`: `0 "off" 1 "on"`, mc-instrument's MC_VALUES) is a value
+/// table and is handed over as it stands: escaping its quotes made the writer see an ordinary unit, so
+/// the table reached the A2L as the text of a PHYS_UNIT. The writer puts each label between quotes
+/// unescaped, so a label holding a backslash or a control character is refused, and so is a value
+/// named twice, and a table on a float, which the writer has no conversion for and whose unit it
+/// would then drop without a word.
+fn mci_unit(r: &MciRecord, what: &str) -> Result<String, String> {
+    let Some(pairs) = enum_unit_pairs(&r.unit) else {
+        return Ok(a2l_text(&r.unit));
+    };
+    let refuse = |why: String| Err(format!("{what} '{}': its unit is a value table (pairs of a value and a label), and {why}; no A2L is written", r.name));
+    if r.ty == -9 || r.ty == -10 {
+        return refuse("the object is a float or a double: a value table names the values of an integer".to_string());
+    }
+    let mut values: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (value, label) in &pairs {
+        if label.chars().any(|c| c == '\\' || c.is_control()) {
+            return refuse(format!("the label of {value} holds a backslash or a control character, which a table's label cannot"));
+        }
+        if !values.insert(*value) {
+            return refuse(format!("{value} is named twice"));
+        }
+    }
+    Ok(pairs.iter().map(|(value, label)| format!("{value} \"{label}\"")).collect::<Vec<_>>().join(" "))
 }
 
 // Read a null-terminated UTF-8 string from a byte slice at a given offset
@@ -3575,13 +3747,22 @@ fn read_target_ptr(bytes: &[u8], at: usize, ptr_size: u8, little_endian: bool) -
     })
 }
 
-/// One record of the xcp_evts section, at `addr`: where its event's name is, and its cycle time.
+/// One record of the xcp_evts section, at `addr`: where its event's name is, its cycle time, and the
+/// channel it fixes, if it fixes one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EventRecord {
     addr: u64,
     name_ptr: u64,
     cycle_time_ns: u32,
+    /// The channel a firmware without an XCP server of its own gives the event (mc-instrument's
+    /// MEASURE_CHANNEL and MC_EVENT, on the VX1000 backend): the record's reserved bytes then hold
+    /// `EVENT_FIXED_MARKER` and the channel, low byte first. None for a record that leaves its
+    /// channel to its position in the section, as every record of an xcplite server does.
+    fixed_channel: Option<u16>,
 }
+
+/// The first reserved byte of an event record that fixes its channel (mc_vx.h: MCI_EVT_FIXED_).
+const EVENT_FIXED_MARKER: u8 = 0xC5;
 
 /// The size of a `tXcpEventDescriptor`, which xcplib.h pads to 16 bytes on every target.
 const XCP_EVENT_RECORD_SIZE: usize = 16;
@@ -3602,13 +3783,66 @@ fn parse_event_records(section: &[u8], base: u64, ptr_size: u8, little_endian: b
             .get(ptr_size as usize..ptr_size as usize + 4)
             .and_then(|b| <[u8; 4]>::try_from(b).ok())
             .ok_or_else(|| format!("a {ptr_size}-byte pointer leaves no room for the cycle time in a {XCP_EVENT_RECORD_SIZE}-byte event record"))?;
+        // The reserved bytes follow the priority, which follows the cycle time: marker, low, high.
+        let reserved = ptr_size as usize + 5;
+        let fixed_channel = match record.get(reserved..reserved + 3) {
+            Some(&[EVENT_FIXED_MARKER, low, high]) => Some(u16::from_le_bytes([low, high])),
+            _ => None,
+        };
         records.push(EventRecord {
             addr: base + (i * XCP_EVENT_RECORD_SIZE) as u64,
             name_ptr,
             cycle_time_ns: if little_endian { u32::from_le_bytes(cycle) } else { u32::from_be_bytes(cycle) },
+            fixed_channel,
         });
     }
     Ok(records)
+}
+
+/// The channel of each event, in the order of `events` (name, the channel its record fixes).
+///
+/// With no fixed channel anywhere a channel is the record's position, which is how an xcplite server
+/// numbers its events and how a VX1000 firmware's runtime does when nothing fixes one. Once one event
+/// has a fixed channel, all must have: the firmware's runtime then gives an event without one no
+/// channel at all -- a position among numbers somebody chose would be a guess -- so its MEASURE never
+/// triggers, and an A2L that numbered it anyway would arm a channel nothing raises. Two events on one
+/// channel would share one DAQ list. Both are refused, naming the events.
+fn event_channels(events: &[(String, Option<u16>)]) -> Result<Vec<u16>, String> {
+    if events.iter().all(|(_, fixed)| fixed.is_none()) {
+        return events
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| u16::try_from(i).map_err(|_| format!("event '{name}' is record {i} of the xcp_evts section, past the 16 bit event numbers")))
+            .collect();
+    }
+    let without: Vec<&str> = events.iter().filter(|(_, fixed)| fixed.is_none()).map(|(name, _)| name.as_str()).collect();
+    if !without.is_empty() {
+        let with: Vec<String> = events.iter().filter_map(|(name, fixed)| fixed.map(|c| format!("'{name}' ({c})"))).collect();
+        return Err(format!(
+            "event{} {} {} no channel of {} own, while {} fix{} theirs: once one event of a firmware has a fixed channel, an event without one              gets none at run time and is never triggered. Give each a channel (MEASURE_CHANNEL in place of MEASURE or MEASURE_CYCLE); no A2L is written",
+            if without.len() == 1 { "" } else { "s" },
+            without.iter().map(|name| format!("'{name}'")).collect::<Vec<_>>().join(", "),
+            if without.len() == 1 { "has" } else { "have" },
+            if without.len() == 1 { "its" } else { "their" },
+            with.join(", "),
+            if with.len() == 1 { "es" } else { "" },
+        ));
+    }
+    let mut taken: std::collections::BTreeMap<u16, &str> = std::collections::BTreeMap::new();
+    let mut channels = Vec::with_capacity(events.len());
+    for (name, fixed) in events {
+        let channel = fixed.expect("checked above: every event fixes its channel");
+        if channel == u16::MAX {
+            return Err(format!("event '{name}' fixes channel 65535, which is the number for no channel; no A2L is written"));
+        }
+        if let Some(other) = taken.insert(channel, name.as_str()) {
+            return Err(format!(
+                "events '{other}' and '{name}' both fix channel {channel}: two events on one channel would share one DAQ list and trigger it from two places.                  Give each a channel of its own; no A2L is written"
+            ));
+        }
+        channels.push(channel);
+    }
+    Ok(channels)
 }
 
 /// One record of mc-instrument's mci_insts section (`mci::InstanceMeta`): where the segment's name
@@ -3802,13 +4036,135 @@ mod tests {
             assert_eq!(
                 records,
                 vec![
-                    EventRecord { addr: 0x4A230, name_ptr: 0x3212D, cycle_time_ns: 0 },
-                    EventRecord { addr: 0x4A240, name_ptr: 0x321C8, cycle_time_ns: 20_000_000 },
+                    EventRecord { addr: 0x4A230, name_ptr: 0x3212D, cycle_time_ns: 0, fixed_channel: None },
+                    EventRecord { addr: 0x4A240, name_ptr: 0x321C8, cycle_time_ns: 20_000_000, fixed_channel: None },
                 ],
                 "{ptr_size}-byte pointers, little endian {little_endian}"
             );
         }
         assert_eq!(parse_event_records(&[], 0x4000, 8, true), Ok(vec![]));
+    }
+
+    /// An event record that fixes its channel: the marker and the channel, low byte first, in the
+    /// reserved bytes behind the priority.
+    fn fixed_event_record(name_ptr: u64, channel: u16, ptr_size: usize, little_endian: bool) -> Vec<u8> {
+        let mut record = event_record(name_ptr, 0, ptr_size, little_endian);
+        record[ptr_size + 5] = EVENT_FIXED_MARKER;
+        record[ptr_size + 6..ptr_size + 8].copy_from_slice(&channel.to_le_bytes());
+        record
+    }
+
+    #[test]
+    fn an_event_record_states_the_channel_it_fixes_on_either_pointer_size_and_byte_order() {
+        for (ptr_size, little_endian) in [(8, true), (4, true), (4, false), (8, false)] {
+            let mut section = fixed_event_record(0x1000, 5, ptr_size, little_endian);
+            section.extend(fixed_event_record(0x1010, 0x8000, ptr_size, little_endian));
+            section.extend(event_record(0x1020, 0, ptr_size, little_endian));
+            let records = parse_event_records(&section, 0x4000, ptr_size as u8, little_endian).unwrap();
+            let fixed: Vec<Option<u16>> = records.iter().map(|r| r.fixed_channel).collect();
+            assert_eq!(fixed, [Some(5), Some(0x8000), None], "{ptr_size}-byte pointers, little endian {little_endian}");
+        }
+        // the channel bytes alone, without the marker, fix nothing
+        let mut record = event_record(0x1000, 0, 4, true);
+        record[10] = 7;
+        assert_eq!(parse_event_records(&record, 0x4000, 4, true).unwrap()[0].fixed_channel, None);
+    }
+
+    fn events(list: &[(&str, Option<u16>)]) -> Vec<(String, Option<u16>)> {
+        list.iter().map(|(name, fixed)| (name.to_string(), *fixed)).collect()
+    }
+
+    #[test]
+    fn events_without_a_fixed_channel_are_numbered_by_position() {
+        assert_eq!(event_channels(&events(&[("a", None), ("b", None), ("c", None)])), Ok(vec![0, 1, 2]));
+        assert_eq!(event_channels(&[]), Ok(vec![]));
+    }
+
+    #[test]
+    fn fixed_channels_are_the_events_numbers_whatever_their_order() {
+        assert_eq!(event_channels(&events(&[("frame", Some(5)), ("init", Some(4)), ("os", Some(20)), ("ten", Some(1))])), Ok(vec![5, 4, 20, 1]));
+    }
+
+    #[test]
+    fn an_event_without_a_channel_among_fixed_ones_is_refused_by_name() {
+        let error = event_channels(&events(&[("frame", Some(5)), ("stray", None), ("ten", Some(1))])).unwrap_err();
+        assert!(error.contains("event 'stray' has no channel of its own"), "{error}");
+        assert!(error.contains("'frame' (5)") && error.contains("'ten' (1)"), "{error}");
+        assert!(error.contains("no A2L is written"), "{error}");
+        let error = event_channels(&events(&[("a", None), ("b", None), ("c", Some(3))])).unwrap_err();
+        assert!(error.contains("events 'a', 'b' have no channel of their own, while 'c' (3) fixes theirs"), "{error}");
+    }
+
+    #[test]
+    fn two_events_on_one_channel_and_channel_65535_are_refused() {
+        let error = event_channels(&events(&[("frame", Some(5)), ("sound", Some(5))])).unwrap_err();
+        assert!(error.contains("events 'frame' and 'sound' both fix channel 5"), "{error}");
+        let error = event_channels(&events(&[("frame", Some(u16::MAX))])).unwrap_err();
+        assert!(error.contains("65535"), "{error}");
+    }
+
+    #[test]
+    fn a_record_name_is_an_a2l_symbol_or_refused() {
+        for name in ["a", "_a1", "Frame_ms", "g.f64", "a.b.c"] {
+            assert!(is_a2l_name(name), "{name}");
+        }
+        for name in ["", "1a", "a..b", ".a", "a.", "a b", "v[2]", "*p", "a\"b"] {
+            assert!(!is_a2l_name(name), "{name}");
+            assert!(check_record_name(name, "measurement").is_err(), "{name}");
+        }
+        let error = check_record_name("a..b", "calibration object").unwrap_err();
+        assert!(error.contains("calibration object name 'a..b' is not a legal A2L symbol"), "{error}");
+    }
+
+    fn record_with_unit(ty: i8, unit: &str) -> MciRecord {
+        MciRecord { name: "mode".into(), ty, x_dim: 1, comment: String::new(), unit: unit.into(), min: 0.0, max: 0.0, addr: Some(0x1000), event: String::new() }
+    }
+
+    #[test]
+    fn a_unit_of_value_and_label_pairs_is_a_table_and_any_other_unit_is_text() {
+        assert_eq!(enum_unit_pairs(r#"0 "off" 1 "on""#), Some(vec![(0, "off"), (1, "on")]));
+        assert_eq!(enum_unit_pairs(r#"  -1 "invalid"   2 "two words"  "#), Some(vec![(-1, "invalid"), (2, "two words")]));
+        assert_eq!(enum_unit_pairs(r#"0 """#), Some(vec![(0, "")]));
+        // white space between a label and the next value is optional, as for xcp_registry's writer
+        assert_eq!(enum_unit_pairs(r#"0 "off"1 "on""#), Some(vec![(0, "off"), (1, "on")]));
+        for text in ["", "V", "km/h", r#"0 "off" 1"#, r#"0 "off" on"#, r#""off" 0"#, r#"0.5 "half""#, r#"0"off""#, r#"0 "off"#] {
+            assert_eq!(enum_unit_pairs(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_table_is_handed_over_as_it_stands_and_a_plain_unit_is_escaped() {
+        // the table: unescaped, so the writer sees pairs and writes a COMPU_VTAB; white space normalised
+        assert_eq!(mci_unit(&record_with_unit(1, r#"0 "off"   1 "on""#), "measurement").unwrap(), r#"0 "off" 1 "on""#);
+        assert_eq!(mci_unit(&record_with_unit(-4, r#"-1 "none" 0 "E1M1""#), "calibration object").unwrap(), r#"-1 "none" 0 "E1M1""#);
+        // a plain unit: the user's text, escaped as before
+        assert_eq!(mci_unit(&record_with_unit(1, r#"m\s "x""#), "measurement").unwrap(), r#"m\\s \"x\""#);
+        assert_eq!(mci_unit(&record_with_unit(-9, "V"), "measurement").unwrap(), "V");
+    }
+
+    #[test]
+    fn a_table_the_writer_cannot_state_is_refused() {
+        let error = mci_unit(&record_with_unit(-9, r#"0 "off" 1 "on""#), "measurement").unwrap_err();
+        assert!(error.contains("measurement 'mode'") && error.contains("a float or a double"), "{error}");
+        let error = mci_unit(&record_with_unit(-10, r#"0 "off""#), "calibration object").unwrap_err();
+        assert!(error.contains("calibration object 'mode'"), "{error}");
+        let error = mci_unit(&record_with_unit(1, r#"0 "a\\b""#), "measurement").unwrap_err();
+        assert!(error.contains("the label of 0 holds a backslash"), "{error}");
+        let error = mci_unit(&record_with_unit(1, "0 \"a\tb\""), "measurement").unwrap_err();
+        assert!(error.contains("control character"), "{error}");
+        let error = mci_unit(&record_with_unit(1, r#"0 "off" 0 "on""#), "measurement").unwrap_err();
+        assert!(error.contains("0 is named twice"), "{error}");
+    }
+
+    #[test]
+    fn calibration_records_alone_make_the_elf_absolute() {
+        let cal = [record_with_unit(1, "")];
+        assert_eq!(MciAddressing::of(None, &cal), MciAddressing::Absolute);
+        assert_eq!(MciAddressing::of(Some(&[]), &cal), MciAddressing::Absolute);
+        // records without an address stay identifier-addressed whatever the calibration section holds
+        let data: Vec<u8> = mci_record(2, 0x100, 0x200, 0);
+        let recs = parse_mci_records(&data, Some(&mci_layout(2)), true, &mci_strings).unwrap();
+        assert_eq!(MciAddressing::of(Some(&recs), &cal), MciAddressing::Identifier);
     }
 
     #[test]
@@ -3928,7 +4284,7 @@ mod tests {
         let data: Vec<u8> = records.iter().flat_map(|&(n, e, a)| mci_record(version, n, e, a)).collect();
         let recs = parse_mci_records(&data, Some(&mci_layout(version)), true, &mci_strings).expect("the records parse");
         assert_eq!(recs.len(), records.len());
-        MciAddressing::of(Some(&recs))
+        MciAddressing::of(Some(&recs), &[])
     }
 
     #[test]
@@ -3949,14 +4305,15 @@ mod tests {
 
     #[test]
     fn no_section_is_no_addressing_and_an_unparseable_one_is_identifier_addressed() {
-        assert_eq!(MciAddressing::of(None), MciAddressing::None);
+        assert_eq!(MciAddressing::of(None, &[]), MciAddressing::None);
         // 41 bytes are not a whole number of 40-byte records: warned about, no records, and the
         // sweep stays as restricted as it was before absolute records existed
         let recs = parse_mci_records(&[0u8; 41], Some(&mci_layout(2)), true, &mci_strings).unwrap();
         assert!(recs.is_empty());
-        assert_eq!(MciAddressing::of(Some(&recs)), MciAddressing::Identifier);
+        assert_eq!(MciAddressing::of(Some(&recs), &[]), MciAddressing::Identifier);
         let elf = ElfReader::new(XCPLITE_ELF, 0, usize::MAX).expect("the xcplite example ELF loads");
-        assert_eq!(MciAddressing::of(elf.mci_records().unwrap().as_deref()), MciAddressing::None);
+        assert_eq!(MciAddressing::of(elf.mci_records().unwrap().as_deref(), &[]), MciAddressing::None);
+        assert!(elf.mci_cal_records().unwrap().is_empty());
     }
 
     #[test]
@@ -4327,6 +4684,9 @@ mod tests {
                 "a2l-require-proto",
                 "check-epk",
                 "a2l-cal-tables",
+                "a2l-event-channel",
+                "a2l-cal-objects",
+                "a2l-value-tables",
             ]
         );
         let mut names = FEATURES.to_vec();

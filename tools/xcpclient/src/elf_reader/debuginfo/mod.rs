@@ -101,6 +101,7 @@ pub(crate) struct DebugData {
     pub(crate) mci_tbls_data: Option<Vec<u8>>,            // raw bytes of the mci_tbls section: the shape and shared axes of each curve, map and axis
     pub(crate) mci_meas_data: Option<(u64, Vec<u8>)>,     // (section_base_addr, raw_bytes) of mci_meas section (mc-instrument measurement descriptors)
     pub(crate) mci_layout_data: Option<Vec<u8>>,          // raw bytes of the mci_layout section: how to parse an mci_meas record on this ABI
+    pub(crate) mci_cal_data: Option<(u64, Vec<u8>)>,      // (section_base_addr, raw_bytes) of the mci_cal section: the calibration objects of a firmware that links no XCP server (records of the mci_meas layout)
     pub(crate) rodata_data: Option<(u64, Vec<u8>)>,       // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers in mci_meas
     pub(crate) xcp_proto_data: Option<Vec<u8>>,           // raw bytes of the xcp_proto section: what the linked xcplite answers to CONNECT and GET_DAQ_RESOLUTION_INFO
     pub(crate) xcp_evts_data: Option<(u64, Vec<u8>)>,     // (section_base_addr, raw_bytes) of the xcp_evts section: the event descriptor records, with the cycle times
