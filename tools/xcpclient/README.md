@@ -105,9 +105,11 @@ an ELF that does not link XCPlite.
 
 - **The application record** (`mci_app`, 218 bytes) holds, after the name, the endpoint and the
   description, `MC_APP`'s `.timing_active`, `.timing_cores` (0 is one core) and
-  `.vx_monitor_active`, whether mc-instrument's runtime can set a channel's mode in the VX1000
-  driver's release, and the driver's channel count (`VX1000_OLDA_ACTIVE_EVT_CNT_MAX`). A record
-  of another size is refused, one of an older layout with the field it lacks: rebuild.
+  `.vx_monitor_active`, whether mc-instrument's runtime writes the VX1000 driver's channel modes
+  (`MCI_VX_W1_WRITES`: the driver's release is one it knows, `VX1000_OLDA` is defined,
+  `VX1000_IGNORE_MBUF_EVENTMODE` is not, and the driver has at most 31 channels), and the
+  driver's channel count (`VX1000_OLDA_ACTIVE_EVT_CNT_MAX`). A record of another size is refused,
+  one of an older layout with the field it lacks: rebuild.
 - **Events** are numbered from the `xcp_evts` records in section order, as the firmware's
   runtime numbers them: each named record that is no template and whose name is new takes the
   next channel from 0. The headers mark each record, `0xC6` in its first reserved byte, and flag
@@ -130,7 +132,7 @@ an ELF that does not link XCPlite.
   of, is left out with a warning, and the trace shows those IDs as numbers. The core count is
   the size of `VX1000If_Os_Trace` in the symbol table. Refused: the bundle not linked, a core
   count other than `.timing_cores`, more cores than the runtime's channel arrays hold, and a
-  driver release the runtime cannot set a channel's mode in. Without `.timing_active` the
+  firmware whose channel modes the runtime does not write. Without `.timing_active` the
   templates and their words are left out.
 - **The VX1000's own values**, when `MC_APP` sets `.vx_monitor_active`: the base module's
   temperature, its counts of lost events and of retries on the target interface, and its

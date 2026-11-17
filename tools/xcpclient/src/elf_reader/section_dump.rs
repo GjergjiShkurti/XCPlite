@@ -20,7 +20,7 @@ use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable,
 use super::vx1000::{EVENT_MARKER, EVENT_MARKER_FIXED, EVENT_MULTIBUF, EVENT_TEMPLATE, EventSlot, number_events};
 use super::{
     CalTableKind, MCI_APP_BIND_LEN, MCI_APP_CHANNEL_COUNT, MCI_APP_DESC_END, MCI_APP_DESC_LEN, MCI_APP_ENDPOINT_END, MCI_APP_NAME_LEN, MCI_APP_NO_SERVER, MCI_APP_RECORD_LEN,
-    MCI_APP_SERVER, MCI_APP_TIMING_ACTIVE, MCI_APP_TIMING_CORES, MCI_APP_VX_MONITOR, MCI_APP_W1_KNOWN, MCI_INSTANCE_POINTERS, MCI_META_RECORD_LEN, XCP_EVENT_RECORD_SIZE,
+    MCI_APP_SERVER, MCI_APP_TIMING_ACTIVE, MCI_APP_TIMING_CORES, MCI_APP_VX_MONITOR, MCI_APP_W1_WRITES, MCI_INSTANCE_POINTERS, MCI_META_RECORD_LEN, XCP_EVENT_RECORD_SIZE,
     parse_cal_meta_record, parse_cal_table_records, parse_event_records, parse_instance_records, parse_mci_records, parse_server_protocol, read_cstr_at, read_cstr_bounded,
     read_target_ptr,
 };
@@ -428,10 +428,10 @@ impl<'d> Image<'d> {
             ]);
             table.row(["vx_monitor_active".into(), switch(MCI_APP_VX_MONITOR)]);
             table.row([
-                "driver release".into(),
-                match d[MCI_APP_W1_KNOWN] {
-                    0 => "not one mc_vx.c can set a channel's mode in (or no VX1000 driver)".to_string(),
-                    1 => "one mc_vx.c can set a channel's mode in".to_string(),
+                "channel modes".into(),
+                match d[MCI_APP_W1_WRITES] {
+                    0 => "mc_vx.c does not write them (MCI_VX_W1_WRITES 0; 0 in an xcplite application too)".to_string(),
+                    1 => "mc_vx.c writes them (MCI_VX_W1_WRITES 1)".to_string(),
                     other => format!("{other} (neither 0 nor 1: the A2L generator refuses the record)"),
                 },
             ]);
@@ -1305,6 +1305,7 @@ mod tests {
             "timing_active      on",
             "timing_cores       2",
             "vx_monitor_active  on",
+            "channel modes      mc_vx.c writes them (MCI_VX_W1_WRITES 1)",
             "channel count      31 (VX1000_OLDA_ACTIVE_EVT_CNT_MAX)",
         ] {
             assert!(dump.contains(row), "{row}: {dump}");

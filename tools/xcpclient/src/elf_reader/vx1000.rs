@@ -5,7 +5,7 @@
 // VX1000 is the server, and the firmware describes itself to it at startup. Its records say more than an xcplite application's:
 //
 // - MC_APP's VX1000 options, in the application record: the VX1000 Timing Bundle (.timing_active, .timing_cores), the VX1000's own values
-//   (.vx_monitor_active), whether mc_vx.c can set a channel's mode in the driver's release, and the driver's channel count.
+//   (.vx_monitor_active), whether mc_vx.c writes the driver's channel modes, and the driver's channel count.
 // - A marker and a flags byte in each event record's reserved bytes: a multi-buffer event (MC_MULTIBUF), a Timing Bundle template.
 // - How the events are numbered, which mc_vx.c does the same way: the records in section order, each named record that is no template and
 //   whose name is new the next channel from 0; with the bundle on, its OS event per traced core, then its runnable event per core.
@@ -21,7 +21,7 @@ use object::{Object, ObjectSymbol};
 use xcp_registry::Registry;
 
 use super::vx_a2l::{TraceKind, TraceWord, Tracing, VxA2l, trace_name_tables};
-use super::{ElfReader, MCI_APP_CHANNEL_COUNT, MCI_APP_RECORD_LEN, MCI_APP_TIMING_ACTIVE, MCI_APP_TIMING_CORES, MCI_APP_VX_MONITOR, MCI_APP_W1_KNOWN, MciRecord, a2l_type_size};
+use super::{ElfReader, MCI_APP_CHANNEL_COUNT, MCI_APP_RECORD_LEN, MCI_APP_TIMING_ACTIVE, MCI_APP_TIMING_CORES, MCI_APP_VX_MONITOR, MCI_APP_W1_WRITES, MciRecord, a2l_type_size};
 
 /// MC_APP's VX1000 options, and what MC_APP adds to them, as the application record states them (mc_vx.h, mci_app_meta).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -32,8 +32,9 @@ pub(crate) struct VxOptions {
     pub(crate) timing_cores: u8,
     /// .vx_monitor_active: the VX1000's own values go into the A2L
     pub(crate) vx_monitor_active: bool,
-    /// mc_vx.c can set a channel's mode in the VX1000 driver's release (MCI_VX_W1_KNOWN)
-    pub(crate) w1_known: bool,
+    /// mc_vx.c writes the VX1000 driver's channel modes, so that a multi-buffer event is one (MCI_VX_W1_WRITES): the driver's release
+    /// is one it knows, VX1000_OLDA is defined, VX1000_IGNORE_MBUF_EVENTMODE is not, and the driver has at most 31 channels
+    pub(crate) w1_writes: bool,
     /// VX1000_OLDA_ACTIVE_EVT_CNT_MAX where MC_APP expands: the driver's channel count
     pub(crate) channel_count: u16,
 }
@@ -72,9 +73,23 @@ pub(crate) fn parse_vx_options(record: &[u8], little_endian: bool) -> Result<VxO
         timing_active: switch(MCI_APP_TIMING_ACTIVE, ".timing_active")?,
         timing_cores: record[MCI_APP_TIMING_CORES],
         vx_monitor_active: switch(MCI_APP_VX_MONITOR, ".vx_monitor_active")?,
-        w1_known: switch(MCI_APP_W1_KNOWN, "whether mc_vx.c knows the VX1000 driver's release")?,
+        w1_writes: switch(MCI_APP_W1_WRITES, "whether mc_vx.c writes the VX1000 driver's channel modes")?,
         channel_count: if little_endian { u16::from_le_bytes(count) } else { u16::from_be_bytes(count) },
     })
+}
+
+/// Refuse `.timing_active` in a firmware whose channel modes mc_vx.c does not write: the Timing Bundle's events would stay single-buffer.
+pub(crate) fn check_mode_writes(options: &VxOptions) -> Result<(), String> {
+    if options.timing_active && !options.w1_writes {
+        return Err(
+            "MC_APP sets .timing_active, but mc_vx.c does not write this firmware's channel modes (MCI_VX_W1_WRITES is 0 where MC_APP \
+             expands): its VX1000 driver is a release mc_vx.c does not know, VX1000_OLDA is undefined, VX1000_IGNORE_MBUF_EVENTMODE \
+             is defined, or the driver has more than 31 channels (VX1000_OLDA_ACTIVE_EVT_CNT_MAX). The Timing Bundle's events would \
+             not be multi-buffer, and would lose samples. Remove the cause, or drop .timing_active; no A2L is written"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 //------------------------------------------------------------------------
@@ -284,8 +299,8 @@ impl ElfReader {
         Ok(Some(parse_vx_options(record, self.debug_data.is_little_endian)?))
     }
 
-    /// The Timing Bundle, when MC_APP switches it on in a VX1000 firmware. Refused when the driver's release is one mc_vx.c cannot set a
-    /// multi-buffer channel in, when the bundle is not linked, when it traces another number of cores than `.timing_cores` says, and when
+    /// The Timing Bundle, when MC_APP switches it on in a VX1000 firmware. Refused when mc_vx.c does not write the firmware's channel
+    /// modes (check_mode_writes), when the bundle is not linked, when it traces another number of cores than `.timing_cores` says, and when
     /// mc_vx.c has room for fewer: each would be an A2L whose bundle events are never raised, or not multi-buffer.
     pub(crate) fn timing_bundle(&self) -> Result<Option<TimingBundle>, Box<dyn Error>> {
         let Some(options) = self.vx_options()? else {
@@ -294,14 +309,7 @@ impl ElfReader {
         if !options.timing_active {
             return Ok(None);
         }
-        if !options.w1_known {
-            return Err(
-                "MC_APP sets .timing_active, but the firmware's VX1000 driver is a release mc_vx.c cannot set a channel's mode in \
-                 (MCI_VX_W1_KNOWN is 0 where MC_APP expands): the Timing Bundle's events would not be multi-buffer, and would lose \
-                 samples. Build with a driver release mc_vx.c knows, or drop .timing_active; no A2L is written"
-                    .into(),
-            );
-        }
+        check_mode_writes(&options)?;
 
         let templates = self.event_templates()?;
         let records = self.raw_mci_records()?.unwrap_or_default();
@@ -471,13 +479,13 @@ mod tests {
     use super::*;
     use xcp_registry::Registry;
 
-    fn record(timing: u8, cores: u8, monitor: u8, known: u8, count: u16, little_endian: bool) -> Vec<u8> {
+    fn record(timing: u8, cores: u8, monitor: u8, writes: u8, count: u16, little_endian: bool) -> Vec<u8> {
         let mut record = vec![0u8; MCI_APP_RECORD_LEN];
         record[..7].copy_from_slice(b"VXdemo\0");
         record[MCI_APP_TIMING_ACTIVE] = timing;
         record[MCI_APP_TIMING_CORES] = cores;
         record[MCI_APP_VX_MONITOR] = monitor;
-        record[MCI_APP_W1_KNOWN] = known;
+        record[MCI_APP_W1_WRITES] = writes;
         let count = if little_endian { count.to_le_bytes() } else { count.to_be_bytes() };
         record[MCI_APP_CHANNEL_COUNT..MCI_APP_CHANNEL_COUNT + 2].copy_from_slice(&count);
         record
@@ -494,7 +502,7 @@ mod tests {
                     timing_active: true,
                     timing_cores: 2,
                     vx_monitor_active: true,
-                    w1_known: true,
+                    w1_writes: true,
                     channel_count: 31
                 },
                 "little endian {little_endian}"
@@ -509,6 +517,38 @@ mod tests {
         let error = parse_vx_options(&record(2, 1, 0, 1, 31, true), true).unwrap_err();
         assert!(error.contains("holds 2 for .timing_active"), "{error}");
         assert!(parse_vx_options(&record(1, 1, 7, 1, 31, true), true).unwrap_err().contains(".vx_monitor_active"));
+    }
+
+    #[test]
+    fn timing_active_is_refused_where_mc_vx_c_does_not_write_the_channel_modes() {
+        let options = |timing_active, w1_writes| VxOptions {
+            timing_active,
+            timing_cores: 1,
+            vx_monitor_active: false,
+            w1_writes,
+            channel_count: 31,
+        };
+        assert_eq!(check_mode_writes(&options(true, true)), Ok(()));
+        assert_eq!(check_mode_writes(&options(false, false)), Ok(()), "without the bundle nothing needs a mode");
+        let error = check_mode_writes(&options(true, false)).unwrap_err();
+        assert!(error.contains("MCI_VX_W1_WRITES is 0 where MC_APP expands"), "{error}");
+        for reason in [
+            "a release mc_vx.c does not know",
+            "VX1000_OLDA is undefined",
+            "VX1000_IGNORE_MBUF_EVENTMODE is defined",
+            "more than 31 channels",
+        ] {
+            assert!(error.contains(reason), "{reason}: {error}");
+        }
+        assert!(error.ends_with("no A2L is written"), "{error}");
+        // the byte is the record's
+        let parsed = parse_vx_options(&record(1, 1, 0, 0, 31, true), true).unwrap();
+        assert!(parsed.timing_active && !parsed.w1_writes);
+        assert!(
+            parse_vx_options(&record(1, 1, 0, 3, 31, true), true)
+                .unwrap_err()
+                .contains("whether mc_vx.c writes the VX1000 driver's channel modes")
+        );
     }
 
     #[test]
@@ -579,7 +619,7 @@ mod tests {
             timing_active: timing,
             timing_cores: 1,
             vx_monitor_active: monitor,
-            w1_known: true,
+            w1_writes: true,
             channel_count: count,
         }
     }
@@ -691,7 +731,7 @@ mod tests {
                 timing_active: true,
                 timing_cores: 2,
                 vx_monitor_active: true,
-                w1_known: true,
+                w1_writes: true,
                 channel_count: 31
             }
         );

@@ -2668,12 +2668,12 @@ const MCI_APP_ENDPOINT_END: usize = MCI_APP_NAME_LEN + MCI_APP_BIND_LEN + 4;
 const MCI_APP_DESC_LEN: usize = 128;
 const MCI_APP_DESC_END: usize = MCI_APP_ENDPOINT_END + MCI_APP_DESC_LEN;
 /// MC_APP's VX1000 options after the description, one byte each (vx1000.rs): .timing_active, .timing_cores, .vx_monitor_active, and
-/// whether mc_vx.c knows the VX1000 driver's release; then the driver's channel count, 16 bits in the target's byte order. Every
+/// whether mc_vx.c writes the VX1000 driver's channel modes; then the driver's channel count, 16 bits in the target's byte order. Every
 /// backend writes them; only a firmware that links no xcplite acts on them.
 const MCI_APP_TIMING_ACTIVE: usize = MCI_APP_DESC_END;
 const MCI_APP_TIMING_CORES: usize = MCI_APP_DESC_END + 1;
 const MCI_APP_VX_MONITOR: usize = MCI_APP_DESC_END + 2;
-const MCI_APP_W1_KNOWN: usize = MCI_APP_DESC_END + 3;
+const MCI_APP_W1_WRITES: usize = MCI_APP_DESC_END + 3;
 const MCI_APP_CHANNEL_COUNT: usize = MCI_APP_DESC_END + 4;
 const MCI_APP_RECORD_LEN: usize = MCI_APP_CHANNEL_COUNT + 2;
 /// AppMeta::endpoint: the application runs no XCP server (the VX1000 backend), or it runs one.

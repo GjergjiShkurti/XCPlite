@@ -14,15 +14,15 @@
 #define SWITCHED_ON 1
 #endif
 
-/* MC_APP(.name = "vx_bundle", .desc = ..., .timing_active = true, .timing_cores = 2, .vx_monitor_active = true), on a driver release
- * mc_vx.c knows, with 31 channels */
+/* MC_APP(.name = "vx_bundle", .desc = ..., .timing_active = true, .timing_cores = 2, .vx_monitor_active = true), where mc_vx.c
+ * writes the driver's channel modes (MCI_VX_W1_WRITES), with 31 channels */
 const struct mci_app_meta __mci_appmeta RECORD("mci_app") = {
     .name = "vx_bundle",
     .desc = "The stand-in VX1000 firmware of xcpclient's tests",
     .timing_active = SWITCHED_ON,
     .timing_cores = 2,
     .vx_monitor_active = SWITCHED_ON,
-    .w1_known = 1,
+    .w1_writes = 1,
     .channel_count = 31,
 };
 const uint16_t __mci_proto[5] RECORD("xcp_proto") = {255, 250, 0x34, 1, 0xA540};

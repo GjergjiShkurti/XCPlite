@@ -39,7 +39,7 @@ struct mci_app_meta {
     uint8_t timing_active;
     uint8_t timing_cores;
     uint8_t vx_monitor_active;
-    uint8_t w1_known;
+    uint8_t w1_writes;
     uint16_t channel_count;
 };
 
