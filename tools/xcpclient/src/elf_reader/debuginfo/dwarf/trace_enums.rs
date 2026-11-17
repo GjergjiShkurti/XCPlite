@@ -8,12 +8,15 @@
 //
 // This pass walks the enumerators of every unit the reader has opened and keeps the ones with the bundle's prefixes, each name once,
 // with every value a unit gave it: two values for one name are a header that units saw differently, and the caller says so. It runs only
-// for an ELF whose mc-instrument application record switches the bundle on (MC_APP's .timing_active), so every other ELF pays nothing.
+// for a firmware that links no xcplite and whose mc-instrument application record switches the bundle on (MC_APP's .timing_active): every
+// other ELF pays nothing for it.
 
 use std::collections::BTreeMap;
 
-use super::DebugDataReader;
+use indexmap::IndexMap;
+
 use super::attributes::{get_const_value_attribute, get_name_attribute};
+use super::{DebugDataReader, VarInfo};
 
 /// The prefixes of the enumerators the pass keeps: the bundle's thread IDs and its runnable IDs.
 pub(crate) const TRACE_ENUM_PREFIXES: [&str; 2] = ["VX1000IF_OS_", "VX1000IF_RTE_"];
@@ -22,9 +25,10 @@ pub(crate) const TRACE_ENUM_PREFIXES: [&str; 2] = ["VX1000IF_OS_", "VX1000IF_RTE
 pub(crate) type TraceEnumerators = BTreeMap<String, Vec<i64>>;
 
 impl DebugDataReader<'_> {
-    /// The trace enumerators of every opened unit, or None when the application record does not switch the bundle on.
-    pub(crate) fn load_trace_enumerators(&self) -> Option<TraceEnumerators> {
-        if !crate::elf_reader::timing_requested(self.mci_app_data.as_deref()) {
+    /// The trace enumerators of every opened unit, or None when the pass does not run (`wanted`); `variables` are the ones the reader
+    /// has loaded.
+    pub(crate) fn load_trace_enumerators(&self, variables: &IndexMap<String, Vec<VarInfo>>) -> Option<TraceEnumerators> {
+        if !wanted(self.mci_app_data.as_deref(), variables.keys()) {
             return None;
         }
         let mut found = TraceEnumerators::new();
@@ -52,6 +56,13 @@ impl DebugDataReader<'_> {
     }
 }
 
+/// Whether the pass runs: for a firmware that links no xcplite -- no `XCPLITE__<signature>` among its `variables`, the test the rest of the
+/// reader makes -- and whose application record `mci_app` switches the Timing Bundle on. An xcplite application's record may carry the
+/// switch, since one MC_APP builds on both backends, and the bundle is no xcplite's.
+fn wanted<'a>(mci_app: Option<&[u8]>, mut variables: impl Iterator<Item = &'a String>) -> bool {
+    crate::elf_reader::timing_requested(mci_app) && !variables.any(|name| name.starts_with("XCPLITE__"))
+}
+
 /// Keep `name` with `value`: a name once, each of its values once.
 pub(crate) fn keep_enumerator(found: &mut TraceEnumerators, name: String, value: i64) {
     let values = found.entry(name).or_default();
@@ -63,6 +74,19 @@ pub(crate) fn keep_enumerator(found: &mut TraceEnumerators, name: String, value:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pass_runs_for_a_firmware_without_xcplite_whose_record_asks_for_the_bundle() {
+        let mut record = vec![0u8; 218];
+        record[212] = 1;
+        let firmware = ["main".to_string(), "VX1000If_Os_Trace".to_string()];
+        let xcplite = ["main".to_string(), "XCPLITE__CASDD".to_string()];
+        assert!(wanted(Some(&record), firmware.iter()));
+        assert!(!wanted(Some(&record), xcplite.iter()), "the bundle is no xcplite's, whatever its MC_APP says");
+        record[212] = 0;
+        assert!(!wanted(Some(&record), firmware.iter()));
+        assert!(!wanted(None, firmware.iter()));
+    }
 
     #[test]
     fn a_name_is_kept_once_with_each_of_its_values() {

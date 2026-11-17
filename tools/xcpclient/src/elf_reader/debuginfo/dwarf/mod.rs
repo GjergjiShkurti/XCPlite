@@ -396,7 +396,7 @@ impl DebugDataReader<'_> {
     fn read_debug_info_entries(mut self, unit_idx_limit: usize) -> DebugData {
         let variables = self.load_variables(unit_idx_limit);
         let (types, typenames) = self.load_types(&variables);
-        let trace_enumerators = self.load_trace_enumerators();
+        let trace_enumerators = self.load_trace_enumerators(&variables);
         let varname_list: Vec<&String> = variables.keys().collect();
         let demangled_names = demangle_cpp_varnames(&varname_list);
         let mut unit_names = Vec::new();

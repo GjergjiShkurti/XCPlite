@@ -922,6 +922,10 @@ impl ElfReader {
         let events = self.section_events()?;
         let declared = self.event_declarations();
         let place = |addr: u64| self.event_place(&declared, addr);
+        let unnamed: Vec<u64> = events.iter().filter(|e| e.name.is_none()).map(|e| e.record.addr).collect();
+        if let Some(warning) = unnamed_events_warning(&unnamed) {
+            warn!("{warning}");
+        }
 
         // A descriptor the debug info has outside the section is one the compiler took out of it -- a
         // MEASURE in a template, whose section attribute gcc drops -- so the application does not
@@ -4011,6 +4015,24 @@ struct EventRecord {
     flags: u8,
 }
 
+/// What to say about the records of a VX1000 firmware's xcp_evts section that have no name pointer (at `addrs`), which number no event:
+/// the firmware's runtime skips them too, and so the two agree only where the image holds every name it runs with.
+fn unnamed_events_warning(addrs: &[u64]) -> Option<String> {
+    if addrs.is_empty() {
+        return None;
+    }
+    let at: Vec<String> = addrs.iter().map(|addr| format!("0x{addr:08X}")).collect();
+    Some(format!(
+        "{} of the xcp_evts section at {} {} no name pointer and {} no event: the firmware's runtime skips {} too. A firmware that fills in \
+         its event names at run time numbers its events otherwise, and the A2L would not fit it",
+        if addrs.len() == 1 { "The record" } else { "The records" },
+        at.join(", "),
+        if addrs.len() == 1 { "has" } else { "have" },
+        if addrs.len() == 1 { "is" } else { "are" },
+        if addrs.len() == 1 { "it" } else { "them" },
+    ))
+}
+
 /// One record of the xcp_evts section with its event's name and its flags (ElfReader::section_events).
 struct SectionEvent {
     record: EventRecord,
@@ -4381,6 +4403,22 @@ mod tests {
         // an ELF without the templates keeps its rules: an empty section is one this reader could not parse
         assert_eq!(MciAddressing::of(Some(&[]), &[], false), MciAddressing::Identifier);
         assert_eq!(MciAddressing::of(None, &[], false), MciAddressing::None);
+    }
+
+    #[test]
+    fn records_without_a_name_pointer_are_said_once() {
+        assert_eq!(unnamed_events_warning(&[]), None);
+        let one = unnamed_events_warning(&[0x8006_0BB8]).unwrap();
+        assert!(
+            one.starts_with("The record of the xcp_evts section at 0x80060BB8 has no name pointer and is no event"),
+            "{one}"
+        );
+        assert!(one.contains("fills in its event names at run time"), "{one}");
+        let two = unnamed_events_warning(&[0x100, 0x110]).unwrap();
+        assert!(
+            two.starts_with("The records of the xcp_evts section at 0x00000100, 0x00000110 have no name pointer and are no event"),
+            "{two}"
+        );
     }
 
     #[test]
