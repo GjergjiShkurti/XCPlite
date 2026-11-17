@@ -1096,9 +1096,11 @@ impl ElfReader {
         // The objects a record describes where they are: a calibration object of mci_cal, and a
         // variable measured in place, whose record holds the variable's own address and not a
         // shadow's. The plain global at such an address is that object under its C name, so it is
-        // left out as a twin too -- by its address, since the record's name is free.
-        let described_in_place: std::collections::HashSet<u64> = match addressing {
-            MciAddressing::Absolute => mci.unwrap_or(&[]).iter().chain(cal).filter_map(|r| r.addr.map(u64::from)).collect(),
+        // left out as a twin too -- by its address, since the record's name is free, and by its size:
+        // a record of one element or of a struct's first member shares the variable's address and
+        // describes only part of it.
+        let described_in_place = match addressing {
+            MciAddressing::Absolute => described_in_place(mci.unwrap_or(&[]).iter().chain(cal)),
             _ => std::collections::HashSet::new(),
         };
         let mut twins: Vec<&str> = Vec::new();
@@ -1240,8 +1242,9 @@ impl ElfReader {
                     }
                 }
 
-                // A twin of an object a record describes at this very address (see above)
-                if var_info.address.0 == 0 && described_in_place.contains(&var_info.address.1) && !calseg_pages.contains(var_name) {
+                // A twin of an object a record describes at this very address and size (see above)
+                let size = self.debug_data.types.get(&var_info.typeref).map(TypeInfo::get_size);
+                if var_info.address.0 == 0 && is_described_in_place(&described_in_place, var_info.address.1, size) && !calseg_pages.contains(var_name) {
                     twins.push(var_name);
                     continue;
                 }
@@ -2114,6 +2117,26 @@ pub(crate) struct MciRecord {
     /// metadata rather than something the address implies (spec §7), but it still decides
     /// which event the object is armed on -- see the event_id lookup in register_mci_measurements.
     event: String,
+}
+
+impl MciRecord {
+    /// How many bytes the record describes: its type's size times its element count.
+    fn size(&self) -> u64 {
+        u64::from(a2l_type_size(self.ty)) * u64::from(self.x_dim.max(1))
+    }
+}
+
+/// The objects a record describes where they are, by address and size: a calibration object of mci_cal, and a
+/// variable measured in place, whose record holds the variable's own address and not a shadow's.
+fn described_in_place<'a>(records: impl Iterator<Item = &'a MciRecord>) -> std::collections::HashSet<(u64, u64)> {
+    records.filter_map(|r| r.addr.map(|addr| (u64::from(addr), r.size()))).collect()
+}
+
+/// Whether the global at `addr`, of `size` bytes, is an object a record describes in place (`described_in_place`):
+/// the same address and the same size. A record of an array element or of a struct's first member has the
+/// address of the whole variable and not its size, and the variable is a measurement of its own.
+fn is_described_in_place(described: &std::collections::HashSet<(u64, u64)>, addr: u64, size: Option<u64>) -> bool {
+    size.is_some_and(|size| described.contains(&(addr, size)))
 }
 
 /// How the ELF's mc-instrument measurement records address their objects, which decides what the
@@ -4327,6 +4350,38 @@ mod tests {
         let mut twins: Vec<String> = instrumented_names(&recs, dwarf.iter()).into_iter().collect();
         twins.sort();
         assert_eq!(twins, ["level1", "speed"]);
+    }
+
+    #[test]
+    fn a_global_is_a_records_twin_only_at_its_address_and_size() {
+        let record = |addr: u32, ty: i8, x_dim: u16| MciRecord {
+            name: "r".into(),
+            ty,
+            x_dim,
+            comment: String::new(),
+            unit: String::new(),
+            min: 0.0,
+            max: 0.0,
+            addr: Some(addr),
+            event: "Frame".into(),
+        };
+        let described = described_in_place(
+            [
+                record(0x1000, -4, 1),  // MC(Ammo[0], MC_STABLE, ...): one element of an int32_t[4]
+                record(0x2000, -2, 1),  // MC(Player.x, MC_STABLE, ...): the first member of a struct of two int16_t
+                record(0x3000, -2, 1),  // MC(Health, MC_STABLE): a whole int16_t
+                record(0x4000, 1, 128), // MC_N(ErrorText, 128, MC_STABLE): a whole char[128]
+                record(0x5000, -10, 1), // a double
+            ]
+            .iter(),
+        );
+        assert!(!is_described_in_place(&described, 0x1000, Some(16)), "the array is measured in its own right");
+        assert!(!is_described_in_place(&described, 0x2000, Some(4)), "the struct is measured in its own right");
+        assert!(is_described_in_place(&described, 0x3000, Some(2)), "the variable is the record's twin");
+        assert!(is_described_in_place(&described, 0x4000, Some(128)));
+        assert!(is_described_in_place(&described, 0x5000, Some(8)));
+        assert!(!is_described_in_place(&described, 0x3000, None), "a variable whose type the debug info does not give");
+        assert!(!is_described_in_place(&described, 0x3002, Some(2)));
     }
 
     fn limits_of(ty: i8, min: f64, max: f64) -> (f64, f64) {
