@@ -709,7 +709,7 @@ mod tests {
         let os = bundle.words[0].addr.unwrap();
         assert_eq!(records[4].addr, Some(os));
         assert_eq!(records[5].addr, Some(os + 4));
-        assert_eq!(super::super::MciAddressing::of(Some(&records), &[]), super::super::MciAddressing::Absolute);
+        assert_eq!(elf.mci_addressing(Some(&records), &[]).unwrap(), super::super::MciAddressing::Absolute);
     }
 
     #[test]
@@ -748,6 +748,33 @@ mod tests {
         assert_eq!(tracing.words[1].addr, tracing.words[0].addr + 4);
         assert_eq!(tracing.threads.unwrap().len(), 4);
         assert_eq!(tracing.runnables.unwrap().len(), 3);
+    }
+
+    /// The same firmware with nothing switched on, no entries of its own and the bundle not linked: the bundle's trace words, at
+    /// address 0, are its only records.
+    const VX_BUNDLE_OFF: &str = "fixtures/vx_bundle/vx_bundle_off.out";
+
+    #[test]
+    fn a_firmware_whose_only_records_are_the_bundles_words_stays_absolute_with_the_bundle_off() {
+        let elf = ElfReader::new(VX_BUNDLE_OFF, 0, usize::MAX).expect("the switched-off stand-in loads");
+        let options = elf.vx_options().unwrap().unwrap();
+        assert!(!options.timing_active && !options.vx_monitor_active);
+        let mci = elf.mci_records().unwrap();
+        assert_eq!(mci.as_ref().map(Vec::len), Some(0), "the bundle's words are no record with the bundle off");
+        let cal = elf.mci_cal_records().unwrap();
+        assert_eq!(elf.mci_addressing(mci.as_deref(), &cal).unwrap(), super::super::MciAddressing::Absolute);
+        // so the sweep runs in full, as for any VX1000 firmware, and binds no event
+        let mut reg = Registry::new();
+        elf.register_events(&mut reg, 0).unwrap();
+        let events: Vec<(String, u16)> = (&reg.event_list).into_iter().map(|e| (e.get_name().to_string(), e.get_id())).collect();
+        assert_eq!(events, [("Init".to_string(), 0), ("Frame".to_string(), 1)]);
+        elf.register_variables(&mut reg, false, 0, usize::MAX, "", "", mci.as_deref(), &cal).unwrap();
+        let swept: Vec<String> = (&reg.instance_list).into_iter().map(|i| i.get_name().to_string()).collect();
+        for name in ["Health", "Ammo", "Player", "Speed"] {
+            assert!(swept.iter().any(|s| s == name), "{name}: {swept:?}");
+        }
+        assert!((&reg.instance_list).into_iter().all(|i| i.event_id().is_none()), "{swept:?}");
+        assert!(elf.vx_a2l(&reg).unwrap().is_none());
     }
 
     #[test]

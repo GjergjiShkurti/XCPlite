@@ -857,7 +857,7 @@ async fn xcp_client(
                 let mci = elf_reader.mci_records()?;
                 // The calibration objects of a firmware without an XCP server of its own (mci_cal)
                 let mci_cal = elf_reader.mci_cal_records()?;
-                let addressing = MciAddressing::of(mci.as_deref(), &mci_cal);
+                let addressing = elf_reader.mci_addressing(mci.as_deref(), &mci_cal)?;
 
                 // A VX1000 application without the record (issue 370): xcp_registry's text is wrong for it
                 if elf_reader::lacks_required_protocol(elf_reader.is_xcplite_target(), addressing, server_protocol.as_ref()) {

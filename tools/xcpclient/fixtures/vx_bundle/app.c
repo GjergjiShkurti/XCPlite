@@ -1,18 +1,27 @@
 /* app.c -- the stand-in firmware's own unit, with what mc-instrument's VX1000 headers and its runtime mc_vx.c write into it: MC_APP's
  * records, two MEASUREs (one multi-buffer), entries measured in place and one copied into its shadow, the Timing Bundle's template
- * records with their trace words, and mc_vx.c's channel arrays for the bundle's hooks. */
+ * records with their trace words, and mc_vx.c's channel arrays for the bundle's hooks.
+ *
+ * Built with -DSWITCHED_OFF (vx_bundle_off.out), MC_APP switches nothing on and the MEASUREs have no entries of their own: the
+ * bundle's trace words are the only records. */
 
 #include "records.h"
 #include "trace.h"
+
+#ifdef SWITCHED_OFF
+#define SWITCHED_ON 0
+#else
+#define SWITCHED_ON 1
+#endif
 
 /* MC_APP(.name = "vx_bundle", .desc = ..., .timing_active = true, .timing_cores = 2, .vx_monitor_active = true), on a driver release
  * mc_vx.c knows, with 31 channels */
 const struct mci_app_meta __mci_appmeta RECORD("mci_app") = {
     .name = "vx_bundle",
     .desc = "The stand-in VX1000 firmware of xcpclient's tests",
-    .timing_active = 1,
+    .timing_active = SWITCHED_ON,
     .timing_cores = 2,
-    .vx_monitor_active = 1,
+    .vx_monitor_active = SWITCHED_ON,
     .w1_known = 1,
     .channel_count = 31,
 };
@@ -34,7 +43,9 @@ struct Position {
 };
 volatile struct Position Player;
 volatile uint8_t Speed;
+#ifndef SWITCHED_OFF
 static volatile uint8_t __mci_sh_Speed;
+#endif
 
 /* MEASURE(Init, "once"), MEASURE(Frame, MC_MULTIBUF, "each frame", ...), then mc_vx.c's templates */
 static const struct mci_evt_descriptor evt__Init RECORD("xcp_evts") = {"Init", 0, 0, {0xC6, 0x00}};
@@ -45,10 +56,12 @@ static const struct mci_evt_descriptor evt__OsRunInfo RECORD("xcp_evts") = {"OsR
 /* Frame's entries: a whole variable in place, an array element and a struct's first member in place (each with its .name), and one
  * copied into its shadow */
 #define ENTRY(name_, type_, var_) {name_, type_, 1, 0, "", "", 0.0, 0.0, NULL, "Frame", (const void *)&(var_)}
+#ifndef SWITCHED_OFF
 static const struct mci_meas_meta __mci_desc_Health RECORD("mci_meas") __attribute__((aligned(8))) = ENTRY("Health", -2, Health);
 static const struct mci_meas_meta __mci_desc_Ammo RECORD("mci_meas") __attribute__((aligned(8))) = ENTRY("Ammo_Bullets", -4, Ammo[0]);
 static const struct mci_meas_meta __mci_desc_Player RECORD("mci_meas") __attribute__((aligned(8))) = ENTRY("PlayerX", -2, Player.x);
 static const struct mci_meas_meta __mci_desc_Speed RECORD("mci_meas") __attribute__((aligned(8))) = ENTRY("Speed", 1, __mci_sh_Speed);
+#endif
 
 /* mc_vx.c's trace words on the templates, the bundle's arrays referred to weakly */
 static const struct mci_meas_meta __mci_desc_Os_Trace RECORD("mci_meas") __attribute__((aligned(8))) = {
@@ -66,6 +79,8 @@ uint16_t mci_vx_timing_rte_channel[6] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
 enum { VX1000IF_OS_XCP_EVENT = 20 };
 
 int main(void) {
+#ifndef SWITCHED_OFF
     __mci_sh_Speed = Speed;
+#endif
     return VX1000IF_OS_TASK_IDLE + VX1000IF_OS_ISR_CAN0_RX + VX1000IF_RTE_R_LOG + VX1000IF_OS_XCP_EVENT;
 }

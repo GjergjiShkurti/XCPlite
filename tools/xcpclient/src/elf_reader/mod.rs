@@ -1197,7 +1197,7 @@ impl ElfReader {
         // MEASURE's shadow), so it is left out. And on a target that is not xcplite a swept
         // measurement is bound to no event: there is no event 0 to sample it on, and an A2L
         // without IF_DATA lets the master choose one.
-        let addressing = MciAddressing::of(mci, cal);
+        let addressing = self.mci_addressing(mci, cal)?;
         let id_addressing = addressing == MciAddressing::Identifier;
         let without_event = addressing == MciAddressing::Absolute && !self.is_xcplite_target();
         let instrumented = match (addressing, mci) {
@@ -1656,6 +1656,15 @@ impl ElfReader {
         }
         let bundle = self.timing_bundle()?;
         Ok(Some(vx1000::expand_bundle_records(records, &templates, bundle.as_ref())))
+    }
+
+    /// How the records address their objects (MciAddressing::of), `records` and `cal` being what
+    /// mci_records and mci_cal_records gave. A VX1000 firmware -- one that holds the Timing Bundle's
+    /// templates -- is absolute even when no record is left: mc_vx.c always writes the bundle's trace
+    /// words, which are no record with the bundle off, and an empty section must not make the firmware
+    /// read as an xcplite application, whose sweep keeps calibration objects only.
+    pub(crate) fn mci_addressing(&self, records: Option<&[MciRecord]>, cal: &[MciRecord]) -> Result<MciAddressing, Box<dyn Error>> {
+        Ok(MciAddressing::of(records, cal, !self.event_templates()?.is_empty()))
     }
 
     /// The records of the mci_meas section as they are, or None when the ELF has none.
@@ -2289,12 +2298,14 @@ impl MciAddressing {
     /// `records` is what ElfReader::mci_records gave: None when the ELF has no mci_meas section.
     /// `cal` is what ElfReader::mci_cal_records gave: calibration objects at absolute addresses, which
     /// only a firmware without identifier addressing declares, so an ELF that has them and no
-    /// measurement record is absolute too.
-    pub(crate) fn of(records: Option<&[MciRecord]>, cal: &[MciRecord]) -> MciAddressing {
+    /// measurement record is absolute too. `vx_firmware` says that the ELF holds the Timing Bundle's
+    /// templates, which mc-instrument's VX1000 runtime always writes: its records are absolute by
+    /// construction, also when none is left once the bundle's trace words are (vx1000.rs).
+    pub(crate) fn of(records: Option<&[MciRecord]>, cal: &[MciRecord], vx_firmware: bool) -> MciAddressing {
         match records {
-            None if cal.is_empty() => MciAddressing::None,
+            None if cal.is_empty() && !vx_firmware => MciAddressing::None,
             None => MciAddressing::Absolute,
-            Some(r) if r.is_empty() && !cal.is_empty() => MciAddressing::Absolute,
+            Some(r) if r.is_empty() && (vx_firmware || !cal.is_empty()) => MciAddressing::Absolute,
             Some(r) if !r.is_empty() && r.iter().all(|r| r.addr.is_some()) => MciAddressing::Absolute,
             Some(_) => MciAddressing::Identifier,
         }
@@ -4302,12 +4313,22 @@ mod tests {
     #[test]
     fn calibration_records_alone_make_the_elf_absolute() {
         let cal = [record_with_unit(1, "")];
-        assert_eq!(MciAddressing::of(None, &cal), MciAddressing::Absolute);
-        assert_eq!(MciAddressing::of(Some(&[]), &cal), MciAddressing::Absolute);
+        assert_eq!(MciAddressing::of(None, &cal, false), MciAddressing::Absolute);
+        assert_eq!(MciAddressing::of(Some(&[]), &cal, false), MciAddressing::Absolute);
         // records without an address stay identifier-addressed whatever the calibration section holds
         let data: Vec<u8> = mci_record(2, 0x100, 0x200, 0);
         let recs = parse_mci_records(&data, Some(&mci_layout(2)), true, &mci_strings).unwrap();
-        assert_eq!(MciAddressing::of(Some(&recs), &cal), MciAddressing::Identifier);
+        assert_eq!(MciAddressing::of(Some(&recs), &cal, false), MciAddressing::Identifier);
+    }
+
+    #[test]
+    fn a_vx1000_firmware_is_absolute_also_with_no_record_left() {
+        // mc_vx.c's trace words are its only records, and the Timing Bundle is off: none is left
+        assert_eq!(MciAddressing::of(Some(&[]), &[], true), MciAddressing::Absolute);
+        assert_eq!(MciAddressing::of(None, &[], true), MciAddressing::Absolute);
+        // an ELF without the templates keeps its rules: an empty section is one this reader could not parse
+        assert_eq!(MciAddressing::of(Some(&[]), &[], false), MciAddressing::Identifier);
+        assert_eq!(MciAddressing::of(None, &[], false), MciAddressing::None);
     }
 
     #[test]
@@ -4427,7 +4448,7 @@ mod tests {
         let data: Vec<u8> = records.iter().flat_map(|&(n, e, a)| mci_record(version, n, e, a)).collect();
         let recs = parse_mci_records(&data, Some(&mci_layout(version)), true, &mci_strings).expect("the records parse");
         assert_eq!(recs.len(), records.len());
-        MciAddressing::of(Some(&recs), &[])
+        MciAddressing::of(Some(&recs), &[], false)
     }
 
     #[test]
@@ -4448,14 +4469,15 @@ mod tests {
 
     #[test]
     fn no_section_is_no_addressing_and_an_unparseable_one_is_identifier_addressed() {
-        assert_eq!(MciAddressing::of(None, &[]), MciAddressing::None);
+        assert_eq!(MciAddressing::of(None, &[], false), MciAddressing::None);
         // 41 bytes are not a whole number of 40-byte records: warned about, no records, and the
         // sweep stays as restricted as it was before absolute records existed
         let recs = parse_mci_records(&[0u8; 41], Some(&mci_layout(2)), true, &mci_strings).unwrap();
         assert!(recs.is_empty());
-        assert_eq!(MciAddressing::of(Some(&recs), &[]), MciAddressing::Identifier);
+        assert_eq!(MciAddressing::of(Some(&recs), &[], false), MciAddressing::Identifier);
         let elf = ElfReader::new(XCPLITE_ELF, 0, usize::MAX).expect("the xcplite example ELF loads");
-        assert_eq!(MciAddressing::of(elf.mci_records().unwrap().as_deref(), &[]), MciAddressing::None);
+        assert_eq!(MciAddressing::of(elf.mci_records().unwrap().as_deref(), &[], false), MciAddressing::None);
+        assert_eq!(elf.mci_addressing(elf.mci_records().unwrap().as_deref(), &[]).unwrap(), MciAddressing::None);
         assert!(elf.mci_cal_records().unwrap().is_empty());
     }
 
