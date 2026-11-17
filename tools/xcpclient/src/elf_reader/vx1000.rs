@@ -18,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 
 use object::{Object, ObjectSymbol};
+use xcp_registry::Registry;
 
+use super::vx_a2l::{TraceKind, TraceWord, Tracing, VxA2l, trace_name_tables};
 use super::{ElfReader, MCI_APP_CHANNEL_COUNT, MCI_APP_RECORD_LEN, MCI_APP_TIMING_ACTIVE, MCI_APP_TIMING_CORES, MCI_APP_VX_MONITOR, MCI_APP_W1_KNOWN, MciRecord, a2l_type_size};
 
 /// MC_APP's VX1000 options, and what MC_APP adds to them, as the application record states them (mc_vx.h, mci_app_meta).
@@ -47,6 +49,11 @@ impl VxOptions {
 /// 30 alike, and channel 31 is the VX1000's own. Up to 31 channels the driver keeps the channel modes in four words of RAM, which mc_vx.c
 /// writes for a multi-buffer event; above 31 they are a table in flash, which it cannot.
 pub(crate) const MAX_CHANNELS: u16 = 31;
+
+/// True when an application record asks for the Timing Bundle: the debug information reader reads the bundle's enumerators only then.
+pub(crate) fn timing_requested(mci_app: Option<&[u8]>) -> bool {
+    mci_app.is_some_and(|record| record.len() == MCI_APP_RECORD_LEN && record[MCI_APP_TIMING_ACTIVE] != 0)
+}
 
 /// The VX1000 options of a whole application record. A switch that is neither 0 nor 1 is a record this reader does not lay out as its writer
 /// did, and is refused rather than read as on.
@@ -169,6 +176,33 @@ pub(crate) fn check_channel_count(options: &VxOptions, events: &[&str], multibuf
         ));
     }
     Ok(())
+}
+
+/// What a firmware's event named `name` clashes with, while MC_APP switches on what xcpclient adds to the A2L under that name: with the
+/// Timing Bundle the group Tracing and the bundle's events, with the VX1000's own values the groups VX1000, BaseModule and Serial. An event
+/// is a group of its own name in the A2L, and the bundle's are events as well. None for a name that is free.
+pub(crate) fn reserved_event_name(name: &str, options: &VxOptions) -> Option<String> {
+    if options.timing_active {
+        if name == "Tracing" {
+            return Some("the A2L group Tracing, which xcpclient adds for the Timing Bundle while MC_APP sets .timing_active".to_string());
+        }
+        for template in BUNDLE_TEMPLATES {
+            if let Some(core) = name.strip_prefix(template).and_then(|rest| rest.strip_prefix("_C"))
+                && !core.is_empty()
+                && core.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Some(format!(
+                    "the Timing Bundle's event of core {core}, which xcpclient adds, whatever the core count, while MC_APP sets .timing_active"
+                ));
+            }
+        }
+    }
+    if options.vx_monitor_active && matches!(name, "VX1000" | "BaseModule" | "Serial") {
+        return Some(format!(
+            "the A2L group {name}, which xcpclient adds for the VX1000's own values while MC_APP sets .vx_monitor_active"
+        ));
+    }
+    None
 }
 
 //------------------------------------------------------------------------
@@ -351,6 +385,56 @@ impl ElfReader {
         let [os, rte]: [MciRecord; 2] = words.try_into().expect("one word per template");
         Ok(Some(TimingBundle { cores, words: [os, rte] }))
     }
+
+    /// What a VX1000 firmware's MC_APP adds to its A2L once xcp_registry has written it (vx_a2l.rs, write_vx_a2l), with the channels `reg`
+    /// gave the Timing Bundle's events. None when MC_APP switches nothing on, and in an ELF that links xcplite. The trace's names come from the
+    /// debug information; a table that it does not give is said, and left out.
+    pub(crate) fn vx_a2l(&self, reg: &Registry) -> Result<Option<VxA2l>, Box<dyn Error>> {
+        let Some(options) = self.vx_options()? else {
+            return Ok(None);
+        };
+        let tracing = match self.timing_bundle()? {
+            None => None,
+            Some(bundle) => {
+                let mut words = Vec::with_capacity(2 * usize::from(bundle.cores));
+                for (kind, record) in [TraceKind::Os, TraceKind::Runnable].into_iter().zip(&bundle.words) {
+                    let addr = record.addr.expect("timing_bundle refuses a trace word without an address");
+                    for core in 0..bundle.cores {
+                        let event = bundle_event(&record.event, core);
+                        let channel = reg
+                            .event_list
+                            .find_event(&event, 0)
+                            .map(|e| e.id)
+                            .ok_or_else(|| format!("the Timing Bundle's event {event} is not registered"))?;
+                        words.push(TraceWord {
+                            kind,
+                            event,
+                            channel,
+                            name: record.name.clone(),
+                            addr: addr + 4 * u32::from(core),
+                        });
+                    }
+                }
+                let (threads, runnables, warnings) = trace_name_tables(self.debug_data.trace_enumerators.as_ref());
+                for warning in warnings {
+                    log::warn!("{warning}");
+                }
+                Some(Tracing {
+                    little_endian: self.debug_data.is_little_endian,
+                    words,
+                    threads,
+                    runnables,
+                })
+            }
+        };
+        if tracing.is_none() && !options.vx_monitor_active {
+            return Ok(None);
+        }
+        Ok(Some(VxA2l {
+            tracing,
+            vx_monitor: options.vx_monitor_active,
+        }))
+    }
 }
 
 /// The address and the size of each of `names` that the ELF at `path` defines in its symbol table. A name a weak reference leaves undefined
@@ -417,6 +501,14 @@ mod tests {
         let error = parse_vx_options(&record(2, 1, 0, 1, 31, true), true).unwrap_err();
         assert!(error.contains("holds 2 for .timing_active"), "{error}");
         assert!(parse_vx_options(&record(1, 1, 7, 1, 31, true), true).unwrap_err().contains(".vx_monitor_active"));
+    }
+
+    #[test]
+    fn only_a_whole_record_with_timing_active_asks_for_the_bundle() {
+        assert!(timing_requested(Some(&record(1, 1, 0, 1, 31, true))));
+        assert!(!timing_requested(Some(&record(0, 1, 1, 1, 31, true))));
+        assert!(!timing_requested(Some(&record(1, 1, 0, 1, 31, true)[..212])));
+        assert!(!timing_requested(None));
     }
 
     #[test]
@@ -514,6 +606,27 @@ mod tests {
         assert_eq!(check_channel_count(&options(31, true, false), &["Frame"], &["Frame"], &bundle_events(1, 1)), Ok(()));
     }
 
+    #[test]
+    fn an_event_may_not_be_named_like_what_a_switched_on_feature_adds() {
+        let timing = options(31, true, false);
+        let monitor = options(31, false, true);
+        let neither = options(31, false, false);
+        for name in ["Tracing", "OsTaskInfo_C0", "OsRunInfo_C0", "OsTaskInfo_C3", "OsRunInfo_C12"] {
+            assert!(reserved_event_name(name, &timing).is_some(), "{name}");
+            assert_eq!(reserved_event_name(name, &monitor), None, "{name}");
+        }
+        for name in ["VX1000", "BaseModule", "Serial"] {
+            assert!(reserved_event_name(name, &monitor).unwrap().contains(&format!("the A2L group {name}")), "{name}");
+            assert_eq!(reserved_event_name(name, &timing), None, "{name}");
+        }
+        for name in ["OsTaskInfo_C", "OsTaskInfo_Cx", "OsTaskInfo_C0a", "Tracing2", "Frame", "VX1000x"] {
+            assert_eq!(reserved_event_name(name, &timing), None, "{name}");
+            assert_eq!(reserved_event_name(name, &monitor), None, "{name}");
+        }
+        assert_eq!(reserved_event_name("Tracing", &neither), None);
+        assert!(reserved_event_name("OsRunInfo_C0", &timing).unwrap().contains("event of core 0"));
+    }
+
     /// The stand-in VX1000 firmware (fixtures/vx_bundle): MC_APP with the Timing Bundle on two cores and the VX1000's own values, the
     /// events Init and Frame (multi-buffer), the bundle's templates, entries measured in place and one copied, and the bundle's enums in
     /// two units.
@@ -521,6 +634,43 @@ mod tests {
 
     fn stand_in() -> ElfReader {
         ElfReader::new(VX_BUNDLE, 0, usize::MAX).expect("the stand-in VX1000 firmware loads")
+    }
+
+    #[test]
+    fn the_trace_enumerators_are_each_name_once_with_every_value_a_unit_gives_it() {
+        let elf = stand_in();
+        let found = elf.debug_data.trace_enumerators.as_ref().expect("its MC_APP sets .timing_active, so the pass runs");
+        // app.c and bundle.c each have a copy of trace.h's anonymous enums: one value each
+        for (name, value) in [
+            ("VX1000IF_OS_TASK_MAIN", 0),
+            ("VX1000IF_OS_TASK_IDLE", 1),
+            ("VX1000IF_OS_TASK_COUNT", 2),
+            ("VX1000IF_OS_ISR_TICK", 2),
+            ("VX1000IF_OS_ISR_CAN0_RX", 3),
+            ("VX1000IF_OS_THREAD_COUNT", 4),
+            ("VX1000IF_RTE_R_STEP", 1),
+            ("VX1000IF_RTE_R_LOG", 2),
+            ("VX1000IF_RTE_R_END_", 3),
+        ] {
+            assert_eq!(found.get(name).map(Vec::as_slice), Some(&[value][..]), "{name}");
+        }
+        // and the two units give one name two values
+        assert_eq!(found["VX1000IF_OS_XCP_EVENT"], [20, 21]);
+        assert_eq!(found.len(), 10, "{found:?}");
+        // the names it gives the trace
+        let (threads, runnables, warnings) = trace_name_tables(Some(found));
+        assert_eq!(
+            threads.unwrap(),
+            [(0, "MAIN"), (1, "IDLE"), (2, "ISR_TICK"), (3, "ISR_CAN0_RX")].map(|(v, n)| (v, n.to_string()))
+        );
+        assert_eq!(runnables.unwrap(), [(0, "Return"), (1, "R_STEP"), (2, "R_LOG")].map(|(v, n)| (v, n.to_string())));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn an_elf_whose_mc_app_does_not_ask_for_the_bundle_has_no_trace_enumerators() {
+        let elf = ElfReader::new("../../examples/no_a2l_demo/CANape/no_a2l_demo.elf", 0, usize::MAX).expect("the xcplite example ELF loads");
+        assert!(elf.debug_data.trace_enumerators.is_none());
     }
 
     #[test]
@@ -580,6 +730,24 @@ mod tests {
             ]
             .map(|(name, id)| (name.to_string(), id))
         );
+        // and what the A2L gets added: each core's words on its events, decoded with the names of the debug information
+        let vx = elf.vx_a2l(&reg).unwrap().unwrap();
+        assert!(vx.vx_monitor);
+        let tracing = vx.tracing.unwrap();
+        assert!(tracing.little_endian);
+        let words: Vec<(TraceKind, &str, u16)> = tracing.words.iter().map(|w| (w.kind, w.event.as_str(), w.channel)).collect();
+        assert_eq!(
+            words,
+            [
+                (TraceKind::Os, "OsTaskInfo_C0", 2),
+                (TraceKind::Os, "OsTaskInfo_C1", 3),
+                (TraceKind::Runnable, "OsRunInfo_C0", 4),
+                (TraceKind::Runnable, "OsRunInfo_C1", 5)
+            ]
+        );
+        assert_eq!(tracing.words[1].addr, tracing.words[0].addr + 4);
+        assert_eq!(tracing.threads.unwrap().len(), 4);
+        assert_eq!(tracing.runnables.unwrap().len(), 3);
     }
 
     #[test]

@@ -24,6 +24,10 @@ use attributes::{get_abstract_origin_attribute, get_attr_value, get_location_att
 
 mod typereader;
 
+// Added to upstream: the VX1000 Timing Bundle's trace enumerators, which no variable's type reaches
+mod trace_enums;
+pub(crate) use trace_enums::TraceEnumerators;
+
 pub(crate) struct UnitList<'a> {
     list: Vec<(UnitHeader<SliceType<'a>>, gimli::Abbreviations)>,
 }
@@ -392,6 +396,7 @@ impl DebugDataReader<'_> {
     fn read_debug_info_entries(mut self, unit_idx_limit: usize) -> DebugData {
         let variables = self.load_variables(unit_idx_limit);
         let (types, typenames) = self.load_types(&variables);
+        let trace_enumerators = self.load_trace_enumerators();
         let varname_list: Vec<&String> = variables.keys().collect();
         let demangled_names = demangle_cpp_varnames(&varname_list);
         let mut unit_names = Vec::new();
@@ -400,6 +405,7 @@ impl DebugDataReader<'_> {
             variables,
             types,
             typenames,
+            trace_enumerators,
             demangled_names,
             unit_names,
             sections: self.sections,

@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::fmt::Display;
 
 mod dwarf;
+pub(crate) use dwarf::TraceEnumerators;
 
 mod cfa;
 use cfa::CfaInfo;
@@ -88,6 +89,8 @@ pub(crate) struct DebugData {
     pub(crate) variables: IndexMap<String, Vec<VarInfo>>, // variable name -> list of VarInfo for instances with that name
     pub(crate) types: HashMap<usize, TypeInfo>,           // type reference -> TypeInfo
     pub(crate) typenames: HashMap<String, Vec<usize>>,    // type name -> list of type references
+    // the VX1000 Timing Bundle's trace IDs, when the application switches it on
+    pub(crate) trace_enumerators: Option<TraceEnumerators>,
     pub(crate) demangled_names: HashMap<String, String>,  // mangled name -> demangled name
     pub(crate) unit_names: Vec<Option<String>>,           // list of compilation unit names by unit index
     pub(crate) sections: HashMap<String, (u64, u64)>,     // section name -> (start, end)

@@ -798,6 +798,9 @@ async fn xcp_client(
             // The DTO identification field the server sends, where it is known (issue 369, below)
             let mut ident_field: Option<IdentField> = None;
 
+            // Added to upstream: what a VX1000 firmware's MC_APP switches on, added to the A2L once it is written (below)
+            let mut vx_a2l: Option<elf_reader::VxA2l> = None;
+
             // Read ELF/DWARF information for events, segments and (unless --create-a2l-template) variables
             // Events and calibration segments found in the ELF file, must match the XCP server information if present
             // If not, they are created, but with dummy event id and segment number, which has to be fixed later !!!
@@ -910,6 +913,9 @@ async fn xcp_client(
                     // Added to upstream (issue 223): a measurement named like a calibration object,
                     // an instance's component path included, is refused, and no A2L is written.
                     elf_reader::check_measurement_names(&reg)?;
+                    // Added to upstream: the Timing Bundle's group and decoded trace words, and the
+                    // VX1000's own values, which a VX1000 firmware's MC_APP switches on
+                    vx_a2l = elf_reader.vx_a2l(&reg)?;
                 }
 
                 // The application's own name, when it carries one, becomes the A2L's PROJECT and
@@ -991,6 +997,16 @@ async fn xcp_client(
                 // (RELATIVE_WORD_ALIGNED) by default. The same rewrite states the server's.
                 if server_protocol.is_some() || ident_field.is_some() {
                     elf_reader::fix_server_facts(&a2l_path, server_protocol.as_ref(), ident_field).inspect_err(|_| {
+                        let _ = std::fs::remove_file(&a2l_path);
+                    })?;
+                }
+                // Added to upstream. xcp_registry's writer has no way to add a group, a type that is
+                // no struct of the program, or an object outside the ELF: what a VX1000 firmware's
+                // MC_APP switches on -- the Timing Bundle's group Tracing with its decoded trace words,
+                // the VX1000's own values -- goes into the A2L here. One that cannot be completed is
+                // not left behind.
+                if let Some(vx_a2l) = &vx_a2l {
+                    elf_reader::write_vx_a2l(&a2l_path, vx_a2l).inspect_err(|_| {
                         let _ = std::fs::remove_file(&a2l_path);
                     })?;
                 }

@@ -83,7 +83,12 @@ pub use section_dump::dump_sections;
 
 // mc-instrument's VX1000 backend: MC_APP's VX1000 options, the event records' flags and numbering, the Timing Bundle
 mod vx1000;
+pub(crate) use vx1000::timing_requested;
 use vx1000::{EVENT_MULTIBUF, EVENT_TEMPLATE, EventSlot};
+
+// What xcpclient adds to the A2L of a VX1000 firmware once xcp_registry has written it: the Timing Bundle's Tracing group and the VX1000's own values
+mod vx_a2l;
+pub use vx_a2l::{VxA2l, write_vx_a2l};
 
 //use crate::xcp_client::xcp;
 
@@ -912,7 +917,7 @@ impl ElfReader {
     /// A VX1000 firmware's runtime numbers its events the same way, with the records that are no event
     /// left out (vx1000.rs, number_events): a Timing Bundle template stands for one event per traced
     /// core, which follow the firmware's own when MC_APP switches the bundle on. MC_APP's VX1000 options
-    /// add the checks of what the driver can serve.
+    /// add the checks of what the driver can serve, and reserve the names of what they add to the A2L.
     fn register_section_events(&self, reg: &mut Registry, base: u64, data: &[u8]) -> Result<(), Box<dyn Error>> {
         let events = self.section_events()?;
         let declared = self.event_declarations();
@@ -939,10 +944,26 @@ impl ElfReader {
             }
         }
 
-        // Each event's channel. The Timing Bundle's follow the firmware's own. MC_APP's VX1000 options, in a
-        // firmware that links no xcplite, decide whether there are any, and what the driver can serve.
+        // MC_APP's VX1000 options, in a firmware that links no xcplite: what it adds to the A2L takes
+        // the names it adds, while it is on.
         let options = self.vx_options()?;
         let bundle = self.timing_bundle()?;
+        if let Some(options) = &options {
+            let clashes: Vec<String> = events
+                .iter()
+                .filter(|e| !e.is_template())
+                .filter_map(|e| {
+                    let name = e.name.as_deref()?;
+                    let what = vx1000::reserved_event_name(name, options)?;
+                    Some(format!("event '{name}' ({}) clashes with {what}", place(e.record.addr)))
+                })
+                .collect();
+            if !clashes.is_empty() {
+                return Err(format!("{}: give the MEASURE another event name; no A2L is written", clashes.join("; ")).into());
+            }
+        }
+
+        // Each event's channel. The Timing Bundle's follow the firmware's own.
         let slots: Vec<EventSlot> = events
             .iter()
             .map(|e| match e.name.as_deref() {
@@ -2777,6 +2798,11 @@ pub const FEATURES: &[&str] = &[
     "a2l-cal-objects",
     // a unit in the enum format is a verbal table, not the text of a PHYS_UNIT
     "a2l-value-tables",
+    // a VX1000 firmware's events are numbered from its records, the Timing Bundle's per traced core after them, with
+    // the group Tracing, the decoded trace words and the trace's name tables, when MC_APP sets .timing_active
+    "a2l-timing-bundle",
+    // the VX1000's own values, in the group VX1000, when a VX1000 firmware's MC_APP sets .vx_monitor_active
+    "a2l-vx-monitor",
 ];
 
 /// True when the A2L cannot state what the server sends and must not be written (issue 370): a
@@ -4857,6 +4883,8 @@ mod tests {
                 "a2l-cal-tables",
                 "a2l-cal-objects",
                 "a2l-value-tables",
+                "a2l-timing-bundle",
+                "a2l-vx-monitor",
             ]
         );
         let mut names = FEATURES.to_vec();

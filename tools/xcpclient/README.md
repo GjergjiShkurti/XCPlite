@@ -113,16 +113,35 @@ an ELF that does not link XCPlite.
   Timing Bundle, which is no event of its own. A record that fixes its own channel (`0xC5`, from
   headers before the numbering) is refused. So is a firmware with more events than channels, at
   most 31 and no more than the driver's count, and one with a multi-buffer event and a driver of
-  more than 31 channels, whose channel modes the runtime cannot set. An event named like a
-  template, `OsTaskInfo` or `OsRunInfo`, is refused.
+  more than 31 channels, whose channel modes the runtime cannot set.
 - **The VX1000 Timing Bundle**, when `MC_APP` sets `.timing_active`: per traced core n the
   events `OsTaskInfo_C<n>` and `OsRunInfo_C<n>`, numbered after the firmware's own (every core's
   OS event, then every core's runnable event), with the trace words `OsTaskInfo_C<n>.Os_Trace`
   (`VX1000If_Os_Trace[n]`) and `OsRunInfo_C<n>.Rte_Trace` (`VX1000If_Rte_Trace[n]`) on them.
-  The core count is the size of `VX1000If_Os_Trace` in the symbol table. Refused: the bundle
-  not linked, a core count other than `.timing_cores`, more cores than the runtime's channel
-  arrays hold, and a driver release the runtime cannot set a channel's mode in. Without
-  `.timing_active` the templates and their words are left out.
+  Their groups are in a `ROOT` group `Tracing`, not in `Measurements`. Each word is decoded by
+  an `INSTANCE` `<event>.<word>_Info` of a structure over it: from thread, from reason, to
+  thread and to reason, or runnable and core, at the bytes the target's byte order puts them
+  in. The reasons are the bundle's format's; the names of the threads and the runnables
+  (`TaskInfo`, `RunnableInfo`) are its enumerators in the debug information,
+  `VX1000IF_OS_TASK_<name>`, `VX1000IF_OS_ISR_<name>` and `VX1000IF_RTE_R_<name>`, prefix
+  dropped. A name table the debug information does not give, or gives two values for one name
+  of, is left out with a warning, and the trace shows those IDs as numbers. The core count is
+  the size of `VX1000If_Os_Trace` in the symbol table. Refused: the bundle not linked, a core
+  count other than `.timing_cores`, more cores than the runtime's channel arrays hold, and a
+  driver release the runtime cannot set a channel's mode in. Without `.timing_active` the
+  templates and their words are left out.
+- **The VX1000's own values**, when `MC_APP` sets `.vx_monitor_active`: the base module's
+  temperature, its counts of lost events and of retries on the target interface, and its
+  console text, at address extension `0xFD` on the VX1000's events `0x8000` and `0x8100`, in a
+  `ROOT` group `VX1000`.
+- **Reserved names**: while the bundle is on, a firmware event named `Tracing`,
+  `OsTaskInfo_C<n>` or `OsRunInfo_C<n>` is refused, and while the VX1000's own values are on,
+  one named `VX1000`, `BaseModule` or `Serial`: each is a group the A2L adds. An event named like
+  a template, `OsTaskInfo` or `OsRunInfo`, is refused always.
+
+xcp_registry's writer cannot add a group or an object outside the ELF, so the group `Tracing`,
+the decoding and the VX1000's values go into the A2L once it is written, each object on one
+line, and the A2L is then loaded once more as a check. One that cannot be completed is deleted.
 
 ### Log levels and `--print-features`
 
@@ -141,7 +160,11 @@ the same as a name that is missing. `--version` names the commit the build is fr
 not what it does; `--print-features` does.
 
 A build that describes mc-instrument's curves, maps and axes as such, from their `mci_tbls`
-records, where the debug information alone sees arrays, also lists `a2l-cal-tables`.
+records, where the debug information alone sees arrays, also lists `a2l-cal-tables`. One that
+reads a VX1000 firmware's records as above lists `a2l-cal-objects` (`mci_cal` records as
+`CHARACTERISTIC`s), `a2l-value-tables` (a unit of value and label pairs as a verbal table),
+`a2l-timing-bundle` (the event numbering, the Timing Bundle and its `Tracing` group) and
+`a2l-vx-monitor` (the VX1000's own values).
 
 Pointer members of a structure type are `ULONG` or `ULONGLONG` by the target's address size. They
 were typed from the wrong field of the debug information, so a 32-bit target got `ULONGLONG`.
