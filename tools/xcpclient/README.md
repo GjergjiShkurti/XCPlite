@@ -213,16 +213,17 @@ the generator reads, and a warning a parser gives appears next to its section.
 
 ```
 xcp_evts  0x4D6F0  48 bytes
-  3 event descriptors (tXcpEventDescriptor, 16 bytes each), in section order: the order the events are numbered in, Timing Bundle templates left out
-  #  name             cycle         priority  flags  descriptor
-  -  ---------------  ------------  --------  -----  --------------------------
-  0  KernelDemoEvent  0 (sporadic)  0         -      main::evt__KernelDemoEvent
-  1  KernelDemoArray  0 (sporadic)  0         -      main::evt__KernelDemoArray
-  2  KernelDemoSlow   1 s           0         -      main::evt__KernelDemoSlow
+  3 event descriptors (tXcpEventDescriptor, 16 bytes each), in section order, with the channel each event gets: none for a Timing Bundle template, a record without a name or a name numbered already
+  #  channel  name             cycle         priority  flags  descriptor
+  -  -------  ---------------  ------------  --------  -----  --------------------------
+  0  0        KernelDemoEvent  0 (sporadic)  0         -      main::evt__KernelDemoEvent
+  1  1        KernelDemoArray  0 (sporadic)  0         -      main::evt__KernelDemoArray
+  2  2        KernelDemoSlow   1 s           0         -      main::evt__KernelDemoSlow
 ```
 
 A VX1000 firmware's events show their flags (`multi-buffer`, `Timing Bundle template`), and its
-application record `MC_APP`'s VX1000 options.
+application record `MC_APP`'s VX1000 options. A template gets no channel: the Timing Bundle's own
+events follow the firmware's, per traced core, when `MC_APP` sets `.timing_active`.
 
 It reads no debug information, so a binary built without `-g` dumps too. Pointers are read as the
 loaded image holds them, with the dynamic relocations applied: in a shared library a pointer to a

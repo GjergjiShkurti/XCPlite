@@ -17,7 +17,7 @@ use std::io::Write as _;
 use object::read::elf::FileHeader;
 use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags, RelocationKind, RelocationTarget, SectionFlags, SymbolKind};
 
-use super::vx1000::{EVENT_MARKER, EVENT_MARKER_FIXED, EVENT_MULTIBUF, EVENT_TEMPLATE};
+use super::vx1000::{EVENT_MARKER, EVENT_MARKER_FIXED, EVENT_MULTIBUF, EVENT_TEMPLATE, EventSlot, number_events};
 use super::{
     CalTableKind, MCI_APP_BIND_LEN, MCI_APP_CHANNEL_COUNT, MCI_APP_DESC_END, MCI_APP_DESC_LEN, MCI_APP_ENDPOINT_END, MCI_APP_NAME_LEN, MCI_APP_NO_SERVER, MCI_APP_RECORD_LEN,
     MCI_APP_SERVER, MCI_APP_TIMING_ACTIVE, MCI_APP_TIMING_CORES, MCI_APP_VX_MONITOR, MCI_APP_W1_KNOWN, MCI_INSTANCE_POINTERS, MCI_META_RECORD_LEN, XCP_EVENT_RECORD_SIZE,
@@ -499,19 +499,36 @@ impl<'d> Image<'d> {
         Ok(())
     }
 
-    /// xcp_evts: one `tXcpEventDescriptor` per event (`parse_event_records`).
+    /// xcp_evts: one `tXcpEventDescriptor` per event (`parse_event_records`), with the channel each gets (`number_events`).
     fn events(&self, section: &SectionView, out: &mut String) -> Result<(), String> {
         let records = parse_event_records(&section.bytes, section.addr, self.ptr_size, self.little_endian)?;
         let _ = writeln!(
             out,
-            "  {} (tXcpEventDescriptor, {XCP_EVENT_RECORD_SIZE} bytes each), in section order: the order the events are numbered in, Timing Bundle templates left out",
+            "  {} (tXcpEventDescriptor, {XCP_EVENT_RECORD_SIZE} bytes each), in section order, with the channel each event gets: none for a \
+             Timing Bundle template, a record without a name or a name numbered already",
             count(records.len(), "event descriptor")
         );
-        let mut table = Table::new(&["#", "name", "cycle", "priority", "flags", "descriptor"]);
+        // The names the numbering goes by: a name that cannot be read is told apart by its address
+        let names: Vec<Option<String>> = records
+            .iter()
+            .map(|r| (r.name_ptr != 0).then(|| self.text_at(r.name_ptr).unwrap_or_else(|| format!("0x{:X}", r.name_ptr))))
+            .collect();
+        let slots: Vec<EventSlot> = records
+            .iter()
+            .zip(&names)
+            .map(|(r, name)| match name.as_deref() {
+                None => EventSlot::Unnamed,
+                Some(name) if r.marker == EVENT_MARKER && r.flags & EVENT_TEMPLATE != 0 => EventSlot::Template(name),
+                Some(name) => EventSlot::Event(name),
+            })
+            .collect();
+        let channels = number_events(&slots)?;
+        let mut table = Table::new(&["#", "channel", "name", "cycle", "priority", "flags", "descriptor"]);
         for (i, record) in records.iter().enumerate() {
             let priority = section.bytes[i * XCP_EVENT_RECORD_SIZE + self.ptr_size as usize + 4];
             table.row([
                 i.to_string(),
+                channels[i].map_or_else(|| "-".to_string(), |channel| channel.to_string()),
                 self.text(record.addr, record.name_ptr),
                 cycle(record.cycle_time_ns),
                 priority.to_string(),
@@ -1265,6 +1282,33 @@ mod tests {
         let mut out = String::new();
         table.render(&mut out);
         assert_eq!(out, "  #   name      comment\n  --  --------  -------------\n  0   mainloop  the main loop\n  10  x\n");
+    }
+
+    #[test]
+    fn a_vx1000_firmwares_events_show_their_channels_and_flags() {
+        let data = std::fs::read("fixtures/vx_bundle/vx_bundle.out").unwrap();
+        let image = Image::parse(&data).unwrap();
+        let sections = image.sections();
+        let evts = sections.iter().find(|s| s.name == "xcp_evts").expect("the stand-in firmware has events");
+        let dump = image.dump(evts, 0);
+        let rows: Vec<Vec<&str>> = dump
+            .lines()
+            .skip_while(|line| !line.starts_with("  -  "))
+            .skip(1)
+            .map(|line| line.split_whitespace().take(3).collect())
+            .collect();
+        assert_eq!(rows, [["0", "0", "Init"], ["1", "1", "Frame"], ["2", "-", "OsTaskInfo"], ["3", "-", "OsRunInfo"]], "{dump}");
+        assert!(dump.contains("multi-buffer, Timing Bundle template"), "{dump}");
+        let app = sections.iter().find(|s| s.name == "mci_app").expect("the stand-in firmware has MC_APP");
+        let dump = image.dump(app, 0);
+        for row in [
+            "timing_active      on",
+            "timing_cores       2",
+            "vx_monitor_active  on",
+            "channel count      31 (VX1000_OLDA_ACTIVE_EVT_CNT_MAX)",
+        ] {
+            assert!(dump.contains(row), "{row}: {dump}");
+        }
     }
 
     #[test]
