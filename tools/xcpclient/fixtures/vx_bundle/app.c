@@ -3,7 +3,7 @@
  * records with their trace words, and mc_vx.c's channel arrays for the bundle's hooks.
  *
  * Built with -DSWITCHED_OFF (vx_bundle_off.out), MC_APP switches nothing on and the MEASUREs have no entries of their own: the
- * bundle's trace words are the only records. */
+ * bundle's trace words are the only records. Built with -DGHOST (vx_bundle_ghost.out), a record with no name pointer comes first. */
 
 #include "records.h"
 #include "trace.h"
@@ -48,6 +48,10 @@ static volatile uint8_t __mci_sh_Speed;
 #endif
 
 /* MEASURE(Init, "once"), MEASURE(Frame, MC_MULTIBUF, "each frame", ...), then mc_vx.c's templates */
+#ifdef GHOST
+/* a record whose name pointer is null, as a hand-written or a run-time-filled one: it numbers no event */
+static const struct mci_evt_descriptor evt__Ghost RECORD("xcp_evts") = {NULL, 0, 0, {0xC6, 0x00}};
+#endif
 static const struct mci_evt_descriptor evt__Init RECORD("xcp_evts") = {"Init", 0, 0, {0xC6, 0x00}};
 static const struct mci_evt_descriptor evt__Frame RECORD("xcp_evts") = {"Frame", 0, 0, {0xC6, 0x01}};
 static const struct mci_evt_descriptor evt__OsTaskInfo RECORD("xcp_evts") = {"OsTaskInfo", 0, 0, {0xC6, 0x03}};

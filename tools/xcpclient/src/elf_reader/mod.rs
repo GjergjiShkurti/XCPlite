@@ -827,10 +827,11 @@ impl ElfReader {
 
         // Each record's name: the string its name pointer holds, or, where that cannot be read, the
         // evt__<name> variable at the record's address. A VX1000 firmware's runtime skips a record
-        // without a name pointer, and so does its numbering here.
+        // without a name pointer, whatever variable the debug info has there, and so does its
+        // numbering here.
         let mut events: Vec<SectionEvent> = Vec::with_capacity(records.len());
         for r in records {
-            if vx && r.name_ptr == 0 && !declared.contains_key(&r.addr) {
+            if vx && r.name_ptr == 0 {
                 events.push(SectionEvent { record: r, name: None, flags: 0 });
                 continue;
             }
@@ -922,7 +923,11 @@ impl ElfReader {
         let events = self.section_events()?;
         let declared = self.event_declarations();
         let place = |addr: u64| self.event_place(&declared, addr);
-        let unnamed: Vec<u64> = events.iter().filter(|e| e.name.is_none()).map(|e| e.record.addr).collect();
+        let unnamed: Vec<(u64, Option<&str>)> = events
+            .iter()
+            .filter(|e| e.name.is_none())
+            .map(|e| (e.record.addr, declared.get(&e.record.addr).map(|(name, _)| *name)))
+            .collect();
         if let Some(warning) = unnamed_events_warning(&unnamed) {
             warn!("{warning}");
         }
@@ -4015,21 +4020,28 @@ struct EventRecord {
     flags: u8,
 }
 
-/// What to say about the records of a VX1000 firmware's xcp_evts section that have no name pointer (at `addrs`), which number no event:
-/// the firmware's runtime skips them too, and so the two agree only where the image holds every name it runs with.
-fn unnamed_events_warning(addrs: &[u64]) -> Option<String> {
-    if addrs.is_empty() {
+/// What to say about the records of a VX1000 firmware's xcp_evts section that have no name pointer, which number no event: each its
+/// address and the evt__<name> variable the debug info has there, if any. The firmware's runtime skips them too, and so the two agree
+/// only where the image holds every name it runs with.
+fn unnamed_events_warning(records: &[(u64, Option<&str>)]) -> Option<String> {
+    if records.is_empty() {
         return None;
     }
-    let at: Vec<String> = addrs.iter().map(|addr| format!("0x{addr:08X}")).collect();
+    let at: Vec<String> = records
+        .iter()
+        .map(|(addr, declared)| match declared {
+            Some(name) => format!("0x{addr:08X} (evt__{name})"),
+            None => format!("0x{addr:08X}"),
+        })
+        .collect();
     Some(format!(
         "{} of the xcp_evts section at {} {} no name pointer and {} no event: the firmware's runtime skips {} too. A firmware that fills in \
          its event names at run time numbers its events otherwise, and the A2L would not fit it",
-        if addrs.len() == 1 { "The record" } else { "The records" },
+        if records.len() == 1 { "The record" } else { "The records" },
         at.join(", "),
-        if addrs.len() == 1 { "has" } else { "have" },
-        if addrs.len() == 1 { "is" } else { "are" },
-        if addrs.len() == 1 { "it" } else { "them" },
+        if records.len() == 1 { "has" } else { "have" },
+        if records.len() == 1 { "is" } else { "are" },
+        if records.len() == 1 { "it" } else { "them" },
     ))
 }
 
@@ -4408,15 +4420,15 @@ mod tests {
     #[test]
     fn records_without_a_name_pointer_are_said_once() {
         assert_eq!(unnamed_events_warning(&[]), None);
-        let one = unnamed_events_warning(&[0x8006_0BB8]).unwrap();
+        let one = unnamed_events_warning(&[(0x8006_0BB8, None)]).unwrap();
         assert!(
             one.starts_with("The record of the xcp_evts section at 0x80060BB8 has no name pointer and is no event"),
             "{one}"
         );
         assert!(one.contains("fills in its event names at run time"), "{one}");
-        let two = unnamed_events_warning(&[0x100, 0x110]).unwrap();
+        let two = unnamed_events_warning(&[(0x100, Some("Ghost")), (0x110, None)]).unwrap();
         assert!(
-            two.starts_with("The records of the xcp_evts section at 0x00000100, 0x00000110 have no name pointer and are no event"),
+            two.starts_with("The records of the xcp_evts section at 0x00000100 (evt__Ghost), 0x00000110 have no name pointer and are no event"),
             "{two}"
         );
     }

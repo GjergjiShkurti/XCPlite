@@ -254,6 +254,26 @@ pub(crate) struct TimingBundle {
     pub(crate) words: [MciRecord; 2],
 }
 
+/// Refuse a core count mc_vx.c has no room for. `room` is how many cores its channel arrays for the bundle's hooks (BUNDLE_CHANNEL_ARRAYS)
+/// hold, the fewer of the two, 16 bits a core; None where the ELF defines either not, a runtime older than its headers.
+pub(crate) fn check_channel_room(cores: u16, room: Option<u64>) -> Result<(), String> {
+    let Some(room) = room else {
+        return Err(format!(
+            "MC_APP sets .timing_active, but the ELF defines no {}: its mc_vx.c is older than its headers. Rebuild with the mc_vx.c of those \
+             headers; no A2L is written",
+            BUNDLE_CHANNEL_ARRAYS.join(" or ")
+        ));
+    };
+    if u64::from(cores) > room {
+        return Err(format!(
+            "MC_APP's .timing_cores is {cores}, but mc_vx.c traces at most {room} cores: its channel arrays ({}) hold {room} entries. MC_SYNC \
+             leaves the Timing Bundle out for this firmware; no A2L is written",
+            BUNDLE_CHANNEL_ARRAYS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 impl TimingBundle {
     /// The trace arrays, each as the address of core 0's word and the bytes of every traced core's: the words of all cores describe
     /// each array together, as a record of it whole would.
@@ -382,22 +402,7 @@ impl ElfReader {
             }
         }
         let room = BUNDLE_CHANNEL_ARRAYS.iter().map(|array| size_of(array).map(|size| size / 2)).collect::<Option<Vec<u64>>>();
-        let Some(room) = room.and_then(|room| room.into_iter().min()) else {
-            return Err(format!(
-                "MC_APP sets .timing_active, but the ELF defines no {}: its mc_vx.c is older than its headers. Rebuild with the mc_vx.c of those \
-                 headers; no A2L is written",
-                BUNDLE_CHANNEL_ARRAYS.join(" or ")
-            )
-            .into());
-        };
-        if u64::from(cores) > room {
-            return Err(format!(
-                "MC_APP's .timing_cores is {cores}, but mc_vx.c traces at most {room} cores: its channel arrays ({}) hold {room} entries. MC_SYNC \
-                 leaves the Timing Bundle out for this firmware; no A2L is written",
-                BUNDLE_CHANNEL_ARRAYS.join(", ")
-            )
-            .into());
-        }
+        check_channel_room(cores, room.and_then(|room| room.into_iter().min()))?;
         let [os, rte]: [MciRecord; 2] = words.try_into().expect("one word per template");
         Ok(Some(TimingBundle { cores, words: [os, rte] }))
     }
@@ -549,6 +554,23 @@ mod tests {
                 .unwrap_err()
                 .contains("whether mc_vx.c writes the VX1000 driver's channel modes")
         );
+    }
+
+    #[test]
+    fn more_cores_than_mc_vx_c_has_room_for_are_refused() {
+        // MCI_VX_TIMING_MAX_CORES is 6: arrays of six 16-bit channels
+        assert_eq!(check_channel_room(1, Some(6)), Ok(()));
+        assert_eq!(check_channel_room(6, Some(6)), Ok(()));
+        let error = check_channel_room(7, Some(6)).unwrap_err();
+        assert!(error.starts_with("MC_APP's .timing_cores is 7, but mc_vx.c traces at most 6 cores"), "{error}");
+        assert!(
+            error.contains("mci_vx_timing_os_channel, mci_vx_timing_rte_channel") && error.ends_with("no A2L is written"),
+            "{error}"
+        );
+        // the smaller array decides, as the caller hands it over, and a runtime without the arrays is older than its headers
+        assert!(check_channel_room(3, Some(2)).is_err());
+        let error = check_channel_room(1, None).unwrap_err();
+        assert!(error.contains("the ELF defines no mci_vx_timing_os_channel or mci_vx_timing_rte_channel"), "{error}");
     }
 
     #[test]

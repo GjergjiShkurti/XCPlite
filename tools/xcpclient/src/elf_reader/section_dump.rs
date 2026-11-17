@@ -1313,6 +1313,37 @@ mod tests {
     }
 
     #[test]
+    fn a_record_without_a_name_numbers_no_event_in_the_a2l_and_in_the_dump() {
+        // evt__Ghost, first, has a null name pointer and a variable in the debug info; the firmware's runtime skips it
+        const GHOST: &str = "fixtures/vx_bundle/vx_bundle_ghost.out";
+        let elf = super::super::ElfReader::new(GHOST, 0, usize::MAX).expect("the stand-in with a nameless record loads");
+        let mut reg = xcp_registry::Registry::new();
+        elf.register_events(&mut reg, 0).unwrap();
+        let a2l: Vec<(String, String)> = (&reg.event_list).into_iter().map(|e| (e.get_name().to_string(), e.get_id().to_string())).collect();
+        let data = std::fs::read(GHOST).unwrap();
+        let image = Image::parse(&data).unwrap();
+        let sections = image.sections();
+        let dump = image.dump(sections.iter().find(|s| s.name == "xcp_evts").unwrap(), 0);
+        let rows: Vec<Vec<&str>> = dump
+            .lines()
+            .skip_while(|line| !line.starts_with("  -  "))
+            .skip(1)
+            .map(|line| line.split_whitespace().take(3).collect())
+            .collect();
+        assert_eq!(rows[0], ["0", "-", "-"], "{dump}");
+        let numbered: Vec<(String, String)> = rows.iter().filter(|row| row[1] != "-").map(|row| (row[2].to_string(), row[1].to_string())).collect();
+        assert_eq!(
+            numbered,
+            [("Init", "0"), ("Frame", "1")].map(|(name, channel)| (name.to_string(), channel.to_string())),
+            "{dump}"
+        );
+        // the A2L numbers the firmware's events alike, the Timing Bundle's after them
+        assert_eq!(a2l[..2], numbered[..], "{a2l:?}");
+        assert!(!a2l.iter().any(|(name, _)| name == "Ghost"), "{a2l:?}");
+        assert_eq!(a2l[2], ("OsTaskInfo_C0".to_string(), "2".to_string()));
+    }
+
+    #[test]
     fn the_sections_of_an_xcplite_elf_are_decoded() {
         // An aarch64 PIE: its pointers are dynamically relocated, and this linker also wrote them into the file
         let data = std::fs::read(XCPLITE_ELF).unwrap();
