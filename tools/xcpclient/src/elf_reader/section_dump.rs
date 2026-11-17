@@ -17,10 +17,12 @@ use std::io::Write as _;
 use object::read::elf::FileHeader;
 use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags, RelocationKind, RelocationTarget, SectionFlags, SymbolKind};
 
+use super::vx1000::{EVENT_MARKER, EVENT_MARKER_FIXED, EVENT_MULTIBUF, EVENT_TEMPLATE};
 use super::{
-    CalTableKind, MCI_APP_BIND_LEN, MCI_APP_DESC_LEN, MCI_APP_ENDPOINT_END, MCI_APP_NAME_LEN, MCI_APP_NO_SERVER, MCI_APP_RECORD_LEN, MCI_APP_SERVER, MCI_INSTANCE_POINTERS,
-    MCI_META_RECORD_LEN, XCP_EVENT_RECORD_SIZE, parse_cal_meta_record, parse_cal_table_records, parse_event_records, parse_instance_records, parse_mci_records,
-    parse_server_protocol, read_cstr_at, read_cstr_bounded, read_target_ptr,
+    CalTableKind, MCI_APP_BIND_LEN, MCI_APP_CHANNEL_COUNT, MCI_APP_DESC_END, MCI_APP_DESC_LEN, MCI_APP_ENDPOINT_END, MCI_APP_NAME_LEN, MCI_APP_NO_SERVER, MCI_APP_RECORD_LEN,
+    MCI_APP_SERVER, MCI_APP_TIMING_ACTIVE, MCI_APP_TIMING_CORES, MCI_APP_VX_MONITOR, MCI_APP_W1_KNOWN, MCI_INSTANCE_POINTERS, MCI_META_RECORD_LEN, XCP_EVENT_RECORD_SIZE,
+    parse_cal_meta_record, parse_cal_table_records, parse_event_records, parse_instance_records, parse_mci_records, parse_server_protocol, read_cstr_at, read_cstr_bounded,
+    read_target_ptr,
 };
 
 /// Print every xcp_ and mci_ section of the ELF file at `path`, one table per section. Section by section rather than all at
@@ -382,9 +384,9 @@ impl<'d> Image<'d> {
     /// mci_app: the application record, `mci::AppMeta` (mc_meas_abi.hpp).
     fn app(&self, section: &SectionView, out: &mut String) -> Result<(), String> {
         let d = &section.bytes;
-        if ![MCI_APP_NAME_LEN, MCI_APP_ENDPOINT_END, MCI_APP_RECORD_LEN].contains(&d.len()) {
+        if ![MCI_APP_NAME_LEN, MCI_APP_ENDPOINT_END, MCI_APP_DESC_END, MCI_APP_RECORD_LEN].contains(&d.len()) {
             return Err(format!(
-                "not an application record: AppMeta is {MCI_APP_RECORD_LEN} bytes, {MCI_APP_ENDPOINT_END} or {MCI_APP_NAME_LEN} in older builds"
+                "not an application record: AppMeta is {MCI_APP_RECORD_LEN} bytes, {MCI_APP_DESC_END}, {MCI_APP_ENDPOINT_END} or {MCI_APP_NAME_LEN} in older builds"
             ));
         }
         let _ = writeln!(out, "  the application record (AppMeta), as MC_APP states it");
@@ -403,10 +405,42 @@ impl<'d> Image<'d> {
             };
             table.row(["endpoint".into(), endpoint]);
         }
-        if d.len() == MCI_APP_RECORD_LEN {
+        if d.len() >= MCI_APP_DESC_END {
             table.row([
                 "description".into(),
                 field_text(&read_cstr_bounded(d, MCI_APP_ENDPOINT_END, MCI_APP_DESC_LEN).unwrap_or_default()),
+            ]);
+        }
+        if d.len() == MCI_APP_RECORD_LEN {
+            // MC_APP's VX1000 options, which a firmware that links xcplite carries without acting on them
+            let switch = |at: usize| match d[at] {
+                0 => "off".to_string(),
+                1 => "on".to_string(),
+                other => format!("{other} (neither 0 nor 1: the A2L generator refuses the record)"),
+            };
+            table.row(["timing_active".into(), switch(MCI_APP_TIMING_ACTIVE)]);
+            table.row([
+                "timing_cores".into(),
+                match d[MCI_APP_TIMING_CORES] {
+                    0 => "0 (left out: one core)".to_string(),
+                    cores => cores.to_string(),
+                },
+            ]);
+            table.row(["vx_monitor_active".into(), switch(MCI_APP_VX_MONITOR)]);
+            table.row([
+                "driver release".into(),
+                match d[MCI_APP_W1_KNOWN] {
+                    0 => "not one mc_vx.c can set a channel's mode in (or no VX1000 driver)".to_string(),
+                    1 => "one mc_vx.c can set a channel's mode in".to_string(),
+                    other => format!("{other} (neither 0 nor 1: the A2L generator refuses the record)"),
+                },
+            ]);
+            table.row([
+                "channel count".into(),
+                match self.u16_at(d, MCI_APP_CHANNEL_COUNT) {
+                    0 => "0 (no VX1000 driver)".to_string(),
+                    count => format!("{count} (VX1000_OLDA_ACTIVE_EVT_CNT_MAX)"),
+                },
             ]);
         }
         table.render(out);
@@ -414,7 +448,11 @@ impl<'d> Image<'d> {
             let _ = writeln!(
                 out,
                 "  an older record: built before MC_APP recorded {}",
-                if d.len() == MCI_APP_NAME_LEN { "its endpoint" } else { "its description" }
+                match d.len() {
+                    MCI_APP_NAME_LEN => "its endpoint",
+                    MCI_APP_ENDPOINT_END => "its description",
+                    _ => "its VX1000 options",
+                }
             );
         }
         Ok(())
@@ -466,10 +504,10 @@ impl<'d> Image<'d> {
         let records = parse_event_records(&section.bytes, section.addr, self.ptr_size, self.little_endian)?;
         let _ = writeln!(
             out,
-            "  {} (tXcpEventDescriptor, {XCP_EVENT_RECORD_SIZE} bytes each), in section order: the order XcpInit creates the events in",
+            "  {} (tXcpEventDescriptor, {XCP_EVENT_RECORD_SIZE} bytes each), in section order: the order the events are numbered in, Timing Bundle templates left out",
             count(records.len(), "event descriptor")
         );
-        let mut table = Table::new(&["#", "name", "cycle", "priority", "descriptor"]);
+        let mut table = Table::new(&["#", "name", "cycle", "priority", "flags", "descriptor"]);
         for (i, record) in records.iter().enumerate() {
             let priority = section.bytes[i * XCP_EVENT_RECORD_SIZE + self.ptr_size as usize + 4];
             table.row([
@@ -477,6 +515,7 @@ impl<'d> Image<'d> {
                 self.text(record.addr, record.name_ptr),
                 cycle(record.cycle_time_ns),
                 priority.to_string(),
+                event_flags(record.marker, record.flags),
                 self.symbol_at(record.addr).unwrap_or_else(|| "-".into()),
             ]);
         }
@@ -980,6 +1019,29 @@ fn count(n: usize, noun: &str) -> String {
     if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
 }
 
+/// What an event record's first two reserved bytes say: the flags mc-instrument's VX1000 headers write behind their marker, "-" for none.
+/// The generator reads them only in a firmware that links no xcplite.
+fn event_flags(marker: u8, flags: u8) -> String {
+    match marker {
+        0 => "-".to_string(),
+        EVENT_MARKER => {
+            let mut named = Vec::new();
+            if flags & EVENT_MULTIBUF != 0 {
+                named.push("multi-buffer".to_string());
+            }
+            if flags & EVENT_TEMPLATE != 0 {
+                named.push("Timing Bundle template".to_string());
+            }
+            if flags & !(EVENT_MULTIBUF | EVENT_TEMPLATE) != 0 {
+                named.push(format!("unknown 0x{:02X}", flags & !(EVENT_MULTIBUF | EVENT_TEMPLATE)));
+            }
+            if named.is_empty() { "none".to_string() } else { named.join(", ") }
+        }
+        EVENT_MARKER_FIXED => "a fixed channel, from headers before the numbering".to_string(),
+        other => format!("marker 0x{other:02X}, unknown"),
+    }
+}
+
 /// A cycle time in nanoseconds, in the largest unit that states it exactly.
 fn cycle(ns: u32) -> String {
     match ns {
@@ -1164,6 +1226,17 @@ mod tests {
         assert_eq!(meta_object_name("xcp_meta__max__speed.0"), Some(("max".into(), "speed".into())));
         assert_eq!(meta_object_name("xcp_meta__unit"), None);
         assert_eq!(meta_object_name("gXcpData"), None);
+    }
+
+    #[test]
+    fn an_event_records_flags_are_named() {
+        assert_eq!(event_flags(0, 0), "-");
+        assert_eq!(event_flags(EVENT_MARKER, 0), "none");
+        assert_eq!(event_flags(EVENT_MARKER, EVENT_MULTIBUF), "multi-buffer");
+        assert_eq!(event_flags(EVENT_MARKER, EVENT_MULTIBUF | EVENT_TEMPLATE), "multi-buffer, Timing Bundle template");
+        assert_eq!(event_flags(EVENT_MARKER, 0x81), "multi-buffer, unknown 0x80");
+        assert_eq!(event_flags(EVENT_MARKER_FIXED, 5), "a fixed channel, from headers before the numbering");
+        assert_eq!(event_flags(0x42, 0), "marker 0x42, unknown");
     }
 
     #[test]

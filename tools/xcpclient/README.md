@@ -95,6 +95,35 @@ then follow the target rather than XCPlite's server:
   application with a `mc_vx.hpp` that writes the record, or pass `--allow-registry-protocol` to
   get the A2L with a warning. Any other ELF without the record is not affected.
 
+### A VX1000 firmware's records
+
+A firmware instrumented with mc-instrument's VX1000 headers (`mc_vx.h`, `mc_vx.hpp`) links no
+XCPlite, and its records say more than an XCPlite application's. xcpclient reads them only in
+an ELF that does not link XCPlite.
+
+- **The application record** (`mci_app`, 218 bytes) holds, after the name, the endpoint and the
+  description, `MC_APP`'s `.timing_active`, `.timing_cores` (0 is one core) and
+  `.vx_monitor_active`, whether mc-instrument's runtime can set a channel's mode in the VX1000
+  driver's release, and the driver's channel count (`VX1000_OLDA_ACTIVE_EVT_CNT_MAX`). A record
+  of another size is refused, one of an older layout with the field it lacks: rebuild.
+- **Events** are numbered from the `xcp_evts` records in section order, as the firmware's
+  runtime numbers them: each named record that is no template and whose name is new takes the
+  next channel from 0. The headers mark each record, `0xC6` in its first reserved byte, and flag
+  it in the second: `0x01` a multi-buffer event (`MC_MULTIBUF`), `0x02` a template of the VX1000
+  Timing Bundle, which is no event of its own. A record that fixes its own channel (`0xC5`, from
+  headers before the numbering) is refused. So is a firmware with more events than channels, at
+  most 31 and no more than the driver's count, and one with a multi-buffer event and a driver of
+  more than 31 channels, whose channel modes the runtime cannot set. An event named like a
+  template, `OsTaskInfo` or `OsRunInfo`, is refused.
+- **The VX1000 Timing Bundle**, when `MC_APP` sets `.timing_active`: per traced core n the
+  events `OsTaskInfo_C<n>` and `OsRunInfo_C<n>`, numbered after the firmware's own (every core's
+  OS event, then every core's runnable event), with the trace words `OsTaskInfo_C<n>.Os_Trace`
+  (`VX1000If_Os_Trace[n]`) and `OsRunInfo_C<n>.Rte_Trace` (`VX1000If_Rte_Trace[n]`) on them.
+  The core count is the size of `VX1000If_Os_Trace` in the symbol table. Refused: the bundle
+  not linked, a core count other than `.timing_cores`, more cores than the runtime's channel
+  arrays hold, and a driver release the runtime cannot set a channel's mode in. Without
+  `.timing_active` the templates and their words are left out.
+
 ### Log levels and `--print-features`
 
 At log level 2 (warnings), a run prints only what needs a decision: a type that went wrong, a
@@ -159,13 +188,16 @@ the generator reads, and a warning a parser gives appears next to its section.
 
 ```
 xcp_evts  0x4D6F0  48 bytes
-  3 event descriptors (tXcpEventDescriptor, 16 bytes each), in section order: the order XcpInit creates the events in
-  #  name             cycle         priority  descriptor
-  -  ---------------  ------------  --------  --------------------------
-  0  KernelDemoEvent  0 (sporadic)  0         main::evt__KernelDemoEvent
-  1  KernelDemoArray  0 (sporadic)  0         main::evt__KernelDemoArray
-  2  KernelDemoSlow   1 s           0         main::evt__KernelDemoSlow
+  3 event descriptors (tXcpEventDescriptor, 16 bytes each), in section order: the order the events are numbered in, Timing Bundle templates left out
+  #  name             cycle         priority  flags  descriptor
+  -  ---------------  ------------  --------  -----  --------------------------
+  0  KernelDemoEvent  0 (sporadic)  0         -      main::evt__KernelDemoEvent
+  1  KernelDemoArray  0 (sporadic)  0         -      main::evt__KernelDemoArray
+  2  KernelDemoSlow   1 s           0         -      main::evt__KernelDemoSlow
 ```
+
+A VX1000 firmware's events show their flags (`multi-buffer`, `Timing Bundle template`), and its
+application record `MC_APP`'s VX1000 options.
 
 It reads no debug information, so a binary built without `-g` dumps too. Pointers are read as the
 loaded image holds them, with the dynamic relocations applied: in a shared library a pointer to a

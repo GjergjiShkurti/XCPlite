@@ -116,6 +116,9 @@ right behind the name pointer), and priority.
 xcpclient iterates all entries in `xcp_evts` to discover **every event** defined in the
 firmware, regardless of whether that code path has executed at the time of A2L generation.
 The event id is the record's index and the `EVENT` line of the A2L states the record's cycle time.
+In a firmware that links no XCPlite (mc-instrument's VX1000 backend) the record's reserved bytes
+carry a marker and flags, and a VX1000 Timing Bundle template numbers no event: see the xcpclient
+README, *A VX1000 firmware's records*.
 
 #### `xcp_cals` section — calibration segment descriptors
 

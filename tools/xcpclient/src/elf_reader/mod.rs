@@ -81,6 +81,10 @@ use debuginfo::{DbgDataType, DebugData, LoadSegment, TypeInfo, VarInfo};
 mod section_dump;
 pub use section_dump::dump_sections;
 
+// mc-instrument's VX1000 backend: MC_APP's VX1000 options, the event records' flags and numbering, the Timing Bundle
+mod vx1000;
+use vx1000::{EVENT_MULTIBUF, EVENT_TEMPLATE, EventSlot};
+
 //use crate::xcp_client::xcp;
 
 //------------------------------------------------------------------------
@@ -88,6 +92,8 @@ pub use section_dump::dump_sections;
 
 pub(crate) struct ElfReader {
     pub(crate) debug_data: DebugData,
+    /// The ELF file, for what the debug information does not hold: the symbol table
+    path: String,
 }
 
 impl ElfReader {
@@ -105,7 +111,7 @@ impl ElfReader {
         let Some(data) = self.mci_app_record()? else {
             return Ok(String::new());
         };
-        let desc = &data[MCI_APP_ENDPOINT_END..MCI_APP_RECORD_LEN];
+        let desc = &data[MCI_APP_ENDPOINT_END..MCI_APP_DESC_END];
         let end = desc.iter().position(|&b| b == 0).unwrap_or(desc.len());
         Ok(a2l_text(&String::from_utf8_lossy(&desc[..end])))
     }
@@ -115,28 +121,7 @@ impl ElfReader {
         let Some(data) = self.debug_data.mci_app_data.as_ref() else {
             return Ok(None);
         };
-        if data.len() == MCI_APP_NAME_LEN {
-            return Err(format!(
-                "the ELF's mci_app record names the application ('{}') but not where it listens: it was built before MC_APP recorded .bind, .port and .tcp there. \
-                 Rebuild it, so that its offline A2L states the application's own endpoint",
-                self.app_name().unwrap_or("")
-            )
-            .into());
-        }
-        if data.len() == MCI_APP_ENDPOINT_END {
-            return Err(format!(
-                "the ELF's mci_app record has no description: '{}' was built before MC_APP recorded .desc there. Rebuild it, so that its offline A2L carries its description",
-                self.app_name().unwrap_or("")
-            )
-            .into());
-        }
-        if data.len() != MCI_APP_RECORD_LEN {
-            return Err(format!(
-                "the mci_app section holds {} bytes, which is not one application record of {MCI_APP_RECORD_LEN}: an application has one MC_APP",
-                data.len()
-            )
-            .into());
-        }
+        check_app_record(data, self.app_name().unwrap_or(""))?;
         Ok(Some(data))
     }
 
@@ -199,7 +184,10 @@ impl ElfReader {
         info!("Loading debug information from ELF file: {}", file_name);
         let debug_data = DebugData::load_dwarf(OsStr::new(file_name), verbose, unit_idx_limit);
         match debug_data {
-            Ok(debug_data) => Some(ElfReader { debug_data }),
+            Ok(debug_data) => Some(ElfReader {
+                debug_data,
+                path: file_name.to_string(),
+            }),
             Err(e) => {
                 error!("Failed to load debug info from '{}': {}", file_name, e);
                 None
@@ -792,18 +780,10 @@ impl ElfReader {
         }
     }
 
-    /// Register one event per record of the xcp_evts section. XcpInit creates the server's events
-    /// from these records, in section order, so an event's number is its record's position, and the
-    /// record holds the event's name and cycle time. The evt__<name> variable in the debug info only
-    /// says where an event was declared, and a translation unit compiled without -g has none: an
-    /// event looked up there was missing from the A2L, and the measurements naming it were bound to
-    /// event 0, while the application created it all the same.
-    fn register_section_events(&self, reg: &mut Registry, base: u64, data: &[u8]) -> Result<(), Box<dyn Error>> {
-        let records = parse_event_records(data, base, self.debug_data.ptr_size, self.debug_data.is_little_endian)?;
-
-        // Where each record was declared, from the debug info, by the record's address: an inline
-        // function's MEASURE is one record however many units include it (the linker keeps one COMDAT
-        // copy), and every unit's definition points at that one.
+    /// Where each record of the xcp_evts section was declared, from the debug info, by the record's address:
+    /// an inline function's MEASURE is one record however many units include it (the linker keeps one
+    /// COMDAT copy), and every unit's definition points at that one.
+    fn event_declarations(&self) -> std::collections::HashMap<u64, (&str, &VarInfo)> {
         let mut declared: std::collections::HashMap<u64, (&str, &VarInfo)> = std::collections::HashMap::new();
         for (var_name, var_infos) in &self.debug_data.variables {
             if let Some(evt_name) = var_name.strip_prefix("evt__") {
@@ -812,6 +792,132 @@ impl ElfReader {
                 }
             }
         }
+        declared
+    }
+
+    /// Where the event record at `addr` was declared, `unit:function`, for a message.
+    fn event_place(&self, declared: &std::collections::HashMap<u64, (&str, &VarInfo)>, addr: u64) -> String {
+        match declared.get(&addr) {
+            Some((_, v)) => {
+                let unit = self.debug_data.make_simple_unit_name(v.unit_idx).unwrap_or_else(|| format!("{}", v.unit_idx));
+                format!("{}:{}", unit, v.function.as_deref().unwrap_or("?"))
+            }
+            None => "a unit without debug information".to_string(),
+        }
+    }
+
+    /// The records of the xcp_evts section, in section order, each with its event's name and, in a firmware
+    /// that links no xcplite, its flags (vx1000.rs). Empty when the ELF has no such section. An event name
+    /// used by two records is refused, and so is a record whose event cannot be named, or whose flags this
+    /// reader cannot read.
+    fn section_events(&self) -> Result<Vec<SectionEvent>, Box<dyn Error>> {
+        let Some((base, data)) = &self.debug_data.xcp_evts_data else {
+            return Ok(Vec::new());
+        };
+        let records = parse_event_records(data, *base, self.debug_data.ptr_size, self.debug_data.is_little_endian)?;
+        let declared = self.event_declarations();
+        let place = |addr: u64| self.event_place(&declared, addr);
+        // The reserved bytes are the record's own only where no xcplite creates the events from them
+        let vx = !self.is_xcplite_target();
+
+        // Each record's name: the string its name pointer holds, or, where that cannot be read, the
+        // evt__<name> variable at the record's address. A VX1000 firmware's runtime skips a record
+        // without a name pointer, and so does its numbering here.
+        let mut events: Vec<SectionEvent> = Vec::with_capacity(records.len());
+        for r in records {
+            if vx && r.name_ptr == 0 && !declared.contains_key(&r.addr) {
+                events.push(SectionEvent { record: r, name: None, flags: 0 });
+                continue;
+            }
+            let name = self.read_rodata_cstr(r.name_ptr).or_else(|| declared.get(&r.addr).map(|(name, _)| name.to_string()));
+            let Some(name) = name else {
+                return Err(format!(
+                    "the xcp_evts record at 0x{:08X} points at its event's name at 0x{:08X}, outside .rodata, and the debug info has no \
+                     evt__ variable there: its event cannot be named, so no A2L is written",
+                    r.addr, r.name_ptr
+                )
+                .into());
+            };
+            let flags = if vx { vx1000::event_flags(&name, r.marker, r.flags)? } else { 0 };
+            events.push(SectionEvent {
+                record: r,
+                name: Some(name),
+                flags,
+            });
+        }
+
+        // An event name belongs to one MEASURE. Each site has its own record, so a name with two
+        // records is two sites -- one event with one DAQ list, triggered from two places, which the
+        // running application also refuses.
+        let mut sites: std::collections::BTreeMap<&str, Vec<&SectionEvent>> = std::collections::BTreeMap::new();
+        for event in &events {
+            if let Some(name) = event.name.as_deref() {
+                sites.entry(name).or_default().push(event);
+            }
+        }
+        // A VX1000 firmware's mc_vx.c holds the Timing Bundle's template records whether or not MC_APP
+        // switches the bundle on, so their names are never a MEASURE's.
+        let named_like_a_template: Vec<String> = sites
+            .iter()
+            .filter(|(_, records)| records.len() > 1 && records.iter().any(|e| e.is_template()))
+            .map(|(name, records)| {
+                let places: Vec<String> = records.iter().filter(|e| !e.is_template()).map(|e| place(e.record.addr)).collect();
+                format!("'{}' ({})", name, places.join(", "))
+            })
+            .collect();
+        if !named_like_a_template.is_empty() {
+            return Err(format!(
+                "event named like a template of the VX1000 Timing Bundle: {}. mc_vx.c holds a template record of that name in every \
+                 VX1000 firmware, whether or not MC_APP switches the bundle on. Give the MEASURE another event name; no A2L is written",
+                named_like_a_template.join("; ")
+            )
+            .into());
+        }
+        let duplicate_events: Vec<String> = sites
+            .iter()
+            .filter(|(_, records)| records.len() > 1)
+            .map(|(name, records)| {
+                let places: Vec<String> = records.iter().map(|e| place(e.record.addr)).collect();
+                format!("'{}' ({} sites: {})", name, records.len(), places.join(", "))
+            })
+            .collect();
+        if !duplicate_events.is_empty() {
+            return Err(format!(
+                "event name used by more than one MEASURE: {}. An event belongs to one call site -- two would share one \
+                 DAQ list and trigger it from two places. Give each MEASURE an event name of its own. A MEASURE in a \
+                 `static` function in a header is one site per file that includes it: move that function into one .cpp file.",
+                duplicate_events.join("; ")
+            )
+            .into());
+        }
+        Ok(events)
+    }
+
+    /// The names of the Timing Bundle's template records in a VX1000 firmware's xcp_evts section: none in
+    /// an ELF that links xcplite.
+    fn event_templates(&self) -> Result<Vec<String>, Box<dyn Error>> {
+        if self.is_xcplite_target() {
+            return Ok(Vec::new());
+        }
+        Ok(self.section_events()?.into_iter().filter(SectionEvent::is_template).filter_map(|e| e.name).collect())
+    }
+
+    /// Register one event per record of the xcp_evts section. XcpInit creates the server's events
+    /// from these records, in section order, so an event's number is its record's position, and the
+    /// record holds the event's name and cycle time. The evt__<name> variable in the debug info only
+    /// says where an event was declared, and a translation unit compiled without -g has none: an
+    /// event looked up there was missing from the A2L, and the measurements naming it were bound to
+    /// event 0, while the application created it all the same.
+    ///
+    /// A VX1000 firmware's runtime numbers its events the same way, with the records that are no event
+    /// left out (vx1000.rs, number_events): a Timing Bundle template stands for one event per traced
+    /// core, which follow the firmware's own when MC_APP switches the bundle on. MC_APP's VX1000 options
+    /// add the checks of what the driver can serve.
+    fn register_section_events(&self, reg: &mut Registry, base: u64, data: &[u8]) -> Result<(), Box<dyn Error>> {
+        let events = self.section_events()?;
+        let declared = self.event_declarations();
+        let place = |addr: u64| self.event_place(&declared, addr);
+
         // A descriptor the debug info has outside the section is one the compiler took out of it -- a
         // MEASURE in a template, whose section attribute gcc drops -- so the application does not
         // create its event at startup, and the A2L does not describe it.
@@ -832,79 +938,52 @@ impl ElfReader {
                 );
             }
         }
-        let place = |addr: u64| match declared.get(&addr) {
-            Some((_, v)) => {
-                let unit = self.debug_data.make_simple_unit_name(v.unit_idx).unwrap_or_else(|| format!("{}", v.unit_idx));
-                format!("{}:{}", unit, v.function.as_deref().unwrap_or("?"))
-            }
-            None => "a unit without debug information".to_string(),
-        };
 
-        // Each record's name: the string its name pointer holds, or, where that cannot be read, the
-        // evt__<name> variable at the record's address.
-        let mut names: Vec<String> = Vec::with_capacity(records.len());
-        for r in &records {
-            let name = self.read_rodata_cstr(r.name_ptr).or_else(|| declared.get(&r.addr).map(|(name, _)| name.to_string()));
-            let Some(name) = name else {
-                return Err(format!(
-                    "the xcp_evts record at 0x{:08X} points at its event's name at 0x{:08X}, outside .rodata, and the debug info has no \
-                     evt__ variable there: its event cannot be named, so no A2L is written",
-                    r.addr, r.name_ptr
-                )
-                .into());
-            };
-            names.push(name);
-        }
-
-        // An event name belongs to one MEASURE. Each site has its own record, so a name with two
-        // records is two sites -- one event with one DAQ list, triggered from two places, which the
-        // running application also refuses.
-        let mut sites: std::collections::BTreeMap<&str, Vec<u64>> = std::collections::BTreeMap::new();
-        for (name, r) in names.iter().zip(&records) {
-            sites.entry(name.as_str()).or_default().push(r.addr);
-        }
-        let duplicate_events: Vec<String> = sites
+        // Each event's channel. The Timing Bundle's follow the firmware's own. MC_APP's VX1000 options, in a
+        // firmware that links no xcplite, decide whether there are any, and what the driver can serve.
+        let options = self.vx_options()?;
+        let bundle = self.timing_bundle()?;
+        let slots: Vec<EventSlot> = events
             .iter()
-            .filter(|(_, addrs)| addrs.len() > 1)
-            .map(|(name, addrs)| {
-                let places: Vec<String> = addrs.iter().map(|a| place(*a)).collect();
-                format!("'{}' ({} sites: {})", name, addrs.len(), places.join(", "))
+            .map(|e| match e.name.as_deref() {
+                None => EventSlot::Unnamed,
+                Some(name) if e.is_template() => EventSlot::Template(name),
+                Some(name) => EventSlot::Event(name),
             })
             .collect();
-        if !duplicate_events.is_empty() {
-            return Err(format!(
-                "event name used by more than one MEASURE: {}. An event belongs to one call site -- two would share one \
-                 DAQ list and trigger it from two places. Give each MEASURE an event name of its own. A MEASURE in a \
-                 `static` function in a header is one site per file that includes it: move that function into one .cpp file.",
-                duplicate_events.join("; ")
-            )
-            .into());
+        let channels = vx1000::number_events(&slots)?;
+        let numbered: Vec<&SectionEvent> = events.iter().zip(&channels).filter(|(_, channel)| channel.is_some()).map(|(e, _)| e).collect();
+        let bundle_events = match &bundle {
+            Some(bundle) => vx1000::bundle_events(u16::try_from(numbered.len()).unwrap_or(u16::MAX), bundle.cores),
+            None => Vec::new(),
+        };
+        if let Some(options) = &options {
+            let names: Vec<&str> = numbered.iter().filter_map(|e| e.name.as_deref()).collect();
+            let multibuf: Vec<&str> = numbered.iter().filter(|e| e.flags & EVENT_MULTIBUF != 0).filter_map(|e| e.name.as_deref()).collect();
+            vx1000::check_channel_count(options, &names, &multibuf, &bundle_events)?;
         }
 
         // The A2L lists events in the order they are registered. Those with an evt__ variable come in
         // the order of the debug info, which is the order the search below has always given them;
-        // those without follow, in section order.
-        let mut order: Vec<usize> = Vec::with_capacity(records.len());
-        let mut placed = vec![false; records.len()];
+        // those without follow, in section order. The Timing Bundle's come last.
+        let mut order: Vec<usize> = Vec::with_capacity(events.len());
+        let mut placed = vec![false; events.len()];
         for var_name in self.debug_data.variables.keys() {
             if let Some(evt_name) = var_name.strip_prefix("evt__")
-                && let Some(i) = names.iter().position(|name| name == evt_name)
+                && let Some(i) = events.iter().position(|e| e.name.as_deref() == Some(evt_name))
                 && !placed[i]
             {
                 placed[i] = true;
                 order.push(i);
             }
         }
-        order.extend((0..records.len()).filter(|&i| !placed[i]));
-
-        // Each event's channel: its record's position, or the channel the firmware fixed. A fixed
-        // channel is read only where the records are a firmware's own: an xcplite server creates its
-        // events by position, whatever the reserved bytes of its records hold.
-        let fixed_allowed = !self.is_xcplite_target();
-        let channels = event_channels(&names.iter().cloned().zip(records.iter().map(|r| r.fixed_channel.filter(|_| fixed_allowed))).collect::<Vec<_>>())?;
+        order.extend((0..events.len()).filter(|&i| !placed[i]));
 
         for i in order {
-            let (name, r) = (&names[i], &records[i]);
+            let (Some(name), Some(event_id)) = (events[i].name.as_ref(), channels[i]) else {
+                continue; // a template, or a record without a name
+            };
+            let r = &events[i].record;
             if reg.event_list.find_event(name, 0).is_some() {
                 continue; // already known, from the server this client is connected to
             }
@@ -913,15 +992,26 @@ impl ElfReader {
             } else {
                 info!("Event '{}' has no debug information: its record at {:#x} names it", name, r.addr);
             }
-            let event_id = channels[i];
             reg.event_list.add_event(McEvent::new(name.clone(), 0, event_id, r.cycle_time_ns))?;
             info!(
                 "New event '{}' found: event id = {}{}, cycle time = {} ns",
                 name,
                 event_id,
-                if r.fixed_channel.is_some() && fixed_allowed { " (fixed by the firmware)" } else { "" },
+                if events[i].flags & EVENT_MULTIBUF != 0 { ", multi-buffer" } else { "" },
                 r.cycle_time_ns
             );
+        }
+        for (name, event_id) in bundle_events {
+            if reg.event_list.find_event(&name, 0).is_some() {
+                continue;
+            }
+            let template = name.rsplit_once("_C").map_or(name.as_str(), |(template, _)| template);
+            let cycle_time_ns = events
+                .iter()
+                .find(|e| e.is_template() && e.name.as_deref() == Some(template))
+                .map_or(0, |e| e.record.cycle_time_ns);
+            reg.event_list.add_event(McEvent::new(name.clone(), 0, event_id, cycle_time_ns))?;
+            info!("Timing Bundle event '{}': event id = {}, multi-buffer, cycle time = {} ns", name, event_id, cycle_time_ns);
         }
         Ok(())
     }
@@ -1528,11 +1618,27 @@ impl ElfReader {
         Ok(())
     }
 
-    /// The mc-instrument measurement records of the ELF (the mci_meas section), or None when it
-    /// has none. Read once and handed to both users: `MciAddressing::of` decides from them what the
-    /// DWARF sweep in register_variables may add, and register_mci_measurements turns them into
-    /// measurements. A layout this reader cannot parse is warned about and gives no records.
+    /// The mc-instrument measurement records of the ELF (the mci_meas section) as the A2L describes
+    /// them, or None when it has none. Read once and handed to both users: `MciAddressing::of` decides
+    /// from them what the DWARF sweep in register_variables may add, and register_mci_measurements
+    /// turns them into measurements. A layout this reader cannot parse is warned about and gives no
+    /// records. In a VX1000 firmware a record on a Timing Bundle template is the bundle's trace word:
+    /// one record per traced core when MC_APP switches the bundle on, none when it does not
+    /// (vx1000.rs, expand_bundle_records).
     pub fn mci_records(&self) -> Result<Option<Vec<MciRecord>>, Box<dyn Error>> {
+        let Some(records) = self.raw_mci_records()? else {
+            return Ok(None);
+        };
+        let templates = self.event_templates()?;
+        if templates.is_empty() {
+            return Ok(Some(records));
+        }
+        let bundle = self.timing_bundle()?;
+        Ok(Some(vx1000::expand_bundle_records(records, &templates, bundle.as_ref())))
+    }
+
+    /// The records of the mci_meas section as they are, or None when the ELF has none.
+    fn raw_mci_records(&self) -> Result<Option<Vec<MciRecord>>, Box<dyn Error>> {
         let Some((_base, data)) = self.debug_data.mci_meas_data.as_ref() else {
             return Ok(None);
         };
@@ -2099,6 +2205,7 @@ impl SweepNames {
 }
 
 /// One record of the mci_meas section: an object a MEASURE (or MC outside one) describes.
+#[derive(Debug, Clone)]
 pub(crate) struct MciRecord {
     name: String,
     ty: i8,
@@ -2466,14 +2573,47 @@ pub fn fix_identifier_read_write(path: &std::path::Path) -> Result<(), Box<dyn E
 
 /// The size of the mci_app record before it held the endpoint -- the name alone -- before it held
 /// the description (issue 186), and since.
+/// MCI_APP_DESC_END is its size before it held MC_APP's VX1000 options.
 const MCI_APP_NAME_LEN: usize = 64;
 const MCI_APP_BIND_LEN: usize = 16;
 const MCI_APP_ENDPOINT_END: usize = MCI_APP_NAME_LEN + MCI_APP_BIND_LEN + 4;
 const MCI_APP_DESC_LEN: usize = 128;
-const MCI_APP_RECORD_LEN: usize = MCI_APP_ENDPOINT_END + MCI_APP_DESC_LEN;
+const MCI_APP_DESC_END: usize = MCI_APP_ENDPOINT_END + MCI_APP_DESC_LEN;
+/// MC_APP's VX1000 options after the description, one byte each (vx1000.rs): .timing_active, .timing_cores, .vx_monitor_active, and
+/// whether mc_vx.c knows the VX1000 driver's release; then the driver's channel count, 16 bits in the target's byte order. Every
+/// backend writes them; only a firmware that links no xcplite acts on them.
+const MCI_APP_TIMING_ACTIVE: usize = MCI_APP_DESC_END;
+const MCI_APP_TIMING_CORES: usize = MCI_APP_DESC_END + 1;
+const MCI_APP_VX_MONITOR: usize = MCI_APP_DESC_END + 2;
+const MCI_APP_W1_KNOWN: usize = MCI_APP_DESC_END + 3;
+const MCI_APP_CHANNEL_COUNT: usize = MCI_APP_DESC_END + 4;
+const MCI_APP_RECORD_LEN: usize = MCI_APP_CHANNEL_COUNT + 2;
 /// AppMeta::endpoint: the application runs no XCP server (the VX1000 backend), or it runs one.
 const MCI_APP_NO_SERVER: u8 = 0;
 const MCI_APP_SERVER: u8 = 1;
+
+/// Refuse an mci_app record that is not one of today's, for the application `name`: one from before
+/// MC_APP recorded the endpoint, the description or the VX1000 options says what it lacks, and any
+/// other size is not one record.
+fn check_app_record(data: &[u8], name: &str) -> Result<(), String> {
+    match data.len() {
+        MCI_APP_RECORD_LEN => Ok(()),
+        MCI_APP_NAME_LEN => Err(format!(
+            "the ELF's mci_app record names the application ('{name}') but not where it listens: it was built before MC_APP recorded .bind, .port and .tcp there. \
+             Rebuild it, so that its offline A2L states the application's own endpoint"
+        )),
+        MCI_APP_ENDPOINT_END => Err(format!(
+            "the ELF's mci_app record has no description: '{name}' was built before MC_APP recorded .desc there. Rebuild it, so that its offline A2L carries its description"
+        )),
+        MCI_APP_DESC_END => Err(format!(
+            "the ELF's mci_app record has no VX1000 options: '{name}' was built before MC_APP recorded .timing_active, .timing_cores, .vx_monitor_active \
+             and the VX1000 driver's channel count there. Rebuild it with the current mc-instrument headers"
+        )),
+        other => Err(format!(
+            "the mci_app section holds {other} bytes, which is not one application record of {MCI_APP_RECORD_LEN}: an application has one MC_APP"
+        )),
+    }
+}
 
 /// What an mc-instrument application's mci_app record says about its XCP endpoint (issue 225).
 pub enum AppEndpoint {
@@ -2633,8 +2773,6 @@ pub const FEATURES: &[&str] = &[
     "check-epk",
     // a curve, a map and an axis are described as one, from the mci_tbls record, not as an array
     "a2l-cal-tables",
-    // an event has the channel its xcp_evts record fixes, in an ELF that links no xcplite
-    "a2l-event-channel",
     // a record of the mci_cal section is a CHARACTERISTIC at its absolute address
     "a2l-cal-objects",
     // a unit in the enum format is a verbal table, not the text of a PHYS_UNIT
@@ -3771,21 +3909,35 @@ fn read_target_ptr(bytes: &[u8], at: usize, ptr_size: u8, little_endian: bool) -
 }
 
 /// One record of the xcp_evts section, at `addr`: where its event's name is, its cycle time, and the
-/// channel it fixes, if it fixes one.
+/// first two of its reserved bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EventRecord {
     addr: u64,
     name_ptr: u64,
     cycle_time_ns: u32,
-    /// The channel a firmware without an XCP server of its own gives the event (mc-instrument's
-    /// MEASURE_CHANNEL and MC_EVENT, on the VX1000 backend): the record's reserved bytes then hold
-    /// `EVENT_FIXED_MARKER` and the channel, low byte first. None for a record that leaves its
-    /// channel to its position in the section, as every record of an xcplite server does.
-    fixed_channel: Option<u16>,
+    /// The first two reserved bytes, behind the priority. A firmware without an XCP server of its own
+    /// (mc-instrument's VX1000 backend) writes a marker and the event's flags there (vx1000.rs,
+    /// `event_flags`); an xcplite server's records hold nothing there that is read.
+    marker: u8,
+    flags: u8,
 }
 
-/// The first reserved byte of an event record that fixes its channel (mc_vx.h: MCI_EVT_FIXED_).
-const EVENT_FIXED_MARKER: u8 = 0xC5;
+/// One record of the xcp_evts section with its event's name and its flags (ElfReader::section_events).
+struct SectionEvent {
+    record: EventRecord,
+    /// The event's name; None for a record of a VX1000 firmware without a name pointer, which is no event
+    name: Option<String>,
+    /// What the record's reserved bytes flag in a firmware that links no xcplite (vx1000.rs, event_flags);
+    /// 0 in an xcplite application
+    flags: u8,
+}
+
+impl SectionEvent {
+    /// A Timing Bundle template, which stands for one event per traced core and is no event of its own
+    fn is_template(&self) -> bool {
+        self.flags & EVENT_TEMPLATE != 0
+    }
+}
 
 /// The size of a `tXcpEventDescriptor`, which xcplib.h pads to 16 bytes on every target.
 const XCP_EVENT_RECORD_SIZE: usize = 16;
@@ -3806,66 +3958,21 @@ fn parse_event_records(section: &[u8], base: u64, ptr_size: u8, little_endian: b
             .get(ptr_size as usize..ptr_size as usize + 4)
             .and_then(|b| <[u8; 4]>::try_from(b).ok())
             .ok_or_else(|| format!("a {ptr_size}-byte pointer leaves no room for the cycle time in a {XCP_EVENT_RECORD_SIZE}-byte event record"))?;
-        // The reserved bytes follow the priority, which follows the cycle time: marker, low, high.
+        // The reserved bytes follow the priority, which follows the cycle time.
         let reserved = ptr_size as usize + 5;
-        let fixed_channel = match record.get(reserved..reserved + 3) {
-            Some(&[EVENT_FIXED_MARKER, low, high]) => Some(u16::from_le_bytes([low, high])),
-            _ => None,
+        let (marker, flags) = match record.get(reserved..reserved + 2) {
+            Some(&[marker, flags]) => (marker, flags),
+            _ => (0, 0),
         };
         records.push(EventRecord {
             addr: base + (i * XCP_EVENT_RECORD_SIZE) as u64,
             name_ptr,
             cycle_time_ns: if little_endian { u32::from_le_bytes(cycle) } else { u32::from_be_bytes(cycle) },
-            fixed_channel,
+            marker,
+            flags,
         });
     }
     Ok(records)
-}
-
-/// The channel of each event, in the order of `events` (name, the channel its record fixes).
-///
-/// With no fixed channel anywhere a channel is the record's position, which is how an xcplite server
-/// numbers its events and how a VX1000 firmware's runtime does when nothing fixes one. Once one event
-/// has a fixed channel, all must have: the firmware's runtime then gives an event without one no
-/// channel at all -- a position among numbers somebody chose would be a guess -- so its MEASURE never
-/// triggers, and an A2L that numbered it anyway would arm a channel nothing raises. Two events on one
-/// channel would share one DAQ list. Both are refused, naming the events.
-fn event_channels(events: &[(String, Option<u16>)]) -> Result<Vec<u16>, String> {
-    if events.iter().all(|(_, fixed)| fixed.is_none()) {
-        return events
-            .iter()
-            .enumerate()
-            .map(|(i, (name, _))| u16::try_from(i).map_err(|_| format!("event '{name}' is record {i} of the xcp_evts section, past the 16 bit event numbers")))
-            .collect();
-    }
-    let without: Vec<&str> = events.iter().filter(|(_, fixed)| fixed.is_none()).map(|(name, _)| name.as_str()).collect();
-    if !without.is_empty() {
-        let with: Vec<String> = events.iter().filter_map(|(name, fixed)| fixed.map(|c| format!("'{name}' ({c})"))).collect();
-        return Err(format!(
-            "event{} {} {} no channel of {} own, while {} fix{} theirs: once one event of a firmware has a fixed channel, an event without one              gets none at run time and is never triggered. Give each a channel (MEASURE_CHANNEL in place of MEASURE or MEASURE_CYCLE); no A2L is written",
-            if without.len() == 1 { "" } else { "s" },
-            without.iter().map(|name| format!("'{name}'")).collect::<Vec<_>>().join(", "),
-            if without.len() == 1 { "has" } else { "have" },
-            if without.len() == 1 { "its" } else { "their" },
-            with.join(", "),
-            if with.len() == 1 { "es" } else { "" },
-        ));
-    }
-    let mut taken: std::collections::BTreeMap<u16, &str> = std::collections::BTreeMap::new();
-    let mut channels = Vec::with_capacity(events.len());
-    for (name, fixed) in events {
-        let channel = fixed.expect("checked above: every event fixes its channel");
-        if channel == u16::MAX {
-            return Err(format!("event '{name}' fixes channel 65535, which is the number for no channel; no A2L is written"));
-        }
-        if let Some(other) = taken.insert(channel, name.as_str()) {
-            return Err(format!(
-                "events '{other}' and '{name}' both fix channel {channel}: two events on one channel would share one DAQ list and trigger it from two places.                  Give each a channel of its own; no A2L is written"
-            ));
-        }
-        channels.push(channel);
-    }
-    Ok(channels)
 }
 
 /// One record of mc-instrument's mci_insts section (`mci::InstanceMeta`): where the segment's name
@@ -4059,8 +4166,20 @@ mod tests {
             assert_eq!(
                 records,
                 vec![
-                    EventRecord { addr: 0x4A230, name_ptr: 0x3212D, cycle_time_ns: 0, fixed_channel: None },
-                    EventRecord { addr: 0x4A240, name_ptr: 0x321C8, cycle_time_ns: 20_000_000, fixed_channel: None },
+                    EventRecord {
+                        addr: 0x4A230,
+                        name_ptr: 0x3212D,
+                        cycle_time_ns: 0,
+                        marker: 0,
+                        flags: 0
+                    },
+                    EventRecord {
+                        addr: 0x4A240,
+                        name_ptr: 0x321C8,
+                        cycle_time_ns: 20_000_000,
+                        marker: 0,
+                        flags: 0
+                    },
                 ],
                 "{ptr_size}-byte pointers, little endian {little_endian}"
             );
@@ -4068,62 +4187,37 @@ mod tests {
         assert_eq!(parse_event_records(&[], 0x4000, 8, true), Ok(vec![]));
     }
 
-    /// An event record that fixes its channel: the marker and the channel, low byte first, in the
+    /// An event record of a VX1000 firmware: mc-instrument's marker and the event's flags, in the
     /// reserved bytes behind the priority.
-    fn fixed_event_record(name_ptr: u64, channel: u16, ptr_size: usize, little_endian: bool) -> Vec<u8> {
+    fn marked_event_record(name_ptr: u64, flags: u8, ptr_size: usize, little_endian: bool) -> Vec<u8> {
         let mut record = event_record(name_ptr, 0, ptr_size, little_endian);
-        record[ptr_size + 5] = EVENT_FIXED_MARKER;
-        record[ptr_size + 6..ptr_size + 8].copy_from_slice(&channel.to_le_bytes());
+        record[ptr_size + 5] = vx1000::EVENT_MARKER;
+        record[ptr_size + 6] = flags;
         record
     }
 
     #[test]
-    fn an_event_record_states_the_channel_it_fixes_on_either_pointer_size_and_byte_order() {
+    fn an_event_records_marker_and_flags_are_read_on_either_pointer_size_and_byte_order() {
         for (ptr_size, little_endian) in [(8, true), (4, true), (4, false), (8, false)] {
-            let mut section = fixed_event_record(0x1000, 5, ptr_size, little_endian);
-            section.extend(fixed_event_record(0x1010, 0x8000, ptr_size, little_endian));
+            let mut section = marked_event_record(0x1000, EVENT_MULTIBUF, ptr_size, little_endian);
+            section.extend(marked_event_record(0x1010, EVENT_MULTIBUF | EVENT_TEMPLATE, ptr_size, little_endian));
             section.extend(event_record(0x1020, 0, ptr_size, little_endian));
             let records = parse_event_records(&section, 0x4000, ptr_size as u8, little_endian).unwrap();
-            let fixed: Vec<Option<u16>> = records.iter().map(|r| r.fixed_channel).collect();
-            assert_eq!(fixed, [Some(5), Some(0x8000), None], "{ptr_size}-byte pointers, little endian {little_endian}");
+            let read: Vec<(u8, u8)> = records.iter().map(|r| (r.marker, r.flags)).collect();
+            assert_eq!(read, [(0xC6, 0x01), (0xC6, 0x03), (0, 0)], "{ptr_size}-byte pointers, little endian {little_endian}");
+            let flags: Vec<Result<u8, String>> = records.iter().map(|r| vx1000::event_flags("e", r.marker, r.flags)).collect();
+            assert_eq!(flags, [Ok(0x01), Ok(0x03), Ok(0)]);
         }
-        // the channel bytes alone, without the marker, fix nothing
+        // a record of the headers that fixed channels is read as it is, and refused by its flags
         let mut record = event_record(0x1000, 0, 4, true);
-        record[10] = 7;
-        assert_eq!(parse_event_records(&record, 0x4000, 4, true).unwrap()[0].fixed_channel, None);
-    }
-
-    fn events(list: &[(&str, Option<u16>)]) -> Vec<(String, Option<u16>)> {
-        list.iter().map(|(name, fixed)| (name.to_string(), *fixed)).collect()
-    }
-
-    #[test]
-    fn events_without_a_fixed_channel_are_numbered_by_position() {
-        assert_eq!(event_channels(&events(&[("a", None), ("b", None), ("c", None)])), Ok(vec![0, 1, 2]));
-        assert_eq!(event_channels(&[]), Ok(vec![]));
-    }
-
-    #[test]
-    fn fixed_channels_are_the_events_numbers_whatever_their_order() {
-        assert_eq!(event_channels(&events(&[("frame", Some(5)), ("init", Some(4)), ("os", Some(20)), ("ten", Some(1))])), Ok(vec![5, 4, 20, 1]));
-    }
-
-    #[test]
-    fn an_event_without_a_channel_among_fixed_ones_is_refused_by_name() {
-        let error = event_channels(&events(&[("frame", Some(5)), ("stray", None), ("ten", Some(1))])).unwrap_err();
-        assert!(error.contains("event 'stray' has no channel of its own"), "{error}");
-        assert!(error.contains("'frame' (5)") && error.contains("'ten' (1)"), "{error}");
-        assert!(error.contains("no A2L is written"), "{error}");
-        let error = event_channels(&events(&[("a", None), ("b", None), ("c", Some(3))])).unwrap_err();
-        assert!(error.contains("events 'a', 'b' have no channel of their own, while 'c' (3) fixes theirs"), "{error}");
-    }
-
-    #[test]
-    fn two_events_on_one_channel_and_channel_65535_are_refused() {
-        let error = event_channels(&events(&[("frame", Some(5)), ("sound", Some(5))])).unwrap_err();
-        assert!(error.contains("events 'frame' and 'sound' both fix channel 5"), "{error}");
-        let error = event_channels(&events(&[("frame", Some(u16::MAX))])).unwrap_err();
-        assert!(error.contains("65535"), "{error}");
+        record[9..12].copy_from_slice(&[vx1000::EVENT_MARKER_FIXED, 5, 0]);
+        let parsed = parse_event_records(&record, 0x4000, 4, true).unwrap()[0];
+        assert_eq!((parsed.marker, parsed.flags), (0xC5, 5));
+        assert!(
+            vx1000::event_flags("Frame", parsed.marker, parsed.flags)
+                .unwrap_err()
+                .contains("Rebuild with the current headers")
+        );
     }
 
     #[test]
@@ -4382,6 +4476,28 @@ mod tests {
         assert!(is_described_in_place(&described, 0x5000, Some(8)));
         assert!(!is_described_in_place(&described, 0x3000, None), "a variable whose type the debug info does not give");
         assert!(!is_described_in_place(&described, 0x3002, Some(2)));
+    }
+
+    #[test]
+    fn an_application_record_of_another_size_than_todays_is_refused() {
+        assert_eq!(MCI_APP_RECORD_LEN, 218);
+        assert_eq!(check_app_record(&[0u8; 218], "app"), Ok(()));
+        let refusal = |size: usize| check_app_record(&vec![0u8; size], "app").unwrap_err();
+        assert!(refusal(64).contains("built before MC_APP recorded .bind, .port and .tcp"), "{}", refusal(64));
+        assert!(refusal(84).contains("built before MC_APP recorded .desc"), "{}", refusal(84));
+        assert!(
+            refusal(212).starts_with("the ELF's mci_app record has no VX1000 options: 'app' was built before MC_APP recorded .timing_active"),
+            "{}",
+            refusal(212)
+        );
+        assert!(refusal(212).ends_with("Rebuild it with the current mc-instrument headers"), "{}", refusal(212));
+        for size in [0, 217, 219, 436] {
+            assert!(
+                refusal(size).contains(&format!("holds {size} bytes, which is not one application record of 218")),
+                "{}",
+                refusal(size)
+            );
+        }
     }
 
     fn limits_of(ty: i8, min: f64, max: f64) -> (f64, f64) {
@@ -4739,7 +4855,6 @@ mod tests {
                 "a2l-require-proto",
                 "check-epk",
                 "a2l-cal-tables",
-                "a2l-event-channel",
                 "a2l-cal-objects",
                 "a2l-value-tables",
             ]
