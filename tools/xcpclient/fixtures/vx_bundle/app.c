@@ -53,12 +53,12 @@ static const struct mci_evt_descriptor evt__Frame RECORD("xcp_evts") = {"Frame",
 static const struct mci_evt_descriptor evt__OsTaskInfo RECORD("xcp_evts") = {"OsTaskInfo", 0, 0, {0xC6, 0x03}};
 static const struct mci_evt_descriptor evt__OsRunInfo RECORD("xcp_evts") = {"OsRunInfo", 0, 0, {0xC6, 0x03}};
 
-/* Frame's entries: a whole variable in place, an array element and a struct's first member in place (each with its .name), and one
- * copied into its shadow */
+/* Frame's entries: a whole variable in place, an array element and a struct's first member in place (each with its .name, the
+ * element's the array's own), and one copied into its shadow */
 #define ENTRY(name_, type_, var_) {name_, type_, 1, 0, "", "", 0.0, 0.0, NULL, "Frame", (const void *)&(var_)}
 #ifndef SWITCHED_OFF
 static const struct mci_meas_meta __mci_desc_Health RECORD("mci_meas") __attribute__((aligned(8))) = ENTRY("Health", -2, Health);
-static const struct mci_meas_meta __mci_desc_Ammo RECORD("mci_meas") __attribute__((aligned(8))) = ENTRY("Ammo_Bullets", -4, Ammo[0]);
+static const struct mci_meas_meta __mci_desc_Ammo RECORD("mci_meas") __attribute__((aligned(8))) = ENTRY("Ammo", -4, Ammo[0]);
 static const struct mci_meas_meta __mci_desc_Player RECORD("mci_meas") __attribute__((aligned(8))) = ENTRY("PlayerX", -2, Player.x);
 static const struct mci_meas_meta __mci_desc_Speed RECORD("mci_meas") __attribute__((aligned(8))) = ENTRY("Speed", 1, __mci_sh_Speed);
 #endif

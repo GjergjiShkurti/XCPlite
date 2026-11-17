@@ -1200,8 +1200,15 @@ impl ElfReader {
         let addressing = self.mci_addressing(mci, cal)?;
         let id_addressing = addressing == MciAddressing::Identifier;
         let without_event = addressing == MciAddressing::Absolute && !self.is_xcplite_target();
+        // A record that measures a variable where it is -- its address is in a variable the debug info
+        // places, and no MEASURE's shadow -- is no name to leave out: its name is free (`.name`), and
+        // its address and size decide alone (below).
         let instrumented = match (addressing, mci) {
-            (MciAddressing::Absolute, Some(records)) => instrumented_names(records, self.debug_data.variables.keys()),
+            (MciAddressing::Absolute, Some(records)) => {
+                let placed = self.placed_variables();
+                let copied: Vec<&MciRecord> = records.iter().filter(|r| !r.addr.is_some_and(|addr| in_place(&placed, u64::from(addr)))).collect();
+                instrumented_names(copied.into_iter(), self.debug_data.variables.keys())
+            }
             _ => std::collections::HashSet::new(),
         };
         // The objects a record describes where they are: a calibration object of mci_cal, and a
@@ -1210,10 +1217,16 @@ impl ElfReader {
         // left out as a twin too -- by its address, since the record's name is free, and by its size:
         // a record of one element or of a struct's first member shares the variable's address and
         // describes only part of it.
-        let described_in_place = match addressing {
+        let mut described_in_place = match addressing {
             MciAddressing::Absolute => described_in_place(mci.unwrap_or(&[]).iter().chain(cal)),
             _ => std::collections::HashSet::new(),
         };
+        // The Timing Bundle's trace words of every traced core describe each trace array together.
+        if addressing == MciAddressing::Absolute
+            && let Some(bundle) = self.timing_bundle()?
+        {
+            described_in_place.extend(bundle.arrays());
+        }
         let mut twins: Vec<&str> = Vec::new();
         // Names this sweep has registered (a name it meets twice is registered once)
         let mut sweep_names = SweepNames::default();
@@ -1562,6 +1575,25 @@ impl ElfReader {
             info!("Swept measurements are bound to no event: the target is not xcplite");
         }
         Ok(())
+    }
+
+    /// The variables the debug information places at an absolute address, with their sizes, sorted by
+    /// start (`in_place`).
+    fn placed_variables(&self) -> Vec<Placed> {
+        let mut placed: Vec<Placed> = Vec::new();
+        for (name, infos) in &self.debug_data.variables {
+            for info in infos.iter().filter(|info| info.address.0 == 0 && info.address.1 != 0) {
+                if let Some(size) = self.debug_data.types.get(&info.typeref).map(TypeInfo::get_size).filter(|size| *size > 0) {
+                    placed.push(Placed {
+                        start: info.address.1,
+                        end: info.address.1.saturating_add(size),
+                        shadow: name.starts_with(MCI_SHADOW_PREFIX),
+                    });
+                }
+            }
+        }
+        placed.sort_by_key(|p| p.start);
+        placed
     }
 
     /// Read XCP_UNIT / XCP_LIMITS / XCP_COMMENT metadata from the xcp_meta ELF section
@@ -2276,6 +2308,26 @@ fn is_described_in_place(described: &std::collections::HashSet<(u64, u64)>, addr
     size.is_some_and(|size| described.contains(&(addr, size)))
 }
 
+/// A variable the debug information places at an absolute address: where it starts, where it ends, and
+/// whether it is a MEASURE's shadow (`__mci_sh_<var>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placed {
+    start: u64,
+    end: u64,
+    shadow: bool,
+}
+
+/// How many variables below an address `in_place` looks at for one that holds it.
+const PLACED_SEARCH: usize = 16;
+
+/// Whether `addr` is in a variable of `placed` (sorted by start) that is no shadow: a record at such an
+/// address measures that variable, or a part of it, where it is. An address in no variable the debug
+/// information places, or in a shadow, is not.
+fn in_place(placed: &[Placed], addr: u64) -> bool {
+    let below = placed.partition_point(|p| p.start <= addr);
+    placed[..below].iter().rev().take(PLACED_SEARCH).any(|p| addr < p.end && !p.shadow)
+}
+
 /// How the ELF's mc-instrument measurement records address their objects, which decides what the
 /// DWARF sweep (register_variables) may add next to them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2319,8 +2371,8 @@ const MCI_SHADOW_PREFIX: &str = "__mci_sh_";
 /// The bare names of the variables a MEASURE already measures, whose plain global the sweep must
 /// not add as a twin: every record's name, and `X` for every shadow `__mci_sh_X` in the DWARF
 /// (a record renamed with `.name` still has its variable's shadow).
-fn instrumented_names<'a>(records: &[MciRecord], dwarf_variables: impl Iterator<Item = &'a String>) -> std::collections::HashSet<String> {
-    let mut set: std::collections::HashSet<String> = records.iter().map(|r| r.name.clone()).collect();
+fn instrumented_names<'a>(records: impl Iterator<Item = &'a MciRecord>, dwarf_variables: impl Iterator<Item = &'a String>) -> std::collections::HashSet<String> {
+    let mut set: std::collections::HashSet<String> = records.map(|r| r.name.clone()).collect();
     set.extend(dwarf_variables.filter_map(|v| v.strip_prefix(MCI_SHADOW_PREFIX)).map(str::to_string));
     set
 }
@@ -4489,7 +4541,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let mut twins: Vec<String> = instrumented_names(&recs, dwarf.iter()).into_iter().collect();
+        let mut twins: Vec<String> = instrumented_names(recs.iter(), dwarf.iter()).into_iter().collect();
         twins.sort();
         assert_eq!(twins, ["level1", "speed"]);
     }
@@ -4524,6 +4576,21 @@ mod tests {
         assert!(is_described_in_place(&described, 0x5000, Some(8)));
         assert!(!is_described_in_place(&described, 0x3000, None), "a variable whose type the debug info does not give");
         assert!(!is_described_in_place(&described, 0x3002, Some(2)));
+    }
+
+    #[test]
+    fn a_record_is_in_place_inside_a_variable_and_not_in_a_shadow() {
+        let placed = [
+            Placed { start: 0x1000, end: 0x1010, shadow: false }, // int32_t Ammo[4]
+            Placed { start: 0x1010, end: 0x1014, shadow: false }, // struct { int16_t x, y; } Player
+            Placed { start: 0x1020, end: 0x1021, shadow: true },  // __mci_sh_Speed
+        ];
+        assert!(in_place(&placed, 0x1000), "the array's first element");
+        assert!(in_place(&placed, 0x100C), "its last element");
+        assert!(in_place(&placed, 0x1012), "the struct's second member");
+        assert!(!in_place(&placed, 0x1020), "a shadow: the entry is copied");
+        assert!(!in_place(&placed, 0x1014) && !in_place(&placed, 0x0FFF) && !in_place(&placed, 0x2000), "in no variable");
+        assert!(!in_place(&[], 0x1000));
     }
 
     #[test]

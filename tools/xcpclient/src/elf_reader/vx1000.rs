@@ -239,6 +239,14 @@ pub(crate) struct TimingBundle {
     pub(crate) words: [MciRecord; 2],
 }
 
+impl TimingBundle {
+    /// The trace arrays, each as the address of core 0's word and the bytes of every traced core's: the words of all cores describe
+    /// each array together, as a record of it whole would.
+    pub(crate) fn arrays(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.words.iter().filter_map(|word| word.addr.map(|addr| (u64::from(addr), 4 * u64::from(self.cores))))
+    }
+}
+
 /// The records as the A2L describes them: a record on a Timing Bundle template, one of `templates`, stands for one word per core when the
 /// bundle is on -- core n's at the address of core 0's plus n words, on core n's own event -- and for none when it is off.
 pub(crate) fn expand_bundle_records(records: Vec<MciRecord>, templates: &[String], bundle: Option<&TimingBundle>) -> Vec<MciRecord> {
@@ -697,7 +705,7 @@ mod tests {
             names,
             [
                 "Frame.Health",
-                "Frame.Ammo_Bullets",
+                "Frame.Ammo",
                 "Frame.PlayerX",
                 "Frame.Speed",
                 "OsTaskInfo_C0.Os_Trace",
@@ -788,8 +796,11 @@ mod tests {
         let swept: Vec<String> = (&reg.instance_list).into_iter().map(|i| i.get_name().to_string()).collect();
         // Frame.Health is Health where it is, all of it: no second object
         assert!(!swept.iter().any(|name| name == "Health"), "{swept:?}");
-        // Frame.Ammo_Bullets is one element of Ammo, Frame.PlayerX the first member of Player: each variable is swept as a whole
+        // Frame.Ammo is one element of Ammo, named like the array, and Frame.PlayerX the first member of Player: each variable is
+        // swept as a whole, the record's name notwithstanding
         assert!(swept.iter().any(|name| name == "Ammo") && swept.iter().any(|name| name == "Player"), "{swept:?}");
+        // the Timing Bundle's words of both cores together are each trace array, all of it
+        assert!(!swept.iter().any(|name| name == "VX1000If_Os_Trace" || name == "VX1000If_Rte_Trace"), "{swept:?}");
         // Frame.Speed is copied into its shadow: the variable is left out by its name, as before
         assert!(!swept.iter().any(|name| name == "Speed"), "{swept:?}");
     }

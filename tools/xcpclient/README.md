@@ -81,10 +81,12 @@ then follow the target rather than XCPlite's server:
   When a record has no address (identifier addressing, XCPlite), the records are the
   measurements and the sweep adds calibration characteristics only. When every record has an
   absolute address (`mc_vx.hpp`), the sweep also adds the plain globals in the same run. It
-  leaves out a variable that a `MEASURE` already measures as `<event>.<name>`: a record's name,
-  or `X` of a shadow `__mci_sh_X`, and a variable a record describes where it is (`MC_STABLE`,
-  `MC_CAL`), at its address and of its size: a record of one array element or of a struct's
-  first member shares the variable's address, and the variable is swept as a whole.
+  leaves out a variable that a `MEASURE` already measures as `<event>.<name>`: the name of a
+  copied entry's record, or `X` of a shadow `__mci_sh_X`, and a variable a record describes
+  where it is (`MC_STABLE`, `MC_CAL`), at its address and of its size alone: a record of one
+  array element or of a struct's first member shares the variable's address, and the variable is
+  swept as a whole, whatever the record's name. The Timing Bundle's words of all traced cores
+  together describe each trace array.
   `--elf-var-filter` and `--elf-unit-filter` narrow the sweep
   as usual. A swept measurement on a target that is not XCPlite has no `IF_DATA` (no event),
   so the master selects the event that samples it. An ELF without `mci_meas` is swept as before.
