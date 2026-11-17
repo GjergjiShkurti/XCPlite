@@ -104,7 +104,12 @@ XCPlite, and its records say more than an XCPlite application's. xcpclient reads
 an ELF that does not link XCPlite.
 
 - **The application record** (`mci_app`, 218 bytes) holds, after the name, the endpoint and the
-  description, `MC_APP`'s `.timing_active`, `.timing_cores` (0 is one core) and
+  description. The endpoint is the VX1000's, the device being the XCP server: `MC_APP`'s
+  `.address` and `.port` (5555 when it leaves `.port` out), over TCP, with an endpoint kind of its
+  own (2, beside 1 for an XCPlite server). The A2L's `XCP_ON_TCP_IP` block is that endpoint, and
+  a `--dest-addr`, `--port` or `--udp` that contradicts it is refused, as for a server; with no
+  `.address` the command line's endpoint stands. Then come `MC_APP`'s `.timing_active`,
+  `.timing_cores` (0 is one core) and
   `.vx_monitor_active`, whether mc-instrument's runtime writes the VX1000 driver's channel modes
   (`MCI_VX_W1_WRITES`: the driver's release is one it knows, `VX1000_OLDA` is defined,
   `VX1000_IGNORE_MBUF_EVENTMODE` is not, and the driver has at most 31 channels), and the

@@ -516,9 +516,9 @@ struct StatedEndpoint {
 }
 
 impl StatedEndpoint {
-    /// Refuses a stated part that is not the application's: `addr`:`port` over `tcp`, from a
-    /// `.bind` written as `bind` ("" when unset).
-    fn check(&self, addr: Ipv4Addr, port: u16, tcp: bool, bind: &str) -> Result<(), Box<dyn Error>> {
+    /// Refuses a stated part that is not the endpoint the application's record states: `addr`:`port`
+    /// over `tcp`, `whose` it is ("the application's own endpoint") and `record` what MC_APP wrote.
+    fn check(&self, addr: Ipv4Addr, port: u16, tcp: bool, whose: &str, record: &str) -> Result<(), Box<dyn Error>> {
         let mut wrong: Vec<String> = Vec::new();
         if let Some(stated) = self.addr
             && stated != std::net::IpAddr::V4(addr)
@@ -538,9 +538,8 @@ impl StatedEndpoint {
         if wrong.is_empty() {
             return Ok(());
         }
-        let bind = if bind.is_empty() { "unset".to_string() } else { format!("\"{bind}\"") };
         Err(format!(
-            "{} contradict{} the application's own endpoint, {} {addr}:{port}, which its MC_APP states in the mci_app record (.bind {bind}, .port {port}, .tcp {tcp}). \
+            "{} contradict{} {whose}, {} {addr}:{port}, which MC_APP states in the mci_app record ({record}). \
              The offline A2L takes the endpoint from the application: drop the flag, or change MC_APP",
             wrong.join(" "),
             if wrong.len() == 1 { "s" } else { "" },
@@ -934,20 +933,33 @@ async fn xcp_client(
                 project_description = elf_reader.project_description()?;
 
                 // Added to upstream (issue 225). Offline, the transport block is where the
-                // application's own XCP server listens -- MC_APP's .bind, .port and .tcp, which the
+                // application's own XCP server listens -- MC_APP's .address, .port and .tcp, which the
                 // mci_app record carries -- not what the command line says: the build rule passed
                 // 127.0.0.1, its own port and TCP for every application, and the kernel dialled
                 // that. A flag that contradicts the record is refused rather than obeyed, and a
                 // record from before it held the endpoint is refused too. Online, the endpoint is
-                // the one that answered, and an application without the record (no MC_APP, or the
-                // VX1000 backend, which serves no XCP of its own) keeps the command line's.
-                if !xcp_client.is_connected()
-                    && let Some(elf_reader::AppEndpoint::Server { addr, port, tcp, bind }) = elf_reader.app_endpoint()?
-                {
-                    stated_endpoint.check(addr, port, tcp, &bind)?;
-                    let protocol = if tcp { "TCP" } else { "UDP" };
-                    info!("The A2L's XCP_ON_{protocol}_IP block is the application's own endpoint, {addr}:{port}, from its MC_APP (the mci_app record)");
-                    reg.set_xcp_eth_params(protocol, addr, port);
+                // the one that answered, and an application without the record (no MC_APP) keeps
+                // the command line's.
+                // A VX1000 firmware serves no XCP of its own: its device does, at the address and
+                // port its MC_APP states, over TCP, and the block is that, checked the same way. Its
+                // MC_APP without .address states none, and the command line's stands.
+                if !xcp_client.is_connected() {
+                    match elf_reader.app_endpoint()? {
+                        Some(elf_reader::AppEndpoint::Server { addr, port, tcp, address }) => {
+                            let address = if address.is_empty() { "unset".to_string() } else { format!("\"{address}\"") };
+                            stated_endpoint.check(addr, port, tcp, "the application's own endpoint", &format!(".address {address}, .port {port}, .tcp {tcp}"))?;
+                            let protocol = if tcp { "TCP" } else { "UDP" };
+                            info!("The A2L's XCP_ON_{protocol}_IP block is the application's own endpoint, {addr}:{port}, from its MC_APP (the mci_app record)");
+                            reg.set_xcp_eth_params(protocol, addr, port);
+                        }
+                        Some(elf_reader::AppEndpoint::Device { addr, port, address }) => {
+                            let record = format!(".address \"{address}\", .port {port}; a VX1000 answers over TCP");
+                            stated_endpoint.check(addr, port, true, "the endpoint of the application's VX1000", &record)?;
+                            info!("The A2L's XCP_ON_TCP_IP block is the endpoint of the application's VX1000, {addr}:{port}, from its MC_APP (the mci_app record)");
+                            reg.set_xcp_eth_params("TCP", addr, port);
+                        }
+                        Some(elf_reader::AppEndpoint::NoServer) | None => {}
+                    }
                 }
             }
 

@@ -19,10 +19,10 @@ use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable,
 
 use super::vx1000::{EVENT_MARKER, EVENT_MARKER_FIXED, EVENT_MULTIBUF, EVENT_TEMPLATE, EventSlot, number_events};
 use super::{
-    CalTableKind, MCI_APP_BIND_LEN, MCI_APP_CHANNEL_COUNT, MCI_APP_DESC_END, MCI_APP_DESC_LEN, MCI_APP_ENDPOINT_END, MCI_APP_NAME_LEN, MCI_APP_NO_SERVER, MCI_APP_RECORD_LEN,
-    MCI_APP_SERVER, MCI_APP_TIMING_ACTIVE, MCI_APP_TIMING_CORES, MCI_APP_VX_MONITOR, MCI_APP_W1_WRITES, MCI_INSTANCE_POINTERS, MCI_META_RECORD_LEN, XCP_EVENT_RECORD_SIZE,
-    parse_cal_meta_record, parse_cal_table_records, parse_event_records, parse_instance_records, parse_mci_records, parse_server_protocol, read_cstr_at, read_cstr_bounded,
-    read_target_ptr,
+    CalTableKind, MCI_APP_ADDRESS_LEN, MCI_APP_CHANNEL_COUNT, MCI_APP_DESC_END, MCI_APP_DESC_LEN, MCI_APP_DEVICE, MCI_APP_ENDPOINT_END, MCI_APP_NAME_LEN, MCI_APP_NO_SERVER,
+    MCI_APP_RECORD_LEN, MCI_APP_SERVER, MCI_APP_TIMING_ACTIVE, MCI_APP_TIMING_CORES, MCI_APP_VX_MONITOR, MCI_APP_W1_WRITES, MCI_INSTANCE_POINTERS, MCI_META_RECORD_LEN,
+    XCP_EVENT_RECORD_SIZE, parse_cal_meta_record, parse_cal_table_records, parse_event_records, parse_instance_records, parse_mci_records, parse_server_protocol, read_cstr_at,
+    read_cstr_bounded, read_target_ptr,
 };
 
 /// Print every xcp_ and mci_ section of the ELF file at `path`, one table per section. Section by section rather than all at
@@ -393,14 +393,23 @@ impl<'d> Image<'d> {
         let mut table = Table::new(&["field", "value"]);
         table.row(["name".into(), field_text(&read_cstr_bounded(d, 0, MCI_APP_NAME_LEN).unwrap_or_default())]);
         if d.len() >= MCI_APP_ENDPOINT_END {
-            let bind = read_cstr_bounded(d, MCI_APP_NAME_LEN, MCI_APP_BIND_LEN).unwrap_or_default();
-            let at = MCI_APP_NAME_LEN + MCI_APP_BIND_LEN;
-            table.row(["bind".into(), if bind.is_empty() { "\"\" (every interface)".into() } else { printable(&bind) }]);
+            let address = read_cstr_bounded(d, MCI_APP_NAME_LEN, MCI_APP_ADDRESS_LEN).unwrap_or_default();
+            let at = MCI_APP_NAME_LEN + MCI_APP_ADDRESS_LEN;
+            let kind = d[at + 3];
+            table.row([
+                "address".into(),
+                match (address.is_empty(), kind) {
+                    (false, _) => printable(&address),
+                    (true, MCI_APP_SERVER) => "\"\" (every interface)".into(),
+                    (true, _) => "\"\" (none: the command line's endpoint)".into(),
+                },
+            ]);
             table.row(["port".into(), self.u16_at(d, at).to_string()]);
             table.row(["transport".into(), if d[at + 2] != 0 { "TCP" } else { "UDP" }.into()]);
-            let endpoint = match d[at + 3] {
+            let endpoint = match kind {
                 MCI_APP_SERVER => "an XCP server".to_string(),
-                MCI_APP_NO_SERVER => "no XCP server (the device is the transport)".to_string(),
+                MCI_APP_DEVICE => "no XCP server: its device, the VX1000, answers at the address, over TCP".to_string(),
+                MCI_APP_NO_SERVER => "no XCP server, and no endpoint".to_string(),
                 other => format!("unknown kind {other}"),
             };
             table.row(["endpoint".into(), endpoint]);
@@ -1310,6 +1319,50 @@ mod tests {
         ] {
             assert!(dump.contains(row), "{row}: {dump}");
         }
+    }
+
+    #[test]
+    fn an_application_records_endpoint_is_shown_as_its_kind_says() {
+        // The stand-in firmware is little-endian, and the record is today's: an address, a port, the transport byte and the kind
+        let data = std::fs::read("fixtures/vx_bundle/vx_bundle.out").unwrap();
+        let image = Image::parse(&data).unwrap();
+        let dump = |address: &[u8], port: u16, tcp: u8, kind: u8| {
+            let mut bytes = vec![0u8; MCI_APP_RECORD_LEN];
+            bytes[..4].copy_from_slice(b"app\0");
+            bytes[MCI_APP_NAME_LEN..MCI_APP_NAME_LEN + address.len()].copy_from_slice(address);
+            let at = MCI_APP_NAME_LEN + MCI_APP_ADDRESS_LEN;
+            bytes[at..at + 2].copy_from_slice(&port.to_le_bytes());
+            bytes[at + 2] = tcp;
+            bytes[at + 3] = kind;
+            image.dump(
+                &SectionView {
+                    name: "mci_app".into(),
+                    addr: 0x1000,
+                    bytes,
+                    relocated: 0,
+                },
+                0,
+            )
+        };
+        // a row, its columns' spacing aside
+        let has = |dump: &str, row: &str| dump.lines().any(|line| line.split_whitespace().collect::<Vec<_>>().join(" ") == row);
+        let device = dump(b"172.31.31.2", 5556, 1, MCI_APP_DEVICE);
+        for row in [
+            "address 172.31.31.2",
+            "port 5556",
+            "transport TCP",
+            "endpoint no XCP server: its device, the VX1000, answers at the address, over TCP",
+        ] {
+            assert!(has(&device, row), "{row}: {device}");
+        }
+        let unnamed = dump(b"", 5555, 1, MCI_APP_DEVICE);
+        assert!(has(&unnamed, "address \"\" (none: the command line's endpoint)"), "{unnamed}");
+        let server = dump(b"", 5557, 0, MCI_APP_SERVER);
+        for row in ["address \"\" (every interface)", "transport UDP", "endpoint an XCP server"] {
+            assert!(has(&server, row), "{row}: {server}");
+        }
+        assert!(has(&dump(b"", 0, 0, MCI_APP_NO_SERVER), "endpoint no XCP server, and no endpoint"));
+        assert!(has(&dump(b"", 0, 0, 7), "endpoint unknown kind 7"));
     }
 
     #[test]

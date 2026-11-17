@@ -130,41 +130,22 @@ impl ElfReader {
         Ok(Some(data))
     }
 
-    /// Where the application's XCP server listens, as its MC_APP states it in the mci_app record
-    /// (AppMeta in mc_meas_abi.hpp: name[64], bind[16], port u16 in the target's byte order, tcp u8,
-    /// endpoint u8, desc[128]). None when the ELF has no mci_app section -- no MC_APP, so no server
-    /// of mc-instrument's to describe.
+    /// Where the application's XCP endpoint is, as its MC_APP states it in the mci_app record
+    /// (AppMeta in mc_meas_abi.hpp: name[64], address[16], port u16 in the target's byte order, tcp u8,
+    /// endpoint u8, desc[128]): its own server's, or its device's. None when the ELF has no mci_app
+    /// section -- no MC_APP, so no endpoint of mc-instrument's to describe.
     ///
     /// The offline A2L's transport block used to come from the command line alone, and the build
     /// rule passed 127.0.0.1, its own port and TCP for every application (issues 158, 225). An unset
-    /// `.bind` and "0.0.0.0" are every interface, which 127.0.0.1 reaches; anything else is the one
+    /// `.address` and "0.0.0.0" are every interface, which 127.0.0.1 reaches; anything else is the one
     /// address the server listens on. A record that predates the endpoint -- the name alone, 64
     /// bytes -- is an error rather than a reason to fall back on the command line: that fallback is
-    /// the guess this replaces.
+    /// the guess this replaces. How the record is read: `parse_app_endpoint`.
     pub fn app_endpoint(&self) -> Result<Option<AppEndpoint>, Box<dyn Error>> {
         let Some(data) = self.mci_app_record()? else {
             return Ok(None);
         };
-        let bind_bytes = &data[MCI_APP_NAME_LEN..MCI_APP_NAME_LEN + MCI_APP_BIND_LEN];
-        let bind_end = bind_bytes.iter().position(|&b| b == 0).unwrap_or(bind_bytes.len());
-        let bind = String::from_utf8_lossy(&bind_bytes[..bind_end]).to_string();
-        let at = MCI_APP_NAME_LEN + MCI_APP_BIND_LEN;
-        let port_bytes: [u8; 2] = data[at..at + 2].try_into().unwrap();
-        let port = if self.debug_data.is_little_endian { u16::from_le_bytes(port_bytes) } else { u16::from_be_bytes(port_bytes) };
-        let tcp = data[at + 2] != 0;
-        match data[at + 3] {
-            MCI_APP_NO_SERVER => Ok(Some(AppEndpoint::NoServer)),
-            MCI_APP_SERVER => {
-                let addr = if bind.is_empty() || bind == "0.0.0.0" {
-                    Ipv4Addr::LOCALHOST
-                } else {
-                    bind.parse::<Ipv4Addr>()
-                        .map_err(|_| format!("MC_APP's .bind \"{bind}\" in the mci_app record is not a dotted IPv4 address, and the application stops at startup on it"))?
-                };
-                Ok(Some(AppEndpoint::Server { addr, port, tcp, bind }))
-            }
-            other => Err(format!("the mci_app record says endpoint kind {other}, which this reader does not know").into()),
-        }
+        Ok(Some(parse_app_endpoint(data, self.debug_data.is_little_endian)?))
     }
 
     /// What the server linked into the ELF answers to CONNECT, GET_DAQ_RESOLUTION_INFO and
@@ -2668,8 +2649,8 @@ pub fn fix_identifier_read_write(path: &std::path::Path) -> Result<(), Box<dyn E
 /// the description (issue 186), and since.
 /// MCI_APP_DESC_END is its size before it held MC_APP's VX1000 options.
 const MCI_APP_NAME_LEN: usize = 64;
-const MCI_APP_BIND_LEN: usize = 16;
-const MCI_APP_ENDPOINT_END: usize = MCI_APP_NAME_LEN + MCI_APP_BIND_LEN + 4;
+const MCI_APP_ADDRESS_LEN: usize = 16;
+const MCI_APP_ENDPOINT_END: usize = MCI_APP_NAME_LEN + MCI_APP_ADDRESS_LEN + 4;
 const MCI_APP_DESC_LEN: usize = 128;
 const MCI_APP_DESC_END: usize = MCI_APP_ENDPOINT_END + MCI_APP_DESC_LEN;
 /// MC_APP's VX1000 options after the description, one byte each (vx1000.rs): .timing_active, .timing_cores, .vx_monitor_active, and
@@ -2681,9 +2662,11 @@ const MCI_APP_VX_MONITOR: usize = MCI_APP_DESC_END + 2;
 const MCI_APP_W1_WRITES: usize = MCI_APP_DESC_END + 3;
 const MCI_APP_CHANNEL_COUNT: usize = MCI_APP_DESC_END + 4;
 const MCI_APP_RECORD_LEN: usize = MCI_APP_CHANNEL_COUNT + 2;
-/// AppMeta::endpoint: the application runs no XCP server (the VX1000 backend), or it runs one.
+/// AppMeta::endpoint: the application runs no XCP server and states no endpoint, it runs one, or it runs none and its device -- the
+/// VX1000 of a firmware made with mc-instrument's VX1000 headers -- answers at the record's address and port, over TCP.
 const MCI_APP_NO_SERVER: u8 = 0;
 const MCI_APP_SERVER: u8 = 1;
+const MCI_APP_DEVICE: u8 = 2;
 
 /// Refuse an mci_app record that is not one of today's, for the application `name`: one from before
 /// MC_APP recorded the endpoint, the description or the VX1000 options says what it lacks, and any
@@ -2692,7 +2675,7 @@ fn check_app_record(data: &[u8], name: &str) -> Result<(), String> {
     match data.len() {
         MCI_APP_RECORD_LEN => Ok(()),
         MCI_APP_NAME_LEN => Err(format!(
-            "the ELF's mci_app record names the application ('{name}') but not where it listens: it was built before MC_APP recorded .bind, .port and .tcp there. \
+            "the ELF's mci_app record names the application ('{name}') but not where it listens: it was built before MC_APP recorded .address, .port and .tcp there. \
              Rebuild it, so that its offline A2L states the application's own endpoint"
         )),
         MCI_APP_ENDPOINT_END => Err(format!(
@@ -2709,13 +2692,57 @@ fn check_app_record(data: &[u8], name: &str) -> Result<(), String> {
 }
 
 /// What an mc-instrument application's mci_app record says about its XCP endpoint (issue 225).
+#[derive(Debug, PartialEq)]
 pub enum AppEndpoint {
-    /// It serves XCP at `addr`:`port` over TCP or UDP; `bind` is `.bind` as written, "" when unset.
+    /// It serves XCP at `addr`:`port` over TCP or UDP; `address` is `.address` as written, "" when unset.
     /// The offline A2L's transport block is this.
-    Server { addr: Ipv4Addr, port: u16, tcp: bool, bind: String },
-    /// It serves none -- the VX1000 backend, whose device is the transport -- so the command
-    /// line's endpoint stands.
+    Server { addr: Ipv4Addr, port: u16, tcp: bool, address: String },
+    /// It serves none: its device, the VX1000, answers at `addr`:`port`, over TCP as a VX1000 always does;
+    /// `address` is `.address` as written. The offline A2L's transport block is this.
+    Device { addr: Ipv4Addr, port: u16, address: String },
+    /// It serves none and states no endpoint -- a VX1000 firmware whose MC_APP leaves `.address` out --
+    /// so the command line's endpoint stands.
     NoServer,
+}
+
+/// What an mci_app record of today's size (`check_app_record`) says about the application's endpoint, the port in the target's
+/// byte order (`little_endian`). A server's unset address and "0.0.0.0" are every interface, which 127.0.0.1 reaches; a device's
+/// is the one address it answers at, so neither stands for it, and a device record without one leaves the endpoint to the command
+/// line. An address that is not a dotted IPv4 address is refused, naming it: the A2L could not say where to connect.
+fn parse_app_endpoint(data: &[u8], little_endian: bool) -> Result<AppEndpoint, String> {
+    let address_bytes = &data[MCI_APP_NAME_LEN..MCI_APP_NAME_LEN + MCI_APP_ADDRESS_LEN];
+    let address_end = address_bytes.iter().position(|&b| b == 0).unwrap_or(address_bytes.len());
+    let address = String::from_utf8_lossy(&address_bytes[..address_end]).to_string();
+    let at = MCI_APP_NAME_LEN + MCI_APP_ADDRESS_LEN;
+    let port_bytes: [u8; 2] = data[at..at + 2].try_into().unwrap();
+    let port = if little_endian {
+        u16::from_le_bytes(port_bytes)
+    } else {
+        u16::from_be_bytes(port_bytes)
+    };
+    let tcp = data[at + 2] != 0;
+    match data[at + 3] {
+        MCI_APP_NO_SERVER => Ok(AppEndpoint::NoServer),
+        MCI_APP_SERVER => {
+            let addr = if address.is_empty() || address == "0.0.0.0" {
+                Ipv4Addr::LOCALHOST
+            } else {
+                address
+                    .parse::<Ipv4Addr>()
+                    .map_err(|_| format!("MC_APP's .address \"{address}\" in the mci_app record is not a dotted IPv4 address, and the application stops at startup on it"))?
+            };
+            Ok(AppEndpoint::Server { addr, port, tcp, address })
+        }
+        MCI_APP_DEVICE if address.is_empty() => Ok(AppEndpoint::NoServer),
+        MCI_APP_DEVICE => match address.parse::<Ipv4Addr>() {
+            Ok(addr) if !addr.is_unspecified() => Ok(AppEndpoint::Device { addr, port, address }),
+            _ => Err(format!(
+                "MC_APP's .address \"{address}\" in the mci_app record is not the address of a device, a dotted IPv4 address such as \"192.168.0.2\": \
+                 the A2L cannot say where the VX1000 answers. Name its address in MC_APP, or leave .address out and give the endpoint on the command line"
+            )),
+        },
+        other => Err(format!("the mci_app record says endpoint kind {other}, which this reader does not know")),
+    }
 }
 
 /// The A2L's ADDR_EPK for an `xcp_epk` section at `elf_addr` (see `register_epk_addr_info`).
@@ -4648,7 +4675,7 @@ mod tests {
         assert_eq!(MCI_APP_RECORD_LEN, 218);
         assert_eq!(check_app_record(&[0u8; 218], "app"), Ok(()));
         let refusal = |size: usize| check_app_record(&vec![0u8; size], "app").unwrap_err();
-        assert!(refusal(64).contains("built before MC_APP recorded .bind, .port and .tcp"), "{}", refusal(64));
+        assert!(refusal(64).contains("built before MC_APP recorded .address, .port and .tcp"), "{}", refusal(64));
         assert!(refusal(84).contains("built before MC_APP recorded .desc"), "{}", refusal(84));
         assert!(
             refusal(212).starts_with("the ELF's mci_app record has no VX1000 options: 'app' was built before MC_APP recorded .timing_active"),
@@ -4663,6 +4690,71 @@ mod tests {
                 refusal(size)
             );
         }
+    }
+
+    /// An application record of today's size with this address, port, transport byte and endpoint kind; the port in the byte order
+    /// `little_endian` says.
+    fn app_record(address: &[u8], port: u16, tcp: u8, kind: u8, little_endian: bool) -> Vec<u8> {
+        let mut data = vec![0u8; MCI_APP_RECORD_LEN];
+        data[..4].copy_from_slice(b"app\0");
+        data[MCI_APP_NAME_LEN..MCI_APP_NAME_LEN + address.len()].copy_from_slice(address);
+        let at = MCI_APP_NAME_LEN + MCI_APP_ADDRESS_LEN;
+        data[at..at + 2].copy_from_slice(&if little_endian { port.to_le_bytes() } else { port.to_be_bytes() });
+        data[at + 2] = tcp;
+        data[at + 3] = kind;
+        data
+    }
+
+    #[test]
+    fn an_application_record_states_its_servers_endpoint_its_devices_or_none() {
+        let parse = |address: &[u8], port: u16, tcp: u8, kind: u8| parse_app_endpoint(&app_record(address, port, tcp, kind, true), true);
+        let server = |addr: [u8; 4], port: u16, tcp: bool, address: &str| AppEndpoint::Server {
+            addr: addr.into(),
+            port,
+            tcp,
+            address: address.into(),
+        };
+        // An XCP server: where it listens; every interface, unset or "0.0.0.0", is reached at 127.0.0.1
+        assert_eq!(parse(b"127.0.0.2", 5825, 0, MCI_APP_SERVER), Ok(server([127, 0, 0, 2], 5825, false, "127.0.0.2")));
+        assert_eq!(parse(b"", 5826, 1, MCI_APP_SERVER), Ok(server([127, 0, 0, 1], 5826, true, "")));
+        assert_eq!(parse(b"0.0.0.0", 5827, 0, MCI_APP_SERVER), Ok(server([127, 0, 0, 1], 5827, false, "0.0.0.0")));
+        let refused = parse(b"not-an-address", 5828, 1, MCI_APP_SERVER).unwrap_err();
+        assert!(
+            refused.starts_with("MC_APP's .address \"not-an-address\" in the mci_app record is not a dotted IPv4 address"),
+            "{refused}"
+        );
+        // A VX1000's: the device's address and port, always over TCP, whatever the transport byte says
+        let device = AppEndpoint::Device {
+            addr: [172, 31, 31, 2].into(),
+            port: 5555,
+            address: "172.31.31.2".into(),
+        };
+        assert_eq!(parse(b"172.31.31.2", 5555, 1, MCI_APP_DEVICE), Ok(device));
+        assert!(matches!(parse(b"172.31.31.2", 5556, 0, MCI_APP_DEVICE), Ok(AppEndpoint::Device { port: 5556, .. })));
+        // ... and in the target's byte order
+        assert!(matches!(
+            parse_app_endpoint(&app_record(b"172.31.31.60", 5555, 1, MCI_APP_DEVICE, false), false),
+            Ok(AppEndpoint::Device { port: 5555, .. })
+        ));
+        // A device record without an address leaves the endpoint to the command line, as a firmware with no server and no endpoint does
+        assert_eq!(parse(b"", 5555, 1, MCI_APP_DEVICE), Ok(AppEndpoint::NoServer));
+        assert_eq!(parse(b"", 0, 0, MCI_APP_NO_SERVER), Ok(AppEndpoint::NoServer));
+        // A device is at one address: neither every interface nor text that is not an address, sixteen characters with no terminator
+        // included (C cuts nothing short there)
+        for address in [&b"0.0.0.0"[..], b"vx1000", b"172.31.31.2:5555", b"255.255.255.2555"] {
+            let refused = parse(address, 5555, 1, MCI_APP_DEVICE).unwrap_err();
+            let text = String::from_utf8_lossy(address);
+            assert!(
+                refused.starts_with(&format!("MC_APP's .address \"{text}\" in the mci_app record is not the address of a device")),
+                "{refused}"
+            );
+            assert!(refused.contains("the A2L cannot say where the VX1000 answers"), "{refused}");
+        }
+        // A kind this reader does not know
+        assert_eq!(
+            parse(b"", 5555, 1, 3),
+            Err("the mci_app record says endpoint kind 3, which this reader does not know".to_string())
+        );
     }
 
     fn limits_of(ty: i8, min: f64, max: f64) -> (f64, f64) {
