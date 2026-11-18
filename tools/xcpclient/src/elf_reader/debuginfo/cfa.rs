@@ -415,8 +415,16 @@ fn parse_eh_frame(file: &object::File, table: &mut Option<CfiTable>, function_ad
     //     );
     // }
 
-    let eh_frame = EhFrame::new(eh_frame_data, LittleEndian);
+    let mut eh_frame = EhFrame::new(eh_frame_data, LittleEndian);
+    eh_frame.set_address_size(address_size(file));
     parse_cfi_section(&eh_frame, eh_frame_address, function_address, ".eh_frame", table)
+}
+
+/// The size of an address in the CFI sections: the ELF's, not the host's, which gimli assumes
+/// otherwise. A CIE of version 1 or 3 does not state it, so a 32-bit target's FDEs were read with
+/// 8-byte addresses and the pass stopped at "Hit the end of input before it was expected".
+fn address_size(file: &object::File) -> u8 {
+    if file.is_64() { 8 } else { 4 }
 }
 
 /// Parse .debug_frame section to find CFA offset for a function  
@@ -434,7 +442,8 @@ fn parse_debug_frame(file: &object::File, table: &mut Option<CfiTable>, function
 
     log::debug!("    Found .debug_frame section with {} bytes at 0x{:08x}", debug_frame_data.len(), debug_frame_address);
 
-    let debug_frame = DebugFrame::new(debug_frame_data, LittleEndian);
+    let mut debug_frame = DebugFrame::new(debug_frame_data, LittleEndian);
+    debug_frame.set_address_size(address_size(file));
     parse_cfi_section(&debug_frame, debug_frame_address, function_address, ".debug_frame", table)
 }
 
@@ -720,3 +729,27 @@ fn get_string_attribute(
 //         }
 //     }
 // }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A 32-bit ELF whose call frame information is in .debug_frame alone, with CIEs that state no
+    /// address size (fixtures/cfa32): the pass reads it with the ELF's 4-byte addresses and finds the
+    /// CFA of each function, where it used to stop at "Hit the end of input before it was expected".
+    #[test]
+    fn test_cfa_of_a_32_bit_debug_frame() {
+        let data = std::fs::read("fixtures/cfa32/cfa32.out").unwrap();
+        let file = object::File::parse(&*data).unwrap();
+        assert!(!file.is_64());
+        assert!(file.section_by_name(".eh_frame").is_none());
+        let mut cfa_info = Vec::new();
+        let n = get_cfa_from_object(&file, &mut cfa_info, 0, usize::MAX).unwrap();
+        assert_eq!(n, 2);
+        for name in ["step", "main"] {
+            let function = cfa_info.iter().find(|f| f.function == name).unwrap();
+            let mut tables = CfiTables::default();
+            assert!(extract_cfa_from_cfi(&file, &mut tables, function.low_pc).unwrap().is_some(), "{name}: CFA from .debug_frame");
+        }
+    }
+}
