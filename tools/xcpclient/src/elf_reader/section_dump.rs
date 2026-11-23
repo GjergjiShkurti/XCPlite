@@ -17,7 +17,7 @@ use std::io::Write as _;
 use object::read::elf::FileHeader;
 use object::{Object, ObjectKind, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags, RelocationKind, RelocationTarget, SectionFlags, SymbolKind};
 
-use super::vx1000::{EVENT_MARKER, EVENT_MARKER_FIXED, EVENT_MULTIBUF, EVENT_TEMPLATE, EventSlot, number_events};
+use super::vx1000::{EVENT_MARKER, EVENT_MULTIBUF, EVENT_TEMPLATE, EventSlot, number_events};
 use super::{
     CalTableKind, MCI_APP_ADDRESS_LEN, MCI_APP_CHANNEL_COUNT, MCI_APP_DESC_END, MCI_APP_DESC_LEN, MCI_APP_DEVICE, MCI_APP_ENDPOINT_END, MCI_APP_NAME_LEN, MCI_APP_NO_SERVER,
     MCI_APP_RECORD_LEN, MCI_APP_SERVER, MCI_APP_TIMING_ACTIVE, MCI_APP_TIMING_CORES, MCI_APP_VX_MONITOR, MCI_APP_W1_WRITES, MCI_INSTANCE_POINTERS, MCI_META_RECORD_LEN,
@@ -384,42 +384,38 @@ impl<'d> Image<'d> {
     /// mci_app: the application record, `mci::AppMeta` (mc_meas_abi.hpp).
     fn app(&self, section: &SectionView, out: &mut String) -> Result<(), String> {
         let d = &section.bytes;
-        if ![MCI_APP_NAME_LEN, MCI_APP_ENDPOINT_END, MCI_APP_DESC_END, MCI_APP_RECORD_LEN].contains(&d.len()) {
+        if ![MCI_APP_DESC_END, MCI_APP_RECORD_LEN].contains(&d.len()) {
             return Err(format!(
-                "not an application record: AppMeta is {MCI_APP_RECORD_LEN} bytes, {MCI_APP_DESC_END}, {MCI_APP_ENDPOINT_END} or {MCI_APP_NAME_LEN} in older builds"
+                "not an application record: AppMeta is {MCI_APP_RECORD_LEN} bytes, {MCI_APP_DESC_END} in older builds"
             ));
         }
         let _ = writeln!(out, "  the application record (AppMeta), as MC_APP states it");
         let mut table = Table::new(&["field", "value"]);
         table.row(["name".into(), field_text(&read_cstr_bounded(d, 0, MCI_APP_NAME_LEN).unwrap_or_default())]);
-        if d.len() >= MCI_APP_ENDPOINT_END {
-            let address = read_cstr_bounded(d, MCI_APP_NAME_LEN, MCI_APP_ADDRESS_LEN).unwrap_or_default();
-            let at = MCI_APP_NAME_LEN + MCI_APP_ADDRESS_LEN;
-            let kind = d[at + 3];
-            table.row([
-                "address".into(),
-                match (address.is_empty(), kind) {
-                    (false, _) => printable(&address),
-                    (true, MCI_APP_SERVER) => "\"\" (every interface)".into(),
-                    (true, _) => "\"\" (none: the command line's endpoint)".into(),
-                },
-            ]);
-            table.row(["port".into(), self.u16_at(d, at).to_string()]);
-            table.row(["transport".into(), if d[at + 2] != 0 { "TCP" } else { "UDP" }.into()]);
-            let endpoint = match kind {
-                MCI_APP_SERVER => "an XCP server".to_string(),
-                MCI_APP_DEVICE => "no XCP server: its device, the VX1000, answers at the address, over TCP".to_string(),
-                MCI_APP_NO_SERVER => "no XCP server, and no endpoint".to_string(),
-                other => format!("unknown kind {other}"),
-            };
-            table.row(["endpoint".into(), endpoint]);
-        }
-        if d.len() >= MCI_APP_DESC_END {
-            table.row([
-                "description".into(),
-                field_text(&read_cstr_bounded(d, MCI_APP_ENDPOINT_END, MCI_APP_DESC_LEN).unwrap_or_default()),
-            ]);
-        }
+        let address = read_cstr_bounded(d, MCI_APP_NAME_LEN, MCI_APP_ADDRESS_LEN).unwrap_or_default();
+        let at = MCI_APP_NAME_LEN + MCI_APP_ADDRESS_LEN;
+        let kind = d[at + 3];
+        table.row([
+            "address".into(),
+            match (address.is_empty(), kind) {
+                (false, _) => printable(&address),
+                (true, MCI_APP_SERVER) => "\"\" (every interface)".into(),
+                (true, _) => "\"\" (none: the command line's endpoint)".into(),
+            },
+        ]);
+        table.row(["port".into(), self.u16_at(d, at).to_string()]);
+        table.row(["transport".into(), if d[at + 2] != 0 { "TCP" } else { "UDP" }.into()]);
+        let endpoint = match kind {
+            MCI_APP_SERVER => "an XCP server".to_string(),
+            MCI_APP_DEVICE => "no XCP server: its device, the VX1000, answers at the address, over TCP".to_string(),
+            MCI_APP_NO_SERVER => "no XCP server, and no endpoint".to_string(),
+            other => format!("unknown kind {other}"),
+        };
+        table.row(["endpoint".into(), endpoint]);
+        table.row([
+            "description".into(),
+            field_text(&read_cstr_bounded(d, MCI_APP_ENDPOINT_END, MCI_APP_DESC_LEN).unwrap_or_default()),
+        ]);
         if d.len() == MCI_APP_RECORD_LEN {
             // MC_APP's VX1000 options, which a firmware that links xcplite carries without acting on them
             let switch = |at: usize| match d[at] {
@@ -454,15 +450,7 @@ impl<'d> Image<'d> {
         }
         table.render(out);
         if d.len() < MCI_APP_RECORD_LEN {
-            let _ = writeln!(
-                out,
-                "  an older record: built before MC_APP recorded {}",
-                match d.len() {
-                    MCI_APP_NAME_LEN => "its endpoint",
-                    MCI_APP_ENDPOINT_END => "its description",
-                    _ => "its VX1000 options",
-                }
-            );
+            let _ = writeln!(out, "  an older record: built before MC_APP recorded its VX1000 options");
         }
         Ok(())
     }
@@ -1063,7 +1051,6 @@ fn event_flags(marker: u8, flags: u8) -> String {
             }
             if named.is_empty() { "none".to_string() } else { named.join(", ") }
         }
-        EVENT_MARKER_FIXED => "a fixed channel, from headers before the numbering".to_string(),
         other => format!("marker 0x{other:02X}, unknown"),
     }
 }
@@ -1261,7 +1248,6 @@ mod tests {
         assert_eq!(event_flags(EVENT_MARKER, EVENT_MULTIBUF), "multi-buffer");
         assert_eq!(event_flags(EVENT_MARKER, EVENT_MULTIBUF | EVENT_TEMPLATE), "multi-buffer, Timing Bundle template");
         assert_eq!(event_flags(EVENT_MARKER, 0x81), "multi-buffer, unknown 0x80");
-        assert_eq!(event_flags(EVENT_MARKER_FIXED, 5), "a fixed channel, from headers before the numbering");
         assert_eq!(event_flags(0x42, 0), "marker 0x42, unknown");
     }
 

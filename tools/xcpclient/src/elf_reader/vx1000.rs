@@ -97,15 +97,13 @@ pub(crate) fn check_mode_writes(options: &VxOptions) -> Result<(), String> {
 
 /// The marker mc-instrument's VX1000 headers write into an event record's first reserved byte; the flags byte follows it.
 pub(crate) const EVENT_MARKER: u8 = 0xC6;
-/// The marker of a record that fixed its own channel, which the headers wrote before mc-instrument numbered the events
-pub(crate) const EVENT_MARKER_FIXED: u8 = 0xC5;
 /// A flag: the event's channel is multi-buffer (MC_MULTIBUF)
 pub(crate) const EVENT_MULTIBUF: u8 = 0x01;
 /// A flag: a Timing Bundle template, which stands for one event per traced core and is no event of its own
 pub(crate) const EVENT_TEMPLATE: u8 = 0x02;
 
 /// The flags of a VX1000 firmware's event record, from the first two of its reserved bytes, `marker` and `flags`: none without the marker. A
-/// record that fixes its channel, from the headers before the numbering, is refused, and so is a marker or a flag this reader does not know.
+/// marker or a flag this reader does not know is refused.
 pub(crate) fn event_flags(name: &str, marker: u8, flags: u8) -> Result<u8, String> {
     match marker {
         0 => Ok(0),
@@ -113,10 +111,6 @@ pub(crate) fn event_flags(name: &str, marker: u8, flags: u8) -> Result<u8, Strin
         EVENT_MARKER => Err(format!(
             "event '{name}': its record's flags are 0x{flags:02X}, with a flag this reader does not know (0x01 multi-buffer, 0x02 Timing Bundle \
              template): rebuild with the mc-instrument headers this xcpclient belongs with; no A2L is written"
-        )),
-        EVENT_MARKER_FIXED => Err(format!(
-            "event '{name}': its record fixes a channel (MEASURE_CHANNEL or MC_EVENT), which mc-instrument no longer does: it numbers the events \
-             itself. Rebuild with the current headers; no A2L is written"
         )),
         other => Err(format!(
             "event '{name}': its record's reserved bytes start with 0x{other:02X}, which is no marker this reader knows (0x{EVENT_MARKER:02X}): \
@@ -582,16 +576,11 @@ mod tests {
     }
 
     #[test]
-    fn an_event_records_marker_gives_its_flags_and_an_old_or_unknown_one_is_refused() {
+    fn an_event_records_marker_gives_its_flags_and_an_unknown_one_is_refused() {
         assert_eq!(event_flags("Frame", 0, 0), Ok(0));
         assert_eq!(event_flags("Frame", EVENT_MARKER, 0), Ok(0));
         assert_eq!(event_flags("Frame", EVENT_MARKER, EVENT_MULTIBUF), Ok(EVENT_MULTIBUF));
         assert_eq!(event_flags("OsTaskInfo", EVENT_MARKER, EVENT_MULTIBUF | EVENT_TEMPLATE), Ok(0x03));
-        let error = event_flags("Frame", EVENT_MARKER_FIXED, 5).unwrap_err();
-        assert!(
-            error.contains("event 'Frame': its record fixes a channel") && error.contains("Rebuild with the current headers"),
-            "{error}"
-        );
         let error = event_flags("Frame", 0x7E, 0).unwrap_err();
         assert!(error.contains("0x7E, which is no marker this reader knows (0xC6)"), "{error}");
         let error = event_flags("Frame", EVENT_MARKER, 0x04).unwrap_err();

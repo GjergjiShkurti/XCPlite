@@ -936,10 +936,9 @@ async fn xcp_client(
                 // application's own XCP server listens -- MC_APP's .address, .port and .tcp, which the
                 // mci_app record carries -- not what the command line says: the build rule passed
                 // 127.0.0.1, its own port and TCP for every application, and the kernel dialled
-                // that. A flag that contradicts the record is refused rather than obeyed, and a
-                // record from before it held the endpoint is refused too. Online, the endpoint is
-                // the one that answered, and an application without the record (no MC_APP) keeps
-                // the command line's.
+                // that. A flag that contradicts the record is refused rather than obeyed. Online,
+                // the endpoint is the one that answered, and an application without the record (no
+                // MC_APP) keeps the command line's.
                 // A VX1000 firmware serves no XCP of its own: its device does, at the address and
                 // port its MC_APP states, over TCP, and the block is that, checked the same way. Its
                 // MC_APP without .address states none, and the command line's stands.

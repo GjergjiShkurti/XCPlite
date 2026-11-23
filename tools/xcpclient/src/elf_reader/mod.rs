@@ -111,7 +111,7 @@ impl ElfReader {
 
     /// Added to upstream (VsCANape issue 186). The A2L's PROJECT description: MC_APP's `.desc`,
     /// escaped as every text of an mc-instrument record is (`a2l_text`). "" when the ELF has no
-    /// mci_app section; an error for a record from before it held one, as for the endpoint.
+    /// mci_app section; an error for a record that is not one of today's (`check_app_record`).
     pub fn project_description(&self) -> Result<String, Box<dyn Error>> {
         let Some(data) = self.mci_app_record()? else {
             return Ok(String::new());
@@ -2645,9 +2645,8 @@ pub fn fix_identifier_read_write(path: &std::path::Path) -> Result<(), Box<dyn E
     Ok(())
 }
 
-/// The size of the mci_app record before it held the endpoint -- the name alone -- before it held
-/// the description (issue 186), and since.
-/// MCI_APP_DESC_END is its size before it held MC_APP's VX1000 options.
+/// Where the mci_app record's fields end: the name, the endpoint, the description (issue 186).
+/// MCI_APP_DESC_END is also the record's size before it held MC_APP's VX1000 options.
 const MCI_APP_NAME_LEN: usize = 64;
 const MCI_APP_ADDRESS_LEN: usize = 16;
 const MCI_APP_ENDPOINT_END: usize = MCI_APP_NAME_LEN + MCI_APP_ADDRESS_LEN + 4;
@@ -2669,18 +2668,10 @@ const MCI_APP_SERVER: u8 = 1;
 const MCI_APP_DEVICE: u8 = 2;
 
 /// Refuse an mci_app record that is not one of today's, for the application `name`: one from before
-/// MC_APP recorded the endpoint, the description or the VX1000 options says what it lacks, and any
-/// other size is not one record.
+/// MC_APP recorded the VX1000 options says what it lacks, and any other size is not one record.
 fn check_app_record(data: &[u8], name: &str) -> Result<(), String> {
     match data.len() {
         MCI_APP_RECORD_LEN => Ok(()),
-        MCI_APP_NAME_LEN => Err(format!(
-            "the ELF's mci_app record names the application ('{name}') but not where it listens: it was built before MC_APP recorded .address, .port and .tcp there. \
-             Rebuild it, so that its offline A2L states the application's own endpoint"
-        )),
-        MCI_APP_ENDPOINT_END => Err(format!(
-            "the ELF's mci_app record has no description: '{name}' was built before MC_APP recorded .desc there. Rebuild it, so that its offline A2L carries its description"
-        )),
         MCI_APP_DESC_END => Err(format!(
             "the ELF's mci_app record has no VX1000 options: '{name}' was built before MC_APP recorded .timing_active, .timing_cores, .vx_monitor_active \
              and the VX1000 driver's channel count there. Rebuild it with the current mc-instrument headers"
@@ -4358,16 +4349,6 @@ mod tests {
             let flags: Vec<Result<u8, String>> = records.iter().map(|r| vx1000::event_flags("e", r.marker, r.flags)).collect();
             assert_eq!(flags, [Ok(0x01), Ok(0x03), Ok(0)]);
         }
-        // a record of the headers that fixed channels is read as it is, and refused by its flags
-        let mut record = event_record(0x1000, 0, 4, true);
-        record[9..12].copy_from_slice(&[vx1000::EVENT_MARKER_FIXED, 5, 0]);
-        let parsed = parse_event_records(&record, 0x4000, 4, true).unwrap()[0];
-        assert_eq!((parsed.marker, parsed.flags), (0xC5, 5));
-        assert!(
-            vx1000::event_flags("Frame", parsed.marker, parsed.flags)
-                .unwrap_err()
-                .contains("Rebuild with the current headers")
-        );
     }
 
     #[test]
@@ -4675,15 +4656,13 @@ mod tests {
         assert_eq!(MCI_APP_RECORD_LEN, 218);
         assert_eq!(check_app_record(&[0u8; 218], "app"), Ok(()));
         let refusal = |size: usize| check_app_record(&vec![0u8; size], "app").unwrap_err();
-        assert!(refusal(64).contains("built before MC_APP recorded .address, .port and .tcp"), "{}", refusal(64));
-        assert!(refusal(84).contains("built before MC_APP recorded .desc"), "{}", refusal(84));
         assert!(
             refusal(212).starts_with("the ELF's mci_app record has no VX1000 options: 'app' was built before MC_APP recorded .timing_active"),
             "{}",
             refusal(212)
         );
         assert!(refusal(212).ends_with("Rebuild it with the current mc-instrument headers"), "{}", refusal(212));
-        for size in [0, 217, 219, 436] {
+        for size in [0, 64, 84, 217, 219, 436] {
             assert!(
                 refusal(size).contains(&format!("holds {size} bytes, which is not one application record of 218")),
                 "{}",

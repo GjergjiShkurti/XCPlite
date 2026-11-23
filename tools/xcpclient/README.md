@@ -113,14 +113,14 @@ an ELF that does not link XCPlite.
   `.vx_monitor_active`, whether mc-instrument's runtime writes the VX1000 driver's channel modes
   (`MCI_VX_W1_WRITES`: the driver's release is one it knows, `VX1000_OLDA` is defined,
   `VX1000_IGNORE_MBUF_EVENTMODE` is not, and the driver has at most 31 channels), and the
-  driver's channel count (`VX1000_OLDA_ACTIVE_EVT_CNT_MAX`). A record of another size is refused,
-  one of an older layout with the field it lacks: rebuild.
+  driver's channel count (`VX1000_OLDA_ACTIVE_EVT_CNT_MAX`). A record of another size is refused;
+  one of the layout before the VX1000 options (212 bytes) is told so: rebuild.
 - **Events** are numbered from the `xcp_evts` records in section order, as the firmware's
   runtime numbers them: each named record that is no template and whose name is new takes the
   next channel from 0. The headers mark each record, `0xC6` in its first reserved byte, and flag
   it in the second: `0x01` a multi-buffer event (`MC_MULTIBUF`), `0x02` a template of the VX1000
-  Timing Bundle, which is no event of its own. A record that fixes its own channel (`0xC5`, from
-  headers before the numbering) is refused. So is a firmware with more events than channels, at
+  Timing Bundle, which is no event of its own. An unknown marker or flag is refused. So is a
+  firmware with more events than channels, at
   most 31 and no more than the driver's count, and one with a multi-buffer event and a driver of
   more than 31 channels, whose channel modes the runtime cannot set.
 - **The VX1000 Timing Bundle**, when `MC_APP` sets `.timing_active`: per traced core n the
